@@ -282,11 +282,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "mtveil-control"
+name = "mtevil-control"
 version = "0.0.0"
 
 [[package]]
-name = "mtveil-data-plane"
+name = "mtevil-data-plane"
 version = "0.1.0-alpha.1"
 dependencies = [
  "aes",
@@ -294,7 +294,7 @@ dependencies = [
  "clap",
  "hex",
  "hmac",
- "mtveil-proto",
+ "mtevil-proto",
  "rand",
  "serde",
  "serde_json",
@@ -305,15 +305,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "mtveil-egress"
+name = "mtevil-egress"
 version = "0.0.0"
 
 [[package]]
-name = "mtveil-guard"
+name = "mtevil-guard"
 version = "0.0.0"
 
 [[package]]
-name = "mtveil-harness"
+name = "mtevil-harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -325,11 +325,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "mtveil-me-pool"
+name = "mtevil-me-pool"
 version = "0.0.0"
 
 [[package]]
-name = "mtveil-proto"
+name = "mtevil-proto"
 version = "0.0.0"
 dependencies = [
  "aes",

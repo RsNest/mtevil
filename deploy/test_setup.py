@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 SETUP_PATH = Path(__file__).resolve().parent / "setup.py"
-SPEC = importlib.util.spec_from_file_location("mtveil_setup", SETUP_PATH)
+SPEC = importlib.util.spec_from_file_location("mtevil_setup", SETUP_PATH)
 setup = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(setup)
@@ -66,16 +66,16 @@ class SetupValidationTests(unittest.TestCase):
         self.assertTrue(any("unexpected AAAA" in l for l in lines2))
 
     def test_cover_cert_hostname_mismatch_from_container(self) -> None:
-        # Requires local image mtveil:wizard-test with openssl + ca-certificates.
-        if subprocess.run(["docker", "image", "inspect", "mtveil:wizard-test"], capture_output=True).returncode != 0:
-            self.skipTest("mtveil:wizard-test image not built")
+        # Requires local image mtevil:wizard-test with openssl + ca-certificates.
+        if subprocess.run(["docker", "image", "inspect", "mtevil:wizard-test"], capture_output=True).returncode != 0:
+            self.skipTest("mtevil:wizard-test image not built")
         repo = Path(__file__).resolve().parent.parent
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             (d / "compose.yaml").write_text(setup.render_compose(repo, d, "direct"), encoding="utf-8")
-            (d / ".env").write_text("MTVEIL_PROJECT=mtveil-cov-test\nMTVEIL_IMAGE=mtveil:wizard-test\nMTVEIL_BIND=127.0.0.1\nMTVEIL_PORT=26449\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_PROJECT=mtevil-cov-test\nMTEVIL_IMAGE=mtevil:wizard-test\nMTEVIL_BIND=127.0.0.1\nMTEVIL_PORT=26449\n", encoding="utf-8")
             (d / "config.json").write_text("{}\n", encoding="utf-8")
-            base = setup.compose_cmd(d, "mtveil-cov-test")
+            base = setup.compose_cmd(d, "mtevil-cov-test")
             ok_good, out_good = setup.check_cover_from_container(base, "example.com:443", "example.com")
             self.assertTrue(ok_good, out_good)
             ok_bad, _ = setup.check_cover_from_container(base, "example.com:443", "wrong-host.invalid")
@@ -156,7 +156,7 @@ class SetupValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             (d / "compose.yaml").write_text("old-compose", encoding="utf-8")
-            (d / ".env").write_text("MTVEIL_PORT=443\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_PORT=443\n", encoding="utf-8")
             (d / "config.json").write_text('{"role":"edge"}\n', encoding="utf-8")
 
             def fake_check_egress_fail(argv, **_kwargs):
@@ -175,7 +175,7 @@ class SetupValidationTests(unittest.TestCase):
             out_buf = io.StringIO()
             err_buf = io.StringIO()
             with (
-                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d), "--project", "mtveil-edge-tok", "--image", "mtveil:test", "--no-build"]),
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d), "--project", "mtevil-edge-tok", "--image", "mtevil:test", "--no-build"]),
                 mock.patch.object(sys, "stdin", io.StringIO(stdin_data)),
                 mock.patch.object(sys, "stdout", out_buf),
                 mock.patch.object(sys, "stderr", err_buf),
@@ -197,7 +197,7 @@ class SetupValidationTests(unittest.TestCase):
             out2 = io.StringIO()
             err2 = io.StringIO()
             with (
-                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d2), "--project", "mtveil-hc-test", "--image", "mtveil:test", "--no-build"]),
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d2), "--project", "mtevil-hc-test", "--image", "mtevil:test", "--no-build"]),
                 mock.patch.object(sys, "stdin", io.StringIO("1\n203.0.113.10\n25443\nn\n")),
                 mock.patch.object(sys, "stdout", out2),
                 mock.patch.object(sys, "stderr", err2),
@@ -219,7 +219,7 @@ class SetupValidationTests(unittest.TestCase):
             self.assertEqual((d / "config.json").read_text(encoding="utf-8"), "old-cfg")
 
     def _local_image(self):
-        for candidate in ("ghcr.io/rsnest/mtevil:v0.1.0-alpha.3", "mtveil:wizard-test"):
+        for candidate in ("mtevil:wizard-test", "ghcr.io/rsnest/mtevil:v0.1.0-alpha.5"):
             if subprocess.run(["docker", "image", "inspect", candidate], capture_output=True).returncode == 0:
                 return candidate
         return None
@@ -234,11 +234,11 @@ class SetupValidationTests(unittest.TestCase):
     def test_short_direct_path_defaults_non_tty_no_ansi(self):
         image = self._local_image()
         if image is None:
-            self.skipTest("no local mtveil image available")
+            self.skipTest("no local mtevil image available")
         free_port = self._free_port()
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
-            project = f"mtveil-short-test-{free_port}"
+            project = f"mtevil-short-test-{free_port}"
             stdin_data = f"1\n127.0.0.1\n{free_port}\nn\n"
             out_buf = io.StringIO()
             err_buf = io.StringIO()
@@ -266,11 +266,11 @@ class SetupValidationTests(unittest.TestCase):
     def test_busy_443_prompts_new_port_and_starts_container(self):
         image = self._local_image()
         if image is None:
-            self.skipTest("no local mtveil image available")
+            self.skipTest("no local mtevil image available")
         free_port = self._free_port()
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
-            project = f"mtveil-port-test-{free_port}"
+            project = f"mtevil-port-test-{free_port}"
             stdin_data = f"1\n127.0.0.1\n443\nn\n{free_port}\n"
             out_buf = io.StringIO()
             err_buf = io.StringIO()
@@ -297,12 +297,12 @@ class SetupValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             (d / "compose.yaml").write_text("old-compose", encoding="utf-8")
-            (d / ".env").write_text("MTVEIL_PORT=24443\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_PORT=24443\n", encoding="utf-8")
             (d / "config.json").write_text('{"sni":"example.com","cover":"example.com:443"}\n', encoding="utf-8")
 
             def fake_run(argv, **_kwargs):
                 cmd = " ".join(argv)
-                if "up -d mtveil" in cmd:
+                if "up -d mtevil" in cmd:
                     return subprocess.CompletedProcess(
                         argv,
                         1,
@@ -317,7 +317,7 @@ class SetupValidationTests(unittest.TestCase):
             out_buf = io.StringIO()
             err_buf = io.StringIO()
             with (
-                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d), "--project", "mtveil-err-test", "--image", "mtveil:test", "--no-build"]),
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d), "--project", "mtevil-err-test", "--image", "mtevil:test", "--no-build"]),
                 mock.patch.object(sys, "stdin", io.StringIO(stdin_data)),
                 mock.patch.object(sys, "stdout", out_buf),
                 mock.patch.object(sys, "stderr", err_buf),
@@ -368,7 +368,7 @@ class SetupValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             (d / "compose.yaml").write_text("old-compose", encoding="utf-8")
-            (d / ".env").write_text("MTVEIL_PORT=443\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_PORT=443\n", encoding="utf-8")
             (d / "config.json").write_text('{"role":"edge"}\n', encoding="utf-8")
 
             def fake_check_egress_fail(argv, **_kwargs):
@@ -387,7 +387,7 @@ class SetupValidationTests(unittest.TestCase):
             out_buf = io.StringIO()
             err_buf = io.StringIO()
             with (
-                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d), "--project", "mtveil-edge-tok", "--image", "mtveil:test", "--no-build"]),
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d), "--project", "mtevil-edge-tok", "--image", "mtevil:test", "--no-build"]),
                 mock.patch.object(sys, "stdin", io.StringIO(stdin_data)),
                 mock.patch.object(sys, "stdout", out_buf),
                 mock.patch.object(sys, "stderr", err_buf),
@@ -409,7 +409,7 @@ class SetupValidationTests(unittest.TestCase):
             out2 = io.StringIO()
             err2 = io.StringIO()
             with (
-                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d2), "--project", "mtveil-hc-test", "--image", "mtveil:test", "--no-build"]),
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d2), "--project", "mtevil-hc-test", "--image", "mtevil:test", "--no-build"]),
                 mock.patch.object(sys, "stdin", io.StringIO("1\n203.0.113.10\n25443\nn\n")),
                 mock.patch.object(sys, "stdout", out2),
                 mock.patch.object(sys, "stderr", err2),

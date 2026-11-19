@@ -5,7 +5,7 @@ Protocol reference (wire-exact): mtg v2 (github.com/9seconds/mtg, MIT license,
 verified 2026-11-17) — mtglib/internal/tls/fake/{client_side,server_side,utils}.go,
 mtglib/obfuscation/{obfuscator,handshake_frame}.go, mtglib/internal/tls/{conn,utils}.go.
 Uses only stdlib + `cryptography` (AES-CTR). Phase 0 client test tooling;
-this is not the mtveil data plane or a stock Telegram client.
+this is not the mtevil data plane or a stock Telegram client.
 
 Flow (ee-secret FakeTLS):
   1. ClientHello: random(32) hidden as HMAC certificate, session_id(32) carries

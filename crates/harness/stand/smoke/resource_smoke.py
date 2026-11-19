@@ -61,7 +61,7 @@ def main():
     peers = []
     process = None
     result = {'status': 'FAIL', 'scope': '12 slow loopback clients, limit 4; not a load benchmark'}
-    with CoverServer(('127.0.0.1', 0), Cover) as cover, tempfile.TemporaryDirectory(prefix='mtveil-smoke-') as temp:
+    with CoverServer(('127.0.0.1', 0), Cover) as cover, tempfile.TemporaryDirectory(prefix='mtevil-smoke-') as temp:
         worker = threading.Thread(target=cover.serve_forever, daemon=True)
         worker.start()
         secret = Path(temp) / 'secret'

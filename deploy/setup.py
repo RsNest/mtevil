@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive Docker Compose setup wizard for mtveil (Direct, Egress, Edge)."""
+"""Interactive Docker Compose setup wizard for mtevil (Direct, Egress, Edge)."""
 import argparse
 import errno
 import getpass
@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 
-DEFAULT_IMAGE = "mtveil:0.1.0-alpha.1"
+DEFAULT_IMAGE = "mtevil:0.1.0-alpha.1"
 DEFAULT_DCS = [
     "1=149.154.175.50:443",
     "2=149.154.167.51:443",
@@ -301,7 +301,7 @@ def check_cover_from_container(base: list[str], cover: str, sni: str) -> tuple[b
             "--no-deps",
             "--entrypoint",
             "openssl",
-            "mtveil",
+            compose_service(base),
             "s_client",
             "-connect",
             cover,
@@ -418,7 +418,7 @@ def deployment_owns_port(deploy_dir: Path, project: str, bind_ip: str, port: int
     if not compose_file.is_file() or not env_file.is_file():
         return False
     base = compose_cmd(deploy_dir, project)
-    proc = run(base + ["ps", "-q", "mtveil"], check=False)
+    proc = run(base + ["ps", "-q", compose_service(base)], check=False)
     cid = proc.stdout.strip()
     if not cid:
         return False
@@ -528,23 +528,23 @@ def render_compose(
     net_block = (
         "    network_mode: host"
         if network_host
-        else f'    ports:\n      - "${{MTVEIL_BIND:-127.0.0.1}}:${{MTVEIL_PORT:-{internal_port}}}:{internal_port}/tcp"'
+        else f'    ports:\n      - "${{MTEVIL_BIND:-127.0.0.1}}:${{MTEVIL_PORT:-{internal_port}}}:{internal_port}/tcp"'
     )
     extra_vol_lines = "".join(f"\n      - {v}" for v in (extra_volumes or []))
-    return f"""name: ${{MTVEIL_PROJECT:-mtveil-{role}}}
+    return f"""name: ${{MTEVIL_PROJECT:-mtevil-{role}}}
 
 x-image: &image
-  image: ${{MTVEIL_IMAGE:-{DEFAULT_IMAGE}}}{build_block}
+  image: ${{MTEVIL_IMAGE:-{DEFAULT_IMAGE}}}{build_block}
 
 services:
-  mtveil:
+  {deployment_service(deploy_dir)}:
     <<: *image
     init: true
     restart: unless-stopped
 {net_block}
     volumes:
-      - ./{config_name}:/etc/mtveil/config.json:ro
-      - state:/var/lib/mtveil{extra_vol_lines}
+      - ./{config_name}:/etc/mtevil/config.json:ro
+      - state:/var/lib/mtevil{extra_vol_lines}
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -558,7 +558,7 @@ services:
         hard: 4096
     stop_grace_period: 10s
     healthcheck:
-      test: [CMD, /usr/local/bin/mtveil, health, --address, "{health_host}:{hc_port}"]
+      test: [CMD, /usr/local/bin/mtevil, health, --address, "{health_host}:{hc_port}"]
       interval: 30s
       timeout: 3s
       retries: 3
@@ -572,6 +572,18 @@ services:
 volumes:
   state:
 """
+
+
+def deployment_service(deploy_dir: Path) -> str:
+    # Compose identifies an existing container by project and service.
+    compose = deploy_dir / "compose.yaml"
+    if compose.is_file() and "\n  mtveil:\n" in compose.read_text(encoding="utf-8"):
+        return "mtveil"
+    return "mtevil"
+
+
+def compose_service(base: list[str]) -> str:
+    return deployment_service(Path(base[-1]).parent)
 
 
 def compose_cmd(deploy_dir: Path, project: str, compose_name: str = "compose.yaml", env_name: str = ".env") -> list[str]:
@@ -596,7 +608,7 @@ def volume_file_exists(base: list[str], path_in_container: str) -> bool:
             "--no-deps",
             "--entrypoint",
             "/bin/sh",
-            "mtveil",
+            compose_service(base),
             "-c",
             f"test -s {path_in_container}",
         ],
@@ -616,8 +628,8 @@ def ensure_generated_secret(base: list[str], path_in_container: str) -> bool:
             "--rm",
             "--no-deps",
             "--entrypoint",
-            "/usr/local/bin/mtveil",
-            "mtveil",
+            "/usr/local/bin/mtevil",
+            compose_service(base),
             "secret",
             "--output",
             path_in_container,
@@ -637,7 +649,7 @@ def write_volume_secret_stdin(base: list[str], path_in_container: str, hex_secre
             "--no-deps",
             "--entrypoint",
             "/bin/sh",
-            "mtveil",
+            compose_service(base),
             "-c",
             f"umask 077 && cat > {path_in_container}",
         ],
@@ -654,7 +666,7 @@ def read_volume_secret(base: list[str], path_in_container: str) -> str:
             "--no-deps",
             "--entrypoint",
             "/bin/cat",
-            "mtveil",
+            compose_service(base),
             path_in_container,
         ]
     ).stdout.strip()
@@ -663,7 +675,7 @@ def read_volume_secret(base: list[str], path_in_container: str) -> str:
 def wait_healthy(base: list[str], timeout_s: int = 45) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        cid = run(base + ["ps", "-q", "mtveil"]).stdout.strip()
+        cid = run(base + ["ps", "-q", compose_service(base)]).stdout.strip()
         if cid:
             raw = run(["docker", "inspect", cid]).stdout
             info = json.loads(raw)[0]
@@ -671,7 +683,7 @@ def wait_healthy(base: list[str], timeout_s: int = 45) -> None:
             if status == "healthy":
                 return
         time.sleep(1.0)
-    raise TimeoutError("mtveil container did not become healthy within 45s")
+    raise TimeoutError("mtevil container did not become healthy within 45s")
 
 
 def configure_role() -> str:
@@ -707,7 +719,7 @@ def load_existing_defaults(deploy_dir: Path) -> dict[str, object]:
         for line in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
             if "=" in line:
                 k, v = line.split("=", 1)
-                defaults[k.strip()] = v.strip()
+                defaults[k.strip().replace("MTVEIL_", "MTEVIL_", 1)] = v.strip()
     cfg_file = deploy_dir / "config.json"
     if cfg_file.is_file():
         try:
@@ -720,7 +732,7 @@ def load_existing_defaults(deploy_dir: Path) -> dict[str, object]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Interactive Docker Compose wizard for mtveil")
+    parser = argparse.ArgumentParser(description="Interactive Docker Compose wizard for mtevil")
     parser.add_argument("--dir", type=Path, default=None, help="Target deployment directory (default: deploy/wizard)")
     parser.add_argument("--project", type=str, default=None, help="Docker Compose project name")
     parser.add_argument("--image", type=str, default=DEFAULT_IMAGE, help="Docker image tag")
@@ -748,16 +760,16 @@ def main() -> int:
             return 0
 
     role = args.role or configure_role()
-    project = args.project or str(saved.get("MTVEIL_PROJECT") or f"mtveil-{role}")
+    project = args.project or str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
 
-    default_bind = str(saved.get("MTVEIL_BIND") or "0.0.0.0")
+    default_bind = str(saved.get("MTEVIL_BIND") or "0.0.0.0")
     default_sni = str(saved_cfg.get("sni") or "example.com")
     default_cover = str(saved_cfg.get("cover") or f"{default_sni}:443")
     advanced_changed: list[str] = []
 
     if role == "direct":
-        default_port = str(saved.get("MTVEIL_PORT") or "443")
-        default_host = str(saved.get("MTVEIL_PUBLIC_HOST") or "") or detect_local_global_ipv4()
+        default_port = str(saved.get("MTEVIL_PORT") or "443")
+        default_host = str(saved.get("MTEVIL_PUBLIC_HOST") or "") or detect_local_global_ipv4()
         public_host, dns_records = prompt_client_address(default_host)
         print(f"\nНа каком TCP-порту принимать подключения?")
         print(f"Нажмите Enter, чтобы использовать {default_port}.")
@@ -782,8 +794,8 @@ def main() -> int:
         config_data = {
             "role": "direct",
             "listen": "0.0.0.0:24443",
-            "secret_file": "/var/lib/mtveil/proxy-secret",
-            "replay_file": "/var/lib/mtveil/replay.bin",
+            "secret_file": "/var/lib/mtevil/proxy-secret",
+            "replay_file": "/var/lib/mtevil/replay.bin",
             "sni": sni,
             "cover": cover,
             "dc": DEFAULT_DCS,
@@ -799,8 +811,8 @@ def main() -> int:
             "client_mss_bulk": 1380,
         }
     elif role == "egress":
-        default_egress_port = str(saved.get("MTVEIL_PORT") or "29443")
-        default_egress_bind = str(saved.get("MTVEIL_BIND") or "")
+        default_egress_port = str(saved.get("MTEVIL_PORT") or "29443")
+        default_egress_bind = str(saved.get("MTEVIL_BIND") or "")
         print("\nУкажите приватный IP этого сервера, по которому до него сможет дотянуться входной сервер (edge).")
         print("(Например, адрес интерфейса WireGuard, AmneziaWG или SharX; 0.0.0.0 запрещён.)")
         bind_ip = ask_validated("Локальный IP туннеля", validate_egress_ip, default_egress_bind or None)
@@ -810,7 +822,7 @@ def main() -> int:
         config_data = {
             "role": "egress",
             "listen": "0.0.0.0:29443",
-            "egress_token_file": "/var/lib/mtveil/egress-token",
+            "egress_token_file": "/var/lib/mtevil/egress-token",
             "dc": DEFAULT_DCS,
             "max_connections": 512,
             "handshake_timeout_secs": 10,
@@ -818,8 +830,8 @@ def main() -> int:
             "drain_timeout_secs": 5,
         }
     else:  # edge
-        default_port = str(saved.get("MTVEIL_PORT") or "443")
-        default_host = str(saved.get("MTVEIL_PUBLIC_HOST") or "") or detect_local_global_ipv4()
+        default_port = str(saved.get("MTEVIL_PORT") or "443")
+        default_host = str(saved.get("MTEVIL_PUBLIC_HOST") or "") or detect_local_global_ipv4()
         public_host, dns_records = prompt_client_address(default_host)
         print(f"\nНа каком TCP-порту принимать подключения?")
         print(f"Нажмите Enter, чтобы использовать {default_port}.")
@@ -859,13 +871,13 @@ def main() -> int:
         config_data = {
             "role": "edge",
             "listen": "0.0.0.0:24443",
-            "secret_file": "/var/lib/mtveil/proxy-secret",
-            "replay_file": "/var/lib/mtveil/replay.bin",
+            "secret_file": "/var/lib/mtevil/proxy-secret",
+            "replay_file": "/var/lib/mtevil/replay.bin",
             "sni": sni,
             "cover": cover,
             "egress_upstreams": upstreams,
             "egress_strategy": strategy,
-            "egress_token_file": "/var/lib/mtveil/egress-token",
+            "egress_token_file": "/var/lib/mtevil/egress-token",
             "max_connections": 256,
             "client_hello_timeout_secs": 5,
             "handshake_timeout_secs": 10,
@@ -918,11 +930,11 @@ def main() -> int:
     cand_token = deploy_dir / ".egress-token.candidate"
     pending_edge_token: str | None = None
     env_text = (
-        f"MTVEIL_PROJECT={project}\n"
-        f"MTVEIL_IMAGE={args.image}\n"
-        f"MTVEIL_BIND={bind_ip}\n"
-        f"MTVEIL_PORT={pub_port}\n"
-        + (f"MTVEIL_PUBLIC_HOST={public_host}\n" if role in ("direct", "edge") else "")
+        f"MTEVIL_PROJECT={project}\n"
+        f"MTEVIL_IMAGE={args.image}\n"
+        f"MTEVIL_BIND={bind_ip}\n"
+        f"MTEVIL_PORT={pub_port}\n"
+        + (f"MTEVIL_PUBLIC_HOST={public_host}\n" if role in ("direct", "edge") else "")
     )
     cfg_text = json.dumps(config_data, indent=2) + "\n"
 
@@ -951,7 +963,7 @@ def main() -> int:
 
         run(cand_base + ["config", "--quiet"])
         if not args.no_build:
-            print("\nСборка Docker-образа mtveil...")
+            print("\nСборка Docker-образа mtevil...")
             build_proc = run(cand_base + ["build"], capture=True, check=False)
             if build_proc.returncode != 0:
                 detail = (build_proc.stderr or build_proc.stdout or "").strip()
@@ -965,7 +977,7 @@ def main() -> int:
         # Ensure secrets / tokens in the state volume without overwriting existing ones.
         if role in ("direct", "edge"):
             try:
-                created = ensure_generated_secret(cand_base, "/var/lib/mtveil/proxy-secret")
+                created = ensure_generated_secret(cand_base, "/var/lib/mtevil/proxy-secret")
             except RuntimeError as exc:
                 summary, action = diagnose_docker_error(str(exc), args.image)
                 print(f"{err_text(summary)}\nДальше: {action}", file=sys.stderr)
@@ -973,22 +985,22 @@ def main() -> int:
             print("Секрет клиента: создан в томе state." if created else "Секрет клиента: сохранён прежний из тома state.")
 
         if role == "egress":
-            if volume_file_exists(cand_base, "/var/lib/mtveil/egress-token"):
+            if volume_file_exists(cand_base, "/var/lib/mtevil/egress-token"):
                 print("Токен MTV2: сохранён прежний из тома state.")
             else:
                 is_first = ask_yes_no("Это первый узел egress (сгенерировать новый токен MTV2)?", default=True)
                 if is_first:
-                    ensure_generated_secret(cand_base, "/var/lib/mtveil/egress-token")
+                    ensure_generated_secret(cand_base, "/var/lib/mtevil/egress-token")
                     print("Токен MTV2 сгенерирован и сохранён в томе state (0600).")
                     if ask_yes_no("Показать сгенерированный токен MTV2 для копирования на edge?", default=False):
-                        tok = read_volume_secret(cand_base, "/var/lib/mtveil/egress-token")
+                        tok = read_volume_secret(cand_base, "/var/lib/mtevil/egress-token")
                         print(f"Токен MTV2: {tok}")
                 else:
                     tok = ask_hidden_token("Введите токен MTV2 с основного egress")
-                    write_volume_secret_stdin(cand_base, "/var/lib/mtveil/egress-token", tok)
+                    write_volume_secret_stdin(cand_base, "/var/lib/mtevil/egress-token", tok)
                     print("Токен MTV2 импортирован в том state.")
         elif role == "edge":
-            if volume_file_exists(cand_base, "/var/lib/mtveil/egress-token") and ask_yes_no(
+            if volume_file_exists(cand_base, "/var/lib/mtevil/egress-token") and ask_yes_no(
                 "Использовать существующий токен MTV2 из тома state?", default=True
             ):
                 print("Токен MTV2: сохранён прежний из тома state.")
@@ -1000,7 +1012,7 @@ def main() -> int:
                 except OSError:
                     pass
                 cand_cfg_data = dict(config_data)
-                cand_cfg_data["egress_token_file"] = "/etc/mtveil/egress-token.candidate"
+                cand_cfg_data["egress_token_file"] = "/etc/mtevil/egress-token.candidate"
                 cand_config.write_text(json.dumps(cand_cfg_data, indent=2) + "\n", encoding="utf-8")
                 cand_compose.write_text(
                     render_compose(
@@ -1012,14 +1024,14 @@ def main() -> int:
                         health_host=health_host,
                         health_port=pub_port,
                         include_build=include_build,
-                        extra_volumes=["./.egress-token.candidate:/etc/mtveil/egress-token.candidate:ro"],
+                        extra_volumes=["./.egress-token.candidate:/etc/mtevil/egress-token.candidate:ro"],
                     ),
                     encoding="utf-8",
                 )
                 print("Токен MTV2 подготовлен для проверки (рабочий том state пока не изменён).")
 
         cfg_check = run(
-            cand_base + ["run", "--rm", "--no-deps", "mtveil", "--config", "/etc/mtveil/config.json", "--check-config"],
+            cand_base + ["run", "--rm", "--no-deps", compose_service(cand_base), "--config", "/etc/mtevil/config.json", "--check-config"],
             check=False,
         )
         if cfg_check.returncode != 0:
@@ -1046,7 +1058,7 @@ def main() -> int:
         if role == "edge":
             print("\nПроверка узлов egress из сетевого контекста edge (DC 2)...")
             check_proc = run(
-                cand_base + ["run", "--rm", "--no-deps", "mtveil", "check-egress", "--config", "/etc/mtveil/config.json", "--dc", "2"],
+                cand_base + ["run", "--rm", "--no-deps", compose_service(cand_base), "check-egress", "--config", "/etc/mtevil/config.json", "--dc", "2"],
                 check=False,
             )
             print(check_proc.stdout.strip())
@@ -1065,6 +1077,16 @@ def main() -> int:
                     print("Прервано до применения изменений. Текущая конфигурация не затронута.")
                     return 1
 
+        live_compose = render_compose(
+            repo_root,
+            deploy_dir,
+            role,
+            "config.json",
+            network_host=args.network_host,
+            health_host=health_host,
+            health_port=pub_port,
+            include_build=include_build,
+        )
         # Back up existing deployment files before promoting validated candidate.
         had_backup = False
         for name in ("compose.yaml", ".env", "config.json"):
@@ -1072,24 +1094,12 @@ def main() -> int:
             if live.exists():
                 live.replace(deploy_dir / f"{name}.bak")
                 had_backup = True
-        (deploy_dir / "compose.yaml").write_text(
-            render_compose(
-                repo_root,
-                deploy_dir,
-                role,
-                "config.json",
-                network_host=args.network_host,
-                health_host=health_host,
-                health_port=pub_port,
-                include_build=include_build,
-            ),
-            encoding="utf-8",
-        )
+        (deploy_dir / "compose.yaml").write_text(live_compose, encoding="utf-8")
         os.replace(cand_env, deploy_dir / ".env")
         os.replace(cand_config, deploy_dir / "config.json")
         if pending_edge_token is not None:
             (deploy_dir / "config.json").write_text(cfg_text, encoding="utf-8")
-            write_volume_secret_stdin(base, "/var/lib/mtveil/egress-token", pending_edge_token)
+            write_volume_secret_stdin(base, "/var/lib/mtevil/egress-token", pending_edge_token)
             print("Токен MTV2 сохранён в томе state.")
         run(base + ["config", "--quiet"])
     finally:
@@ -1100,7 +1110,7 @@ def main() -> int:
     up_succeeded = False
     try:
         while True:
-            up_proc = run(base + ["up", "-d", "mtveil"], check=False)
+            up_proc = run(base + ["up", "-d", compose_service(base)], check=False)
             if up_proc.returncode == 0:
                 up_succeeded = True
                 break
@@ -1129,8 +1139,8 @@ def main() -> int:
                 pub_port = ask_validated("Другой порт", validate_port)
             pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=(role in ("direct", "edge")))
             (deploy_dir / ".env").write_text(
-                f"MTVEIL_PROJECT={project}\nMTVEIL_IMAGE={args.image}\nMTVEIL_BIND={bind_ip}\nMTVEIL_PORT={pub_port}\n"
-                + (f"MTVEIL_PUBLIC_HOST={public_host}\n" if role in ("direct", "edge") else ""),
+                f"MTEVIL_PROJECT={project}\nMTEVIL_IMAGE={args.image}\nMTEVIL_BIND={bind_ip}\nMTEVIL_PORT={pub_port}\n"
+                + (f"MTEVIL_PUBLIC_HOST={public_host}\n" if role in ("direct", "edge") else ""),
                 encoding="utf-8",
             )
             if args.network_host:
@@ -1160,7 +1170,7 @@ def main() -> int:
         wait_healthy(base)
     except TimeoutError:
         print(err_text("Контейнер не перешёл в статус healthy за 45 секунд."), file=sys.stderr)
-        print(f"Проверьте логи этой установки: docker compose {compose_ref} logs --tail=100 mtveil", file=sys.stderr)
+        print(f"Проверьте логи этой установки: docker compose {compose_ref} logs --tail=100 {compose_service(base)}", file=sys.stderr)
         return 1
     print(ok_text("Контейнер исправен"))
 
@@ -1170,11 +1180,11 @@ def main() -> int:
             + [
                 "exec",
                 "-T",
-                "mtveil",
-                "mtveil",
+                compose_service(base),
+                "mtevil",
                 "link",
                 "--config",
-                "/etc/mtveil/config.json",
+                "/etc/mtevil/config.json",
                 "--server",
                 public_host,
                 "--port",
@@ -1191,13 +1201,13 @@ def main() -> int:
         print("\n" + heading("Что указать на входном сервере (edge)"))
         print(f"  Адрес выхода: {bind_ip}:{pub_port}")
         print(f"  Режим в мастере на edge: 2 (несколько серверов) -> 2 (Входной сервер (edge))")
-        print(f"  Получить токен MTV2 безопасно: docker compose {compose_ref} exec -T mtveil cat /var/lib/mtveil/egress-token")
+        print(f"  Получить токен MTV2 безопасно: docker compose {compose_ref} exec -T {compose_service(base)} cat /var/lib/mtevil/egress-token")
 
     print("\nУправление и диагностика:")
     print(f"  docker compose {compose_ref} ps")
-    print(f"  docker compose {compose_ref} logs --tail=100 mtveil")
+    print(f"  docker compose {compose_ref} logs --tail=100 {compose_service(base)}")
     if role == "edge":
-        print(f"  docker compose {compose_ref} exec mtveil mtveil check-egress --config /etc/mtveil/config.json --dc 2")
+        print(f"  docker compose {compose_ref} exec {compose_service(base)} mtevil check-egress --config /etc/mtevil/config.json --dc 2")
 
     return 0
 

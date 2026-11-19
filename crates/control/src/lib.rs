@@ -1,4 +1,4 @@
-//! `mtveil-control` — control plane: epoch-конфиги, пользователи, localhost API, /metrics, lifecycle.
+//! `mtevil-control` — control plane: epoch-конфиги, пользователи, localhost API, /metrics, lifecycle.
 //!
 //! **Статус: пуст.** Код — после ADR-001 и спеки `docs/specs/control.md`.
 //!

@@ -1,6 +1,6 @@
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
-use mtveil_proto::{self as wire, AesCtr};
+use mtevil_proto::{self as wire, AesCtr};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -25,7 +25,7 @@ mod telemetry;
 use serde_json::json;
 
 #[derive(Parser)]
-#[command(name = "mtveil", version, about = "Experimental MTProto Direct proxy")]
+#[command(name = "mtevil", version, about = "Experimental MTProto Direct proxy")]
 struct Args {
     #[command(subcommand)]
     command: Option<Action>,

@@ -1,4 +1,4 @@
-//! mtveil-harness — артефакты Phase 0 (docs/specs/phase-0.md).
+//! mtevil-harness — артефакты Phase 0 (docs/specs/phase-0.md).
 //!
 //! Реализовано: `corpus verify` (structural|acceptance), `report lint`,
 //! `report seal`, `stand up/down/preflight`. Каркасы с зафиксированными
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "mtveil-harness",
+    name = "mtevil-harness",
     about = "Phase 0 harness: корпус, генератор, стенд, отчёты",
     version
 )]
@@ -155,7 +155,7 @@ fn main() -> anyhow::Result<()> {
             secret_file,
             sni,
         } => {
-            let python = std::env::var("MTVEIL_PYTHON").unwrap_or_else(|_| {
+            let python = std::env::var("MTEVIL_PYTHON").unwrap_or_else(|_| {
                 if cfg!(windows) {
                     "python".into()
                 } else {

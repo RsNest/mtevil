@@ -1,4 +1,4 @@
-# mtveil — Architecture Baseline v1.3
+# mtevil — Architecture Baseline v1.3
 ## Итоговое архитектурное решение. Обязательно для всего проекта.
 
 > **Статус:** действует. Изменения — только через ADR (`docs/adr/NNN-*.md`).
@@ -97,7 +97,7 @@ Cover-коммит — при первом из: байт клиента фор�
 ошибка после коммита → drain/close, не cover.
 
 ### INV-02 · Replay: атомарность и персистентность
-Таблица в **tmpfs-mmap** (`/run/mtveil/replay.tbl`), разбитая на N шардов (напр. 256).
+Таблица в **tmpfs-mmap** (`/run/mtevil/replay.tbl`), разбитая на N шардов (напр. 256).
 Каждый шард — **process-shared robust mutex** (не lock-free CAS: проще, переживает смерть
 владельца через `EOWNERDEAD` + recovery). `check_and_insert` — одна критическая секция.
 Ключ = canonical HMAC (32 Б), TTL 300 с; ленивое протухание + bounded sweep в control plane.
@@ -390,7 +390,7 @@ recovery-таксономия, forced_close_ratio, rst_ratio (сверка), pro
 
 ### 14.1. Репозиторий
 ```text
-mtveil/
+mtevil/
   docs/adr/                  # ADR-000 (этот baseline), ADR-001 (gate), ...
   docs/specs/                # спеки компонентов, failure-matrix, методики
   crates/

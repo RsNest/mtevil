@@ -17,7 +17,7 @@ import struct
 import sys
 import time
 
-DUT_HOST = sys.argv[1] if len(sys.argv) > 1 else "mtveil-dut-telemt"
+DUT_HOST = sys.argv[1] if len(sys.argv) > 1 else "mtevil-dut-telemt"
 DUT_PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 443
 CLOSED_PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 9999
 ERRORS = 0

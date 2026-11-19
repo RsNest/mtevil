@@ -14,10 +14,10 @@ def main():
     parser.add_argument('--out',type=Path,required=True)
     args=parser.parse_args()
     args.out.mkdir(parents=True,exist_ok=True)
-    project='mtveil-release-smoke'
-    env=dict(os.environ,MTVEIL_BIND='127.0.0.1',MTVEIL_PORT='25443')
+    project='mtevil-release-smoke'
+    env=dict(os.environ,MTEVIL_BIND='127.0.0.1',MTEVIL_PORT='25443')
     compose=['docker','compose','-p',project,'-f','deploy/compose.yaml']
-    rollback='mtveil:release-smoke-rollback'
+    rollback='mtevil:release-smoke-rollback'
     result={'status':'FAIL','scope':'isolated Compose lifecycle, no Telegram DC validation'}
     created=False
     logs=[]
@@ -27,7 +27,7 @@ def main():
             raise RuntimeError('command failed: '+ ' '.join(argv[:6])+'; '+p.stderr[:300])
         return p
     def dc(*argv,**kwargs):return command(compose+list(argv),**kwargs)
-    def cid():return dc('ps','-q','mtveil').stdout.strip()
+    def cid():return dc('ps','-q','mtevil').stdout.strip()
     def inspect():return json.loads(command(['docker','inspect',cid()]).stdout)[0]
     def healthy():
         limit=time.monotonic()+45
@@ -40,7 +40,7 @@ def main():
         raise TimeoutError('container not healthy within 45s')
     def link():
         # Capture credentials locally without printing them or including them in evidence.
-        return dc('exec','-T','mtveil','mtveil','link','--config','/etc/mtveil/config.json','--server','127.0.0.1','--port','25443').stdout.strip()
+        return dc('exec','-T','mtevil','mtevil','link','--config','/etc/mtevil/config.json','--server','127.0.0.1','--port','25443').stdout.strip()
     try:
         if command(['docker','ps','-aq','--filter','label=com.docker.compose.project='+project]).stdout.strip():
             raise RuntimeError('smoke project already exists; left untouched')
@@ -49,8 +49,8 @@ def main():
         dc('config','--quiet')
         created=True
         dc('--profile','tools','run','--rm','init')
-        dc('run','--rm','--no-deps','mtveil','--config','/etc/mtveil/config.json','--check-config')
-        dc('up','-d','mtveil')
+        dc('run','--rm','--no-deps','mtevil','--config','/etc/mtevil/config.json','--check-config')
+        dc('up','-d','mtevil')
         data=healthy()
         assert data['Config']['User']=='10001:10001'
         assert data['HostConfig']['ReadonlyRootfs'] is True
@@ -60,25 +60,25 @@ def main():
         assert first.startswith('https://t.me/proxy?server=127.0.0.1&port=25443&secret=ee')
         assert dc('--profile','tools','run','--rm','init',check=False).returncode!=0
         assert link()==first
-        dc('stop','mtveil')
+        dc('stop','mtevil')
         stopped=json.loads(command(['docker','inspect',data['Id']]).stdout)[0]
         assert stopped['State']['ExitCode']==0
-        dc('up','-d','mtveil')
+        dc('up','-d','mtevil')
         data=healthy();assert link()==first
         # Kill the application, not Docker's manually-stopped flag; restart policy must recover it.
         time.sleep(10)
         before=data['RestartCount']
         command(['docker','exec',data['Id'],'/bin/sh','-c',
-                 'for p in /proc/[0-9]*/comm; do read -r name < "$p" || continue; if [ "$name" = mtveil ]; then n=${p#/proc/}; n=${n%/comm}; kill -KILL "$n"; exit; fi; done'])
+                 'for p in /proc/[0-9]*/comm; do read -r name < "$p" || continue; if [ "$name" = mtevil ]; then n=${p#/proc/}; n=${n%/comm}; kill -KILL "$n"; exit; fi; done'])
         deadline=time.monotonic()+45
         while time.monotonic()<deadline:
             data=healthy()
             if data['RestartCount']>before:break
             time.sleep(0.5)
         assert data['RestartCount']>before and link()==first
-        command(['docker','image','tag','mtveil:0.1.0-alpha.1',rollback])
-        rollback_env=dict(env,MTVEIL_IMAGE=rollback)
-        dc('up','-d','--no-build','mtveil',alternate=rollback_env)
+        command(['docker','image','tag','mtevil:0.1.0-alpha.1',rollback])
+        rollback_env=dict(env,MTEVIL_IMAGE=rollback)
+        dc('up','-d','--no-build','mtevil',alternate=rollback_env)
         data=healthy()
         assert data['Config']['Image']==rollback and link()==first
         result.update(status='PASS',non_root=True,read_only_rootfs=True,
@@ -91,7 +91,7 @@ def main():
         raise
     finally:
         if created:
-            logs.append(dc('logs','--no-color','mtveil',check=False).stdout)
+            logs.append(dc('logs','--no-color','mtevil',check=False).stdout)
             dc('down','-v',check=False)
             command(['docker','image','rm',rollback],check=False)
         (args.out/'deployment-smoke.json').write_text(json.dumps(result,indent=2))

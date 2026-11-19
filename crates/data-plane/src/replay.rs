@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn inv02_persistent_replay_survives_reload() -> Result<()> {
         let dir = std::env::temp_dir().join(format!(
-            "mtveil-replay-test-{}",
+            "mtevil-replay-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()

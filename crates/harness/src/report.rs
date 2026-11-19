@@ -289,7 +289,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let d =
-            std::env::temp_dir().join(format!("mtveil-lint-test-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("mtevil-lint-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d

@@ -79,7 +79,7 @@ class TunnelConnection:
 async def run(factory, secret, sni):
     from telethon.network.mtprotosender import MTProtoSender
     from telethon.tl.functions import PingRequest
-    loggers = defaultdict(lambda: logging.getLogger('mtveil.auth-smoke'))
+    loggers = defaultdict(lambda: logging.getLogger('mtevil.auth-smoke'))
     connection = TunnelConnection(factory, secret, sni)
     sender = MTProtoSender(None, loggers=loggers, retries=1, auto_reconnect=False,
                           connect_timeout=20)

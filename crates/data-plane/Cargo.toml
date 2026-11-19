@@ -1,15 +1,15 @@
 [package]
-name = "mtveil-data-plane"
+name = "mtevil-data-plane"
 version = "0.1.0-alpha.1"
 edition.workspace = true
 description = "Test-only FakeTLS Direct proxy authorized by ADR-001"
 
 [[bin]]
-name = "mtveil"
+name = "mtevil"
 path = "src/main.rs"
 
 [dependencies]
-mtveil-proto = { path = "../proto" }
+mtevil-proto = { path = "../proto" }
 anyhow.workspace = true
 clap.workspace = true
 hex.workspace = true

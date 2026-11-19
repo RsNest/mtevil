@@ -10,7 +10,7 @@
 
 set -eu
 RUN_DIR="${RUN_DIR:-/runs/current}"
-DUT_CONTAINER="${DUT_CONTAINER:-mtveil-dut-telemt}"
+DUT_CONTAINER="${DUT_CONTAINER:-mtevil-dut-telemt}"
 OUT="${RUN_DIR}/raw/nstat/dut.jsonl"
 mkdir -p "$(dirname "$OUT")"
 

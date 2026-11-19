@@ -1,4 +1,4 @@
-//! `mtveil-egress` — egress plane: direct/socks5/interface/bind + scopes, health, `me_nat_ip`.
+//! `mtevil-egress` — egress plane: direct/socks5/interface/bind + scopes, health, `me_nat_ip`.
 //!
 //! **Статус: пуст.** Код — после ADR-001 и спеки `docs/specs/egress.md`.
 //!

@@ -1,6 +1,6 @@
 {
   "listen": "0.0.0.0:24443",
-  "secret_file": "/var/lib/mtveil/proxy-secret",
+  "secret_file": "/var/lib/mtevil/proxy-secret",
   "sni": "example.com",
   "cover": "example.com:443",
   "dc": [

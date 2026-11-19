@@ -1,11 +1,11 @@
-"""Transparent TCP ingress for an isolated mtveil test."""
+"""Transparent TCP ingress for an isolated mtevil test."""
 import asyncio
 import json
 import os
 import time
 
-LISTEN = os.environ['MTVEIL_LISTEN']
-BACKEND = os.environ['MTVEIL_BACKEND']
+LISTEN = os.environ['MTEVIL_LISTEN']
+BACKEND = os.environ['MTEVIL_BACKEND']
 stats = dict(active=0, accepted=0, rejected=0, errors=0, uploaded=0, downloaded=0)
 
 

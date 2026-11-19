@@ -105,7 +105,7 @@ fn default_drain() -> u64 {
     5
 }
 fn default_fake_tls_cert_bytes() -> usize {
-    mtveil_proto::DEFAULT_CERT_BYTES
+    mtevil_proto::DEFAULT_CERT_BYTES
 }
 fn default_fake_tls_cert_jitter() -> usize {
     0
@@ -155,7 +155,7 @@ impl Config {
             (1..=300).contains(&self.drain_timeout_secs),
             "drain timeout must be 1..300 seconds"
         );
-        mtveil_proto::ServerFlightProfile {
+        mtevil_proto::ServerFlightProfile {
             cert_bytes: self.fake_tls_cert_bytes,
             jitter: self.fake_tls_cert_jitter,
         }
@@ -305,7 +305,7 @@ mod tests {
         assert_eq!(c.listen, SocketAddr::from(([127, 0, 0, 1], 24443)));
         assert_eq!(c.max_connections, 128);
         assert!(!c.enable_dd);
-        assert_eq!(c.fake_tls_cert_bytes, mtveil_proto::DEFAULT_CERT_BYTES);
+        assert_eq!(c.fake_tls_cert_bytes, mtevil_proto::DEFAULT_CERT_BYTES);
         assert_eq!(c.fake_tls_cert_jitter, 0);
         assert!(serde_json::from_str::<Config>(r#"{"secret_file":"secret","sni":"example.com","cover":"example.com:443","dc":[],"max_conections":100}"#).is_err());
         Ok(())
@@ -325,7 +325,7 @@ mod tests {
         c.fake_tls_cert_bytes = 511;
         assert!(c.validate().is_err());
         let mut c = config()?;
-        c.fake_tls_cert_bytes = mtveil_proto::MAX_CERT_BYTES + 1;
+        c.fake_tls_cert_bytes = mtevil_proto::MAX_CERT_BYTES + 1;
         assert!(c.validate().is_err());
         let mut c = config()?;
         c.fake_tls_cert_jitter = 4096;

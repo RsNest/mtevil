@@ -13,7 +13,7 @@ MTProto-прокси для Telegram на Rust. На одном Linux VPS мас
 Подключитесь к VPS по SSH и выполните эти команды в Bash. Установщик скачает готовый образ и откроет мастер настройки.
 
 ```bash
-curl -fsSL https://github.com/RsNest/mtevil/releases/download/v0.1.0-alpha.4/install.sh -o install.sh &&
+curl -fsSL https://github.com/RsNest/mtevil/releases/download/v0.1.0-alpha.5/install.sh -o install.sh &&
   bash install.sh
 ```
 
@@ -22,7 +22,7 @@ curl -fsSL https://github.com/RsNest/mtevil/releases/download/v0.1.0-alpha.4/ins
 3. По умолчанию для HTTPS-маскировки используется `example.com:443` (его можно поменять в «Расширенных настройках»).
 4. Откройте ссылку, которую выдаст мастер, в Telegram и нажмите «Подключить прокси». Для проверки переключитесь на мобильную сеть и откройте фото или видео в чате.
 
-Команда выше устанавливает [релиз `v0.1.0-alpha.4`](https://github.com/RsNest/mtevil/releases/tag/v0.1.0-alpha.4). В нём каталог ещё называется `~/mtveil`. В новой версии установщика каталог называется `~/mtevil`. При обновлении прежней установки этот путь ведёт к уже имеющимся файлам, а Docker продолжает использовать тот же том с секретами.
+Команда выше устанавливает [релиз `v0.1.0-alpha.5`](https://github.com/RsNest/mtevil/releases/tag/v0.1.0-alpha.5). В предыдущих версиях каталог назывался `~/mtveil`, в новой версии установщика — `~/mtevil`. При обновлении прежней установки этот путь ведёт к уже имеющимся файлам, а Docker продолжает использовать тот же том с секретами.
 
 <details>
 <summary>Установка из исходников</summary>

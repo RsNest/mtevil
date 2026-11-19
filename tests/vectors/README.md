@@ -4,7 +4,7 @@
 
 - `index.json` — индекс: `{"version":1,"vectors":[{"id","file","sha256","class","transport"}]}`.
 - Векторы — JSON по схеме §3.2 (records hex, expect по INV-01/INV-04).
-- Приёмка: `cargo run -p mtveil-harness -- corpus verify`.
+- Приёмка: `cargo run -p mtevil-harness -- corpus verify`.
 - `clients.lock` — версии стоковых клиентов, с которых сняты захваты.
 - `pcap-derived/` — нормализованные таблицы кадров генератора (§4.3) + sha256.
 

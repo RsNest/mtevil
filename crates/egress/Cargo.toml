@@ -1,5 +1,5 @@
 [package]
-name = "mtveil-egress"
+name = "mtevil-egress"
 version = "0.0.0"
 edition.workspace = true
 description = "Upstreams, health, routing. ПУСТО: spec-first, код после ADR-001 (ADR-000 §1)"

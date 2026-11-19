@@ -1,6 +1,6 @@
 # Совместимый Direct-прототип (ADR-001)
 
-Бинарник `mtveil`, крейты `proto` (чистые байтовые операции) и `data-plane`
+Бинарник `mtevil`, крейты `proto` (чистые байтовые операции) и `data-plane`
 (Tokio I/O). Это тестовый прототип, не production-релиз.
 
 Вход: TLS ClientHello до 4096 байт handshake body, до 16 TLS records.
@@ -55,7 +55,7 @@ deadlines, release permit и остановку при насыщенном admi
 Малый Linux resource smoke (не нагрузочный benchmark):
 
 ```text
-python3 crates/harness/stand/smoke/resource_smoke.py --binary target/release/mtveil --out runs/resource-smoke
+python3 crates/harness/stand/smoke/resource_smoke.py --binary target/release/mtevil --out runs/resource-smoke
 ```
 
 Он создаёт 12 медленных loopback-соединений при лимите 4, фиксирует /proc FD/RSS,

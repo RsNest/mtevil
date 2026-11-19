@@ -27,7 +27,7 @@ def main():
         info=dict(line.split(': ',1) for line in cli('show info').splitlines() if ': ' in line)
         rows=csv.DictReader(io.StringIO(cli('show stat').replace('# pxname','pxname',1)))
         fields=['pxname','svname','scur','stot','bin','bout','qcur','econ','eresp','cli_abrt','srv_abrt','wretr','wredis','status']
-        selected=[{k:row.get(k) for k in fields} for row in rows if row.get('pxname') in ['se_443','mtveil_live_test']]
+        selected=[{k:row.get(k) for k in fields} for row in rows if row.get('pxname') in ['se_443','mtevil_live_test']]
         proc=Path('/sys/fs/cgroup/system.slice')/a.unit/'cgroup.procs'
         emit({'event':'sample','haproxy_worker_pid':info.get('Pid'),'haproxy_uptime_sec':info.get('Uptime_sec'),'dut_pids':proc.read_text().split() if proc.exists() else [],'counters':selected})
     journal=subprocess.Popen(['journalctl','-u',a.unit,'-f','-n','0','-o','json','--no-pager'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Restore only the temporary mtveil HAProxy route; preserve unrelated edits."""
+"""Restore only the temporary mtevil HAProxy route; preserve unrelated edits."""
 import argparse,fcntl,hashlib,json,os,shutil,signal,subprocess,tempfile,threading,time
 from pathlib import Path
 
@@ -21,7 +21,7 @@ def restore(state_path):
                     if text.count(block)!=1:raise RuntimeError('route restoration conflict: manual review required')
                     text=text.replace(block,'',1)
                 restored=text.encode()
-            fd,name=tempfile.mkstemp(prefix='.mtveil-restore-',dir=config.parent);os.close(fd)
+            fd,name=tempfile.mkstemp(prefix='.mtevil-restore-',dir=config.parent);os.close(fd)
             temp=Path(name)
             try:
                 shutil.copy2(config,temp);temp.write_bytes(restored)

@@ -1,4 +1,4 @@
-//! `mtveil-me-pool` — ME-writer'ы (Dialing → Handshaking → Ready → Draining → Dead) и Direct.
+//! `mtevil-me-pool` — ME-writer'ы (Dialing → Handshaking → Ready → Draining → Dead) и Direct.
 //!
 //! **Статус: пуст.** Код — после ADR-001 и спеки `docs/specs/me-pool.md`.
 //!

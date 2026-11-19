@@ -16,7 +16,7 @@ RUN git clone https://github.com/telemt/telemt . \
 
 FROM debian:bookworm-slim
 ARG TELEMT_REF=dac7aeeeda55951cf03a229ee9357e2af558d45e
-LABEL mtveil.dut="telemt" mtveil.ref="${TELEMT_REF}"
+LABEL mtevil.dut="telemt" mtevil.ref="${TELEMT_REF}"
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/telemt /usr/local/bin/telemt
 COPY --from=build /src/pinned-commit.txt /etc/telemt/pinned-commit.txt

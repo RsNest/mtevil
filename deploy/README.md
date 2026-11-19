@@ -1,4 +1,4 @@
-# Тестовый релиз mtveil 0.1.0-alpha.1
+# Тестовый релиз mtevil 0.1.0-alpha.1
 
 Нужен Linux-сервер с Docker Engine и плагином Docker Compose, исходящим TCP
 доступом к Telegram DC и выбранному HTTPS-cover. Это experimental alpha:
@@ -7,13 +7,13 @@
 
 ## Первый запуск
 
-На сервере, в каталоге исходников mtveil, в Bash:
+На сервере, в каталоге исходников mtevil, в Bash:
 
 ```bash
 docker compose -f deploy/compose.yaml build
 docker compose -f deploy/compose.yaml --profile tools run --rm init
-docker compose -f deploy/compose.yaml run --rm --no-deps mtveil --config /etc/mtveil/config.json --check-config
-docker compose -f deploy/compose.yaml up -d mtveil
+docker compose -f deploy/compose.yaml run --rm --no-deps mtevil --config /etc/mtevil/config.json --check-config
+docker compose -f deploy/compose.yaml up -d mtevil
 docker compose -f deploy/compose.yaml ps
 ```
 
@@ -35,12 +35,12 @@ NAT/прокси. На действующей ноде не используйт
 После проверки задайте адрес/порт публикации; например для отдельного сервера:
 
 ```bash
-MTVEIL_BIND=0.0.0.0 MTVEIL_PORT=443 docker compose -f deploy/compose.yaml up -d mtveil
-docker compose -f deploy/compose.yaml exec mtveil mtveil link --config /etc/mtveil/config.json --server YOUR_SERVER_IP --port 443
+MTEVIL_BIND=0.0.0.0 MTEVIL_PORT=443 docker compose -f deploy/compose.yaml up -d mtevil
+docker compose -f deploy/compose.yaml exec mtevil mtevil link --config /etc/mtevil/config.json --server YOUR_SERVER_IP --port 443
 ```
 
 Команда `link` намеренно раскрывает секрет в ссылке — выдавайте её только
-предназначенным тестировщикам. Для повторных deploy сохраните MTVEIL_BIND/PORT
+предназначенным тестировщикам. Для повторных deploy сохраните MTEVIL_BIND/PORT
 в локальном `deploy/.env` (этот файл не включается в git/build context).
 Шаблон — `deploy/.env.example`. Compose читает `.env` рядом с выбранным
 Compose-файлом; при необходимости укажите его явно через `--env-file`
@@ -56,9 +56,9 @@ HTTPS-cover; пример использует example.com. Перед изме�
 ## Диагностика и остановка
 
 ```bash
-docker compose -f deploy/compose.yaml logs --tail=100 mtveil
-docker compose -f deploy/compose.yaml stats --no-stream mtveil
-docker compose -f deploy/compose.yaml stop mtveil
+docker compose -f deploy/compose.yaml logs --tail=100 mtevil
+docker compose -f deploy/compose.yaml stats --no-stream mtevil
+docker compose -f deploy/compose.yaml stop mtevil
 docker compose -f deploy/compose.yaml down
 ```
 
@@ -72,23 +72,23 @@ SIGTERM прекращает приём, затем даёт сессиям drai
 Перед изменением исходников сохраните image текущей версии под отдельным тегом:
 
 ```bash
-docker image tag mtveil:0.1.0-alpha.1 mtveil:rollback
+docker image tag mtevil:0.1.0-alpha.1 mtevil:rollback
 ```
 
 Сохраните копию config.json. Соберите новую версию, выполните `--check-config`,
-затем `up -d mtveil`. Для отката восстановите совместимый config.json и выполните:
+затем `up -d mtevil`. Для отката восстановите совместимый config.json и выполните:
 
 ```bash
-MTVEIL_IMAGE=mtveil:rollback docker compose -f deploy/compose.yaml up -d --no-build mtveil
+MTEVIL_IMAGE=mtevil:rollback docker compose -f deploy/compose.yaml up -d --no-build mtevil
 ```
 
-При откате используйте прежние MTVEIL_BIND/PORT. Том секрета не удаляйте.
+При откате используйте прежние MTEVIL_BIND/PORT. Том секрета не удаляйте.
 Обновление перезапускает единственный процесс: zero-downtime здесь не обещается,
 replay-cache при перезапуске очищается. Базовые образы закреплены digest'ами;
 байт-идентичность сборки и registry publication пока не заявляются.
 
 Пакет проверен на Linux/amd64. Прикладная проверка Telegram DC — отдельная
-команда `mtveil-harness probe`, она требует тестового секрета и Python-клиента.
+команда `mtevil-harness probe`, она требует тестового секрета и Python-клиента.
 Перед выдачей ссылки тестировщикам выполните её либо ручную проверку настоящим
 Telegram с отправкой и загрузкой медиа. Наличие `healthy` этого не заменяет.
 
@@ -123,7 +123,7 @@ python3 deploy/setup.py --network-host
    - Запрашивает публичный адрес/порт, SNI и cover, список `egress_upstreams` в порядке приоритета, общий токен `MTV2` (скрытый ввод) и стратегию:
      - `ordered` — всегда начинает с первого (primary) egress и при сбое перебирает резервные по порядку;
      - `round-robin` — балансирует новые сессии по кругу (поведение по умолчанию для старых конфигов без `egress_strategy`).
-   - Перед запуском выполняет `mtveil check-egress --config /etc/mtveil/config.json --dc 2` из сетевого контекста edge-контейнера (отдельно показывает TCP-доступность, проверку токена и связность до Telegram DC).
+   - Перед запуском выполняет `mtevil check-egress --config /etc/mtevil/config.json --dc 2` из сетевого контекста edge-контейнера (отдельно показывает TCP-доступность, проверку токена и связность до Telegram DC).
 
 ### Туннели (SharX, WireGuard, AmneziaWG) и безопасность
 
@@ -144,12 +144,12 @@ python3 deploy/setup.py --network-host
 ```bash
 # Статус, логи и диагностика egress
 docker compose --env-file deploy/wizard/.env -f deploy/wizard/compose.yaml ps
-docker compose --env-file deploy/wizard/.env -f deploy/wizard/compose.yaml logs --tail=100 mtveil
-docker compose --env-file deploy/wizard/.env -f deploy/wizard/compose.yaml exec mtveil mtveil check-egress --config /etc/mtveil/config.json --dc 2
+docker compose --env-file deploy/wizard/.env -f deploy/wizard/compose.yaml logs --tail=100 mtevil
+docker compose --env-file deploy/wizard/.env -f deploy/wizard/compose.yaml exec mtevil mtevil check-egress --config /etc/mtevil/config.json --dc 2
 
 # Перезапуск и откат на предыдущий образ (сохраняя state-том с секретом/токеном)
-docker compose --env-file deploy/wizard/.env -f deploy/wizard/compose.yaml restart mtveil
-MTVEIL_IMAGE=mtveil:rollback docker compose --env-file deploy/wizard/.env -f deploy/wizard/compose.yaml up -d --no-build mtveil
+docker compose --env-file deploy/wizard/.env -f deploy/wizard/compose.yaml restart mtevil
+MTEVIL_IMAGE=mtevil:rollback docker compose --env-file deploy/wizard/.env -f deploy/wizard/compose.yaml up -d --no-build mtevil
 ```
 
 Статус `healthy` означает только доступность listener'а внутри контейнера; сквозную работу проверяйте через `check-egress` и реальный клиент Telegram.

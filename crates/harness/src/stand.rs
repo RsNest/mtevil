@@ -265,11 +265,11 @@ pub fn preflight(dut: &str, allow_unimplemented: bool) -> Result<i32> {
     //    обнаружен 2026-11-17), host-чек подходит только как доп. информация.
     let in_container_checks = [
         (
-            "mtveil-dut-telemt",
+            "mtevil-dut-telemt",
             443u16,
             "dut-telemt:443 (MTProto/FakeTLS listen)",
         ),
-        ("mtveil-cover", 80, "cover:80 (эталонный сайт)"),
+        ("mtevil-cover", 80, "cover:80 (эталонный сайт)"),
     ];
     for (container, port, what) in in_container_checks {
         let cmd = format!("exec 3<>/dev/tcp/127.0.0.1/{port}");

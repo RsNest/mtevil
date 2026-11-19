@@ -16,7 +16,7 @@ trap cleanup EXIT
 cd "$(dirname "$0")/../../../.."   # → корень репо (smoke → stand → harness → crates → root)
 
 export PATH="$HOME/.cargo/bin:$PATH"
-HARNESS=target/release/mtveil-harness
+HARNESS=target/release/mtevil-harness
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-infra-smoke"
 RUN_DIR="runs/${RUN_ID}"
 STAND=crates/harness/stand
@@ -37,37 +37,37 @@ echo "=== [3/8] ожидание DUT (telemt инициализирует DC-con
 # из client-stub при 'успешном' host-чеке).
 DUT_WAIT_START=$(date +%s)
 for i in $(seq 1 60); do
-    if docker exec mtveil-dut-telemt bash -c 'exec 3<>/dev/tcp/127.0.0.1/443' 2>/dev/null; then break; fi
+    if docker exec mtevil-dut-telemt bash -c 'exec 3<>/dev/tcp/127.0.0.1/443' 2>/dev/null; then break; fi
     sleep 2
 done
 DUT_WAIT_S=$(( $(date +%s) - DUT_WAIT_START ))
 echo "dut_startup_wait_s=${DUT_WAIT_S} (метод: docker-exec /dev/tcp, не host-port)" | tee "${RUN_DIR}/env/dut-startup-wait.txt"
-if ! docker exec mtveil-dut-telemt bash -c 'exec 3<>/dev/tcp/127.0.0.1/443' 2>/dev/null; then
-    echo "FAIL: DUT не начал слушать 443 внутри контейнера за 120 c — лог: docker logs mtveil-dut-telemt"
+if ! docker exec mtevil-dut-telemt bash -c 'exec 3<>/dev/tcp/127.0.0.1/443' 2>/dev/null; then
+    echo "FAIL: DUT не начал слушать 443 внутри контейнера за 120 c — лог: docker logs mtevil-dut-telemt"
     exit 1
 fi
 
 echo "=== [3b/8] start rst-observer capture (bpftrace → raw/ebpf/reset.log)"
 # rst-observer пишет в stdout контейнера; направляем в файл через docker logs -f
-docker logs --since 0s -f mtveil-rst-observer > "${RUN_DIR}/raw/ebpf/reset.log" 2>&1 &
+docker logs --since 0s -f mtevil-rst-observer > "${RUN_DIR}/raw/ebpf/reset.log" 2>&1 &
 BPF_LOG_PID=$!
 sleep 3   # attach bpftrace
 
 echo "=== [4/8] client-stub пробы (controlled RST, closed port, garbage)"
 # --entrypoint обязателен: compose run не переопределяет entrypoint контейнера
 docker compose -f "${STAND}/compose.yaml" --profile tools run --rm --entrypoint python3 client-stub \
-    /client/probe.py mtveil-dut-telemt 443 9999 \
+    /client/probe.py mtevil-dut-telemt 443 9999 \
     > "${RUN_DIR}/raw/events/probe-stub.jsonl" 2>&1
 cat "${RUN_DIR}/raw/events/probe-stub.jsonl"
 
 echo "=== [5/8] DUT-netns HTTP fetch до cover (дельты nstat в netns DUT)"
 DUT_PID=$(pgrep -f '/usr/local/bin/telemt' | head -1)
 echo "dut pid: ${DUT_PID}" | tee "${RUN_DIR}/env/dut-pid.txt"
-docker exec mtveil-nstat-observer sh -c \
-    "nsenter -t ${DUT_PID} -n curl -sS -m 5 -o /dev/null -w 'http_code=%{http_code}\n' http://mtveil-cover:80/" \
+docker exec mtevil-nstat-observer sh -c \
+    "nsenter -t ${DUT_PID} -n curl -sS -m 5 -o /dev/null -w 'http_code=%{http_code}\n' http://mtevil-cover:80/" \
     2>&1 | tee -a "${RUN_DIR}/raw/events/dut-netns-curl.log"
-docker exec mtveil-nstat-observer sh -c \
-    "nsenter -t ${DUT_PID} -n curl -sS -m 5 http://mtveil-upstream-farm:80/" \
+docker exec mtevil-nstat-observer sh -c \
+    "nsenter -t ${DUT_PID} -n curl -sS -m 5 http://mtevil-upstream-farm:80/" \
     2>&1 | tee -a "${RUN_DIR}/raw/events/dut-netns-curl.log"
 
 echo "=== [6/8] vmstat (CPU contention evidence)"
@@ -92,8 +92,8 @@ sleep 2   # дать nstat-observer доснять дельты
 # потом снимаем ПОЛНЫЙ лог контейнера.
 docker compose -f "${STAND}/compose.yaml" stop rst-observer nstat-observer > /dev/null 2>&1 || true
 kill "${BPF_LOG_PID}" 2>/dev/null || true
-docker logs mtveil-rst-observer > "${RUN_DIR}/raw/ebpf/reset.log" 2>&1 || true
-docker logs mtveil-nstat-observer > "${RUN_DIR}/logs/nstat-observer.log" 2>&1 || true
+docker logs mtevil-rst-observer > "${RUN_DIR}/raw/ebpf/reset.log" 2>&1 || true
+docker logs mtevil-nstat-observer > "${RUN_DIR}/logs/nstat-observer.log" 2>&1 || true
 docker compose -f "${STAND}/compose.yaml" logs dut-telemt > "${RUN_DIR}/logs/dut.log" 2>&1 || true
 gzip -f "${RUN_DIR}/raw/nstat/dut.jsonl" "${RUN_DIR}"/logs/*.log
 cp "${RUN_DIR}/raw/events/probe-stub.jsonl" "${RUN_DIR}/raw/events.jsonl.tmp"

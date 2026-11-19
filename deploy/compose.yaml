@@ -1,21 +1,21 @@
-name: mtveil
+name: mtevil
 
 x-image: &image
-  image: ${MTVEIL_IMAGE:-mtveil:0.1.0-alpha.1}
+  image: ${MTEVIL_IMAGE:-mtevil:0.1.0-alpha.1}
   build:
     context: ..
     dockerfile: Dockerfile
 
 services:
-  mtveil:
+  mtevil:
     <<: *image
     init: true
     restart: unless-stopped
     ports:
-      - "${MTVEIL_BIND:-127.0.0.1}:${MTVEIL_PORT:-24443}:24443/tcp"
+      - "${MTEVIL_BIND:-127.0.0.1}:${MTEVIL_PORT:-24443}:24443/tcp"
     volumes:
-      - ./config.json:/etc/mtveil/config.json:ro
-      - state:/var/lib/mtveil:ro
+      - ./config.json:/etc/mtevil/config.json:ro
+      - state:/var/lib/mtevil:ro
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -29,7 +29,7 @@ services:
         hard: 4096
     stop_grace_period: 10s
     healthcheck:
-      test: [CMD, /usr/local/bin/mtveil, health, --address, "127.0.0.1:24443"]
+      test: [CMD, /usr/local/bin/mtevil, health, --address, "127.0.0.1:24443"]
       interval: 30s
       timeout: 3s
       retries: 3
@@ -43,9 +43,9 @@ services:
   init:
     <<: *image
     profiles: [tools]
-    command: [secret, --output, /var/lib/mtveil/proxy-secret]
+    command: [secret, --output, /var/lib/mtevil/proxy-secret]
     volumes:
-      - state:/var/lib/mtveil
+      - state:/var/lib/mtevil
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]

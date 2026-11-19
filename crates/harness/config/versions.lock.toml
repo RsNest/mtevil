@@ -37,7 +37,7 @@ patches_dir = ""
 build_system = "cargo"                                  # edition 2024, rust-version >= 1.88
 build_flags = "--release"                               # фичи по умолчанию; флаг-матрица фиксируется при первых прогонах
 build_reproducible = false                              # НЕ установлен: ни разу не пересобран дважды с сверкой sha256
-image = "mtveil/dut-telemt:pinned-dac7aee"              # локальная сборка из pinned source (dut-telemt.Dockerfile); registry-образ не используется
+image = "mtevil/dut-telemt:pinned-dac7aee"              # локальная сборка из pinned source (dut-telemt.Dockerfile); registry-образ не используется
 image_digest = "local-build"                            # registry digest отсутствует; идентичность фиксируется binary_sha256 + ref
 binary_sha256 = "f1a504152c7a4062ca555df1c95c06c37c8641507a55fa520e02c262dc84f6ad"  # сборка на VM (rust:1-bookworm), 2026-11-17
 startup_note = "telemt выполняет DC-connectivity init ~37 c до bind:443 (замер smoke 2026-11-17) — стенд обязан ждать bind"

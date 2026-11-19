@@ -1,9 +1,9 @@
-//! `mtveil-guard` — replay-таблица (tmpfs-mmap, robust mutex), suspects, shadow-ban, canary.
+//! `mtevil-guard` — replay-таблица (tmpfs-mmap, robust mutex), suspects, shadow-ban, canary.
 //!
 //! **Статус: пуст.** Код — после ADR-001 и спеки `docs/specs/guard.md`.
 //!
 //! Контракт (ADR-000 INV-02, INV-04):
-//! - таблица `/run/mtveil/replay.tbl`, N шардов (напр. 256), каждый шард — process-shared
+//! - таблица `/run/mtevil/replay.tbl`, N шардов (напр. 256), каждый шард — process-shared
 //!   robust mutex; `check_and_insert` — одна критическая секция;
 //! - ключ = canonical HMAC (32 Б), TTL 300 с; ленивое протухание + bounded sweep в control plane;
 //! - duplicate → CoverRelay + метрика; saturated → sweep, при переполнении — CoverRelay новых CH;
