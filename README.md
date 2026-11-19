@@ -13,7 +13,7 @@ MTProto-прокси для Telegram на Rust. На одном Linux VPS мас
 Подключитесь к VPS по SSH и выполните эти команды в Bash. Установщик скачает готовый образ и откроет мастер настройки.
 
 ```bash
-curl -fsSL https://github.com/RsNest/mtevil/releases/download/v0.1.0-alpha.2/install.sh -o install.sh &&
+curl -fsSL https://github.com/RsNest/mtevil/releases/download/v0.1.0-alpha.3/install.sh -o install.sh &&
   bash install.sh
 ```
 
@@ -22,7 +22,7 @@ curl -fsSL https://github.com/RsNest/mtevil/releases/download/v0.1.0-alpha.2/ins
 3. Для HTTPS-cover можно оставить `example.com:443`. Мастер проверит сертификат из контейнера. Если вы указали свой cover, используйте имя, на которое выдан его сертификат.
 4. Откройте ссылку, которую выдаст мастер, в Telegram и подключите прокси. Для проверки переключитесь на мобильную сеть и откройте фото или видео в чате.
 
-Установщик и мастер доступны в [релизе `v0.1.0-alpha.2`](https://github.com/RsNest/mtevil/releases/tag/v0.1.0-alpha.2).
+Установщик и мастер доступны в [релизе `v0.1.0-alpha.3`](https://github.com/RsNest/mtevil/releases/tag/v0.1.0-alpha.3).
 
 <details>
 <summary>Установка из исходников</summary>
