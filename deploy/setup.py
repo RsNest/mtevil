@@ -795,6 +795,7 @@ def main() -> int:
             "role": "direct",
             "listen": "0.0.0.0:24443",
             "secret_file": "/var/lib/mtevil/proxy-secret",
+            "users_file": "/var/lib/mtevil/users.json",
             "replay_file": "/var/lib/mtevil/replay.bin",
             "sni": sni,
             "cover": cover,
@@ -872,6 +873,7 @@ def main() -> int:
             "role": "edge",
             "listen": "0.0.0.0:24443",
             "secret_file": "/var/lib/mtevil/proxy-secret",
+            "users_file": "/var/lib/mtevil/users.json",
             "replay_file": "/var/lib/mtevil/replay.bin",
             "sni": sni,
             "cover": cover,
@@ -929,6 +931,7 @@ def main() -> int:
     cand_config = deploy_dir / "config.candidate.json"
     cand_token = deploy_dir / ".egress-token.candidate"
     pending_edge_token: str | None = None
+    previous_token: str | None = None
     env_text = (
         f"MTEVIL_PROJECT={project}\n"
         f"MTEVIL_IMAGE={args.image}\n"
@@ -978,6 +981,8 @@ def main() -> int:
         if role in ("direct", "edge"):
             try:
                 created = ensure_generated_secret(cand_base, "/var/lib/mtevil/proxy-secret")
+                if not volume_file_exists(cand_base, "/var/lib/mtevil/users.json"):
+                    write_volume_secret_stdin(cand_base, "/var/lib/mtevil/users.json", "{}")
             except RuntimeError as exc:
                 summary, action = diagnose_docker_error(str(exc), args.image)
                 print(f"{err_text(summary)}\nДальше: {action}", file=sys.stderr)
@@ -985,12 +990,30 @@ def main() -> int:
             print("Секрет клиента: создан в томе state." if created else "Секрет клиента: сохранён прежний из тома state.")
 
         if role == "egress":
-            if volume_file_exists(cand_base, "/var/lib/mtevil/egress-token"):
+            has_egress_tok = volume_file_exists(cand_base, "/var/lib/mtevil/egress-token")
+            if has_egress_tok and ask_yes_no("Использовать существующий токен MTV2 из тома state?", default=True):
                 print("Токен MTV2: сохранён прежний из тома state.")
             else:
+                if has_egress_tok:
+                    previous_token = read_volume_secret(cand_base, "/var/lib/mtevil/egress-token")
                 is_first = ask_yes_no("Это первый узел egress (сгенерировать новый токен MTV2)?", default=True)
                 if is_first:
-                    ensure_generated_secret(cand_base, "/var/lib/mtevil/egress-token")
+                    if has_egress_tok:
+                        tok = run(
+                            cand_base
+                            + [
+                                "run",
+                                "--rm",
+                                "--no-deps",
+                                "--entrypoint",
+                                "/bin/sh",
+                                compose_service(cand_base),
+                                "-c",
+                                "rm -f /var/lib/mtevil/egress-token && /usr/local/bin/mtevil secret --output /var/lib/mtevil/egress-token >/dev/null && cat /var/lib/mtevil/egress-token",
+                            ]
+                        ).stdout.strip()
+                    else:
+                        ensure_generated_secret(cand_base, "/var/lib/mtevil/egress-token")
                     print("Токен MTV2 сгенерирован и сохранён в томе state (0600).")
                     if ask_yes_no("Показать сгенерированный токен MTV2 для копирования на edge?", default=False):
                         tok = read_volume_secret(cand_base, "/var/lib/mtevil/egress-token")
@@ -1000,11 +1023,14 @@ def main() -> int:
                     write_volume_secret_stdin(cand_base, "/var/lib/mtevil/egress-token", tok)
                     print("Токен MTV2 импортирован в том state.")
         elif role == "edge":
-            if volume_file_exists(cand_base, "/var/lib/mtevil/egress-token") and ask_yes_no(
+            has_edge_tok = volume_file_exists(cand_base, "/var/lib/mtevil/egress-token")
+            if has_edge_tok and ask_yes_no(
                 "Использовать существующий токен MTV2 из тома state?", default=True
             ):
                 print("Токен MTV2: сохранён прежний из тома state.")
             else:
+                if has_edge_tok:
+                    previous_token = read_volume_secret(cand_base, "/var/lib/mtevil/egress-token")
                 pending_edge_token = ask_hidden_token("Введите общий токен MTV2")
                 cand_token.write_text(pending_edge_token + "\n", encoding="utf-8")
                 try:
@@ -1161,14 +1187,28 @@ def main() -> int:
                     encoding="utf-8",
                 )
     finally:
-        if not up_succeeded and had_backup:
-            restore_backup_files(deploy_dir)
-            print("Прежние файлы конфигурации восстановлены.", file=sys.stderr)
+        if not up_succeeded:
+            if previous_token is not None:
+                try:
+                    write_volume_secret_stdin(base, "/var/lib/mtevil/egress-token", previous_token)
+                except Exception:
+                    pass
+            if had_backup:
+                restore_backup_files(deploy_dir)
+                print("Прежние файлы конфигурации восстановлены.", file=sys.stderr)
 
     print(ok_text("Контейнер запущен"))
     try:
         wait_healthy(base)
     except TimeoutError:
+        if previous_token is not None:
+            try:
+                write_volume_secret_stdin(base, "/var/lib/mtevil/egress-token", previous_token)
+            except Exception:
+                pass
+        if had_backup:
+            restore_backup_files(deploy_dir)
+            print("Прежние файлы конфигурации восстановлены.", file=sys.stderr)
         print(err_text("Контейнер не перешёл в статус healthy за 45 секунд."), file=sys.stderr)
         print(f"Проверьте логи этой установки: docker compose {compose_ref} logs --tail=100 {compose_service(base)}", file=sys.stderr)
         return 1

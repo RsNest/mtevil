@@ -54,10 +54,10 @@ fn fragmented(raw: &[u8], records: usize) -> Vec<u8> {
 
 fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
     Arc::new(State {
-        secrets: vec![NamedSecret {
+        secrets: std::sync::RwLock::new(Arc::new(vec![NamedSecret {
             name: "default".into(),
             key: Zeroizing::new(secret()),
-        }],
+        }])),
         sni: "example.com".into(),
         cover: cover.to_string(),
         enable_dd: false,
@@ -68,6 +68,8 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         egress_strategy: EgressStrategy::RoundRobin,
         egress_token: [0u8; 16],
         egress_rr: std::sync::atomic::AtomicUsize::new(0),
+        egress_health: std::sync::Mutex::new(EgressHealth::new(0)),
+        egress_cooldown: Duration::from_secs(15),
         client_hello: Duration::from_millis(150),
         handshake: Duration::from_millis(150),
         idle: Duration::from_millis(300),
@@ -884,7 +886,7 @@ async fn multi_secret_and_flight_shaping_authenticate_and_relay() -> Result<()> 
     let dc_addr = dc.local_addr()?;
     let mut cfg = state(cover.addr, dc_addr);
     let state_mut = Arc::get_mut(&mut cfg).context("unique state")?;
-    state_mut.secrets = vec![
+    state_mut.secrets = std::sync::RwLock::new(Arc::new(vec![
         NamedSecret {
             name: "other".into(),
             key: Zeroizing::new([0x11u8; 16]),
@@ -893,7 +895,7 @@ async fn multi_secret_and_flight_shaping_authenticate_and_relay() -> Result<()> 
             name: "alice".into(),
             key: Zeroizing::new(secret()),
         },
-    ];
+    ]));
     state_mut.flight_shaping = true;
     state_mut.handshake = Duration::from_secs(1);
 
@@ -1190,5 +1192,266 @@ async fn probe_egress_separates_tcp_token_and_dc_failures() -> Result<()> {
     let _ = bad_tx.send(());
     timeout(Duration::from_secs(2), good_task).await???;
     timeout(Duration::from_secs(2), bad_task).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> {
+    let mut cover = cover_mock().await?;
+    let dc = TcpListener::bind("127.0.0.1:0").await?;
+    let dc_addr = dc.local_addr()?;
+
+    let dir = std::env::temp_dir().join(format!(
+        "mtevil-users-hot-reload-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    ));
+    std::fs::create_dir_all(&dir)?;
+    let secret_path = dir.join("proxy-secret");
+    let users_path = dir.join("users.json");
+    // Primary secret uses a distinct key (`[0x44; 16]`), while dynamically added `alice`
+    // uses the fixture `secret()` so we can send precomputed valid ClientHello vectors for `alice`.
+    std::fs::write(&secret_path, hex::encode([0x44u8; 16]))?;
+    std::fs::write(&users_path, "{}\n")?;
+
+    let file_cfg = Config {
+        role: Role::Direct,
+        listen: "127.0.0.1:0".parse()?,
+        secret_file: Some(secret_path.clone()),
+        users_file: Some(users_path.clone()),
+        replay_file: None,
+        sni: "example.com".into(),
+        cover: cover.addr.to_string(),
+        enable_dd: true,
+        proxy_protocol: false,
+        dc: vec![format!("2={dc_addr}")],
+        egress_upstreams: Vec::new(),
+        egress_strategy: EgressStrategy::RoundRobin,
+        egress_token_file: None,
+        max_connections: 16,
+        client_hello_timeout_secs: 2,
+        handshake_timeout_secs: 2,
+        idle_timeout_secs: 5,
+        drain_timeout_secs: 1,
+        fake_tls_cert_bytes: wire::DEFAULT_CERT_BYTES,
+        fake_tls_cert_jitter: 0,
+        flight_shaping: false,
+        client_mss: None,
+        client_mss_bulk: None,
+    };
+
+    let mut proxy_state = state(cover.addr, dc_addr);
+    {
+        let sm = Arc::get_mut(&mut proxy_state).context("unique state")?;
+        sm.secrets = std::sync::RwLock::new(Arc::new(file_cfg.secrets()?));
+        sm.enable_dd = true;
+        sm.client_hello = Duration::from_secs(1);
+        sm.handshake = Duration::from_secs(1);
+        sm.idle = Duration::from_secs(3);
+    }
+
+    // 1. Add user `bob` and `carol` via OS lock helper & atomic writer, verify sorted names.
+    {
+        let _lock = lock_users_file(&users_path)?;
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("alice".to_string(), hex::encode(secret()));
+        write_users_map_atomic(&users_path, &map)?;
+    }
+
+    // Malformed JSON must not clobber existing secrets when reload runs.
+    std::fs::write(&users_path, "{invalid json")?;
+    proxy_state.reload_secrets(&file_cfg);
+    assert_eq!(proxy_state.current_secrets().len(), 1);
+    assert_eq!(proxy_state.current_secrets()[0].name, "default");
+
+    // Restore valid JSON with `alice` and reload.
+    {
+        let _lock = lock_users_file(&users_path)?;
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("alice".to_string(), hex::encode(secret()));
+        write_users_map_atomic(&users_path, &map)?;
+    }
+    proxy_state.reload_secrets(&file_cfg);
+    assert_eq!(proxy_state.current_secrets().len(), 2);
+
+    // 2. Open an active session for `alice` and keep it open while deleting `alice` from users.json.
+    let (mut alice_open, alice_task) = proxy(proxy_state.clone()).await?;
+    let dc_task = tokio::spawn(async move {
+        let (mut peer, _) = dc.accept().await?;
+        let mut header = [0u8; 64];
+        peer.read_exact(&mut header).await?;
+        let mut decode = AesCtr::new_from_slices(&header[8..40], &header[40..56])?;
+        let mut plain = header;
+        wire::crypt(&mut decode, &mut plain);
+        let mut payload = vec![0; CLIENT_PAYLOAD.len()];
+        peer.read_exact(&mut payload).await?;
+        wire::crypt(&mut decode, &mut payload);
+        assert_eq!(payload, CLIENT_PAYLOAD);
+        let reversed: Vec<_> = header[8..56].iter().rev().copied().collect();
+        let mut encode = AesCtr::new_from_slices(&reversed[..32], &reversed[32..])?;
+        let mut reply = DC_REPLY.to_vec();
+        wire::crypt(&mut encode, &mut reply);
+        peer.write_all(&reply).await?;
+        peer.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let raw = hello()?;
+    alice_open.write_all(&raw).await?;
+    flight(&mut alice_open, &raw).await?;
+
+    // Delete `alice` and hot-reload while `alice_open` is still in-flight!
+    {
+        let _lock = lock_users_file(&users_path)?;
+        let map = std::collections::BTreeMap::new();
+        write_users_map_atomic(&users_path, &map)?;
+    }
+    proxy_state.reload_secrets(&file_cfg);
+    assert_eq!(proxy_state.current_secrets().len(), 1);
+
+    // 3. New connection with `alice`'s deleted secret is now rejected to cover.
+    let (mut alice_new, new_task) = proxy(proxy_state.clone()).await?;
+    alice_new.write_all(&hello()?).await?;
+    alice_new.shutdown().await?;
+    let relayed_to_cover = timeout(Duration::from_secs(2), cover.received.recv())
+        .await?
+        .context("deleted user hello must go to cover")?;
+    assert!(!relayed_to_cover.is_empty());
+    timeout(Duration::from_secs(2), new_task).await???;
+
+    // 4. Meanwhile, `alice_open` (already authenticated before deletion) completes its download!
+    let mut bytes = fixture("init")?;
+    bytes.extend_from_slice(&fixture("payload")?);
+    alice_open.write_all(&wire::record(0x17, &bytes)?).await?;
+    alice_open.shutdown().await?;
+    let mut reply = Vec::new();
+    while reply.len() < DC_REPLY.len() {
+        let (kind, part) = read_record(&mut alice_open).await?;
+        assert_eq!(kind, 0x17);
+        reply.extend_from_slice(&part);
+    }
+    assert_eq!(reply, fixture("reply")?);
+    timeout(Duration::from_secs(2), alice_task).await???;
+    timeout(Duration::from_secs(2), dc_task).await???;
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordered_egress_cooldown_8_parallel_skip_primary_and_single_probe_recovers() -> Result<()> {
+    let cover = cover_mock().await?;
+    let token = [0x5au8; 16];
+
+    // Primary egress: controllable mode (0 = fail by closing before ACK, 1 = healthy relay to DC).
+    let primary_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let primary_mode = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let primary_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let primary_addr = primary_listener.local_addr()?;
+    let primary_hits_clone = primary_hits.clone();
+    let primary_mode_clone = primary_mode.clone();
+    let primary_task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = primary_listener.accept().await {
+            primary_hits_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mode = primary_mode_clone.load(std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                if mode == 0 {
+                    // Fail immediately before ACK (node failure).
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                let mut preface = [0u8; 88];
+                if stream.read_exact(&mut preface).await.is_ok() {
+                    let dc_req = i16::from_le_bytes([preface[4], preface[5]]).abs();
+                    if mode == 2 && dc_req == 2 {
+                        let _ = stream.write_all(&[EGRESS_ACK_ERR]).await;
+                    } else {
+                        let _ = stream.write_all(&[EGRESS_ACK_OK]).await;
+                    }
+                }
+            });
+        }
+    });
+
+    // Backup egress: always healthy (accepts MTV2 preface and replies EGRESS_ACK_OK).
+    let backup_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let backup_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backup_addr = backup_listener.local_addr()?;
+    let backup_hits_clone = backup_hits.clone();
+    let backup_task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = backup_listener.accept().await {
+            backup_hits_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut preface = [0u8; 88];
+                if stream.read_exact(&mut preface).await.is_ok() {
+                    let _ = stream.write_all(&[EGRESS_ACK_OK]).await;
+                }
+            });
+        }
+    });
+
+    let mut cfg = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut cfg).context("unique state")?;
+        sm.dcs.clear();
+        sm.egress_upstreams = vec![primary_addr, backup_addr];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_token = token;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+        sm.egress_cooldown = Duration::from_millis(350);
+        sm.handshake = Duration::from_secs(2);
+    }
+
+    // 1. First connection hits failing primary (primary_hits: 1) and fails over to backup (backup_hits: 1).
+    let hdr = [0u8; 64];
+    let (_s1, route1) = connect_upstream(&cfg, 2, &hdr).await?;
+    assert_eq!(route1, "egress");
+    assert_eq!(primary_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // 2. While primary is in cooldown, 8 parallel connections MUST all go through backup
+    //    with ZERO connection attempts to primary!
+    let mut join_set = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let st = cfg.clone();
+        join_set.spawn(async move { connect_upstream(&st, 2, &[0u8; 64]).await });
+    }
+    while let Some(res) = join_set.join_next().await {
+        let (_s, route) = res??;
+        assert_eq!(route, "egress");
+    }
+    assert_eq!(
+        primary_hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "primary must receive 0 attempts during active cooldown"
+    );
+    assert_eq!(backup_hits.load(std::sync::atomic::Ordering::SeqCst), 9);
+
+    // 3. After cooldown expires, restore primary to healthy and verify single probe recovers primary.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    primary_mode.store(1, std::sync::atomic::Ordering::SeqCst);
+    let (_s2, _route2) = connect_upstream(&cfg, 2, &hdr).await?;
+    assert_eq!(primary_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(backup_hits.load(std::sync::atomic::Ordering::SeqCst), 9);
+
+    // 4. DC-specific negative ACK (mode 2: DC 2 returns EGRESS_ACK_ERR, DC 4 returns EGRESS_ACK_OK):
+    //    DC 2 fails over to backup and enters DC-specific cooldown on primary, while DC 4 still uses primary!
+    primary_mode.store(2, std::sync::atomic::Ordering::SeqCst);
+    let (_s3, _) = connect_upstream(&cfg, 2, &hdr).await?;
+    assert_eq!(primary_hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(backup_hits.load(std::sync::atomic::Ordering::SeqCst), 10);
+
+    // Next DC 2 request during cooldown skips primary completely:
+    let (_s4, _) = connect_upstream(&cfg, 2, &hdr).await?;
+    assert_eq!(primary_hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(backup_hits.load(std::sync::atomic::Ordering::SeqCst), 11);
+
+    // Meanwhile DC 4 request is NOT in cooldown on primary and succeeds on primary:
+    let (_s5, _) = connect_upstream(&cfg, 4, &hdr).await?;
+    assert_eq!(primary_hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+    assert_eq!(backup_hits.load(std::sync::atomic::Ordering::SeqCst), 11);
+
+    primary_task.abort();
+    backup_task.abort();
     Ok(())
 }

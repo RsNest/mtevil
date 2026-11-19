@@ -29,7 +29,7 @@ pub struct NamedSecret {
     pub key: Zeroizing<[u8; 16]>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -240,30 +240,32 @@ impl Config {
             });
         }
         if let Some(path) = &self.users_file {
-            let meta = std::fs::metadata(path).context("users file")?;
-            ensure!(meta.len() <= 262_144, "users file exceeds 256 KiB");
-            let text = Zeroizing::new(std::fs::read_to_string(path).context("users file")?);
-            let map: HashMap<String, String> =
-                serde_json::from_str(&text).context("invalid users file JSON")?;
-            let mut names: Vec<_> = map.keys().cloned().collect();
-            names.sort();
-            for name in names {
-                ensure!(
-                    !name.is_empty()
-                        && name.len() <= 32
-                        && name
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
-                    "invalid user name"
-                );
-                let mut key = Zeroizing::new([0u8; 16]);
-                hex::decode_to_slice(map[&name].trim(), &mut key[..])
-                    .with_context(|| format!("invalid 32-hex secret for user {name}"))?;
-                ensure!(
-                    !out.iter().any(|existing| *existing.key == *key),
-                    "duplicate secret in users_file"
-                );
-                out.push(NamedSecret { name, key });
+            if path.exists() || self.secret_file.is_none() {
+                let meta = std::fs::metadata(path).context("users file")?;
+                ensure!(meta.len() <= 262_144, "users file exceeds 256 KiB");
+                let text = Zeroizing::new(std::fs::read_to_string(path).context("users file")?);
+                let map: HashMap<String, String> =
+                    serde_json::from_str(&text).context("invalid users file JSON")?;
+                let mut names: Vec<_> = map.keys().cloned().collect();
+                names.sort();
+                for name in names {
+                    ensure!(
+                        !name.is_empty()
+                            && name.len() <= 32
+                            && name
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                        "invalid user name"
+                    );
+                    let mut key = Zeroizing::new([0u8; 16]);
+                    hex::decode_to_slice(map[&name].trim(), &mut key[..])
+                        .with_context(|| format!("invalid 32-hex secret for user {name}"))?;
+                    ensure!(
+                        !out.iter().any(|existing| *existing.key == *key),
+                        "duplicate secret in users_file"
+                    );
+                    out.push(NamedSecret { name, key });
+                }
             }
         }
         ensure!(!out.is_empty(), "at least one secret is required");

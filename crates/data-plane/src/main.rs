@@ -100,6 +100,18 @@ enum Action {
         #[arg(long)]
         name: String,
     },
+    /// Remove a named user secret from a JSON users file.
+    UserDel {
+        #[arg(long)]
+        users_file: PathBuf,
+        #[arg(long)]
+        name: String,
+    },
+    /// List user names from a JSON users file (one name per line, never prints secrets).
+    UserList {
+        #[arg(long)]
+        users_file: PathBuf,
+    },
     /// Explicitly print a Telegram proxy link. Treat the output as a credential.
     Link {
         #[arg(long)]
@@ -167,8 +179,146 @@ impl Args {
     }
 }
 
+#[derive(Default, Clone, Copy)]
+struct CooldownSlot {
+    until: Option<Instant>,
+    probing: bool,
+}
+
+#[derive(Default)]
+struct EgressHealth {
+    nodes: Vec<CooldownSlot>,
+    dc_slots: HashMap<(usize, i16), CooldownSlot>,
+}
+
+struct EgressAttemptClaim<'a> {
+    health: &'a std::sync::Mutex<EgressHealth>,
+    idx: usize,
+    dc: i16,
+    node_probe: bool,
+    dc_probe: bool,
+    completed: bool,
+}
+
+impl<'a> Drop for EgressAttemptClaim<'a> {
+    fn drop(&mut self) {
+        if !self.completed && (self.node_probe || self.dc_probe) {
+            if let Ok(mut h) = self.health.lock() {
+                if self.node_probe {
+                    if let Some(slot) = h.nodes.get_mut(self.idx) {
+                        slot.probing = false;
+                    }
+                }
+                if self.dc_probe {
+                    if let Some(slot) = h.dc_slots.get_mut(&(self.idx, self.dc)) {
+                        slot.probing = false;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl EgressHealth {
+    fn new(node_count: usize) -> Self {
+        Self {
+            nodes: vec![CooldownSlot::default(); node_count],
+            dc_slots: HashMap::new(),
+        }
+    }
+
+    fn try_claim<'a>(
+        health: &'a std::sync::Mutex<EgressHealth>,
+        idx: usize,
+        dc: i16,
+        now: Instant,
+    ) -> Option<EgressAttemptClaim<'a>> {
+        let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
+        while h.nodes.len() <= idx {
+            h.nodes.push(CooldownSlot::default());
+        }
+        let mut node_probe = false;
+        let node_slot = &mut h.nodes[idx];
+        if let Some(until) = node_slot.until {
+            if now < until || node_slot.probing {
+                return None;
+            }
+            node_slot.probing = true;
+            node_probe = true;
+        }
+        let mut dc_probe = false;
+        if let Some(dc_slot) = h.dc_slots.get_mut(&(idx, dc)) {
+            if let Some(until) = dc_slot.until {
+                if now < until || dc_slot.probing {
+                    if node_probe {
+                        h.nodes[idx].probing = false;
+                    }
+                    return None;
+                }
+                dc_slot.probing = true;
+                dc_probe = true;
+            }
+        }
+        Some(EgressAttemptClaim {
+            health,
+            idx,
+            dc,
+            node_probe,
+            dc_probe,
+            completed: false,
+        })
+    }
+}
+
+impl<'a> EgressAttemptClaim<'a> {
+    fn record_success(mut self) {
+        self.completed = true;
+        let mut h = self.health.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = h.nodes.get_mut(self.idx) {
+            slot.until = None;
+            slot.probing = false;
+        }
+        if let Some(slot) = h.dc_slots.get_mut(&(self.idx, self.dc)) {
+            slot.until = None;
+            slot.probing = false;
+        }
+    }
+
+    fn record_node_failure(mut self, cooldown: Duration) {
+        self.completed = true;
+        let mut h = self.health.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = h.nodes.get_mut(self.idx) {
+            slot.until = Some(Instant::now() + cooldown);
+            slot.probing = false;
+        }
+        if self.dc_probe {
+            if let Some(slot) = h.dc_slots.get_mut(&(self.idx, self.dc)) {
+                slot.probing = false;
+            }
+        }
+    }
+
+    fn record_dc_failure(mut self, cooldown: Duration) {
+        self.completed = true;
+        let mut h = self.health.lock().unwrap_or_else(|e| e.into_inner());
+        if self.node_probe {
+            if let Some(slot) = h.nodes.get_mut(self.idx) {
+                slot.until = None;
+                slot.probing = false;
+            }
+        }
+        h.dc_slots.insert(
+            (self.idx, self.dc),
+            CooldownSlot {
+                until: Some(Instant::now() + cooldown),
+                probing: false,
+            },
+        );
+    }
+}
+
 struct State {
-    secrets: Vec<NamedSecret>,
+    secrets: std::sync::RwLock<Arc<Vec<NamedSecret>>>,
     sni: String,
     cover: String,
     enable_dd: bool,
@@ -179,6 +329,8 @@ struct State {
     egress_strategy: EgressStrategy,
     egress_token: [u8; 16],
     egress_rr: std::sync::atomic::AtomicUsize,
+    egress_health: std::sync::Mutex<EgressHealth>,
+    egress_cooldown: Duration,
     client_hello: Duration,
     handshake: Duration,
     idle: Duration,
@@ -188,6 +340,142 @@ struct State {
     client_mss_bulk: Option<u16>,
     replay: Mutex<ReplayCache>,
     counters: telemetry::Counters,
+}
+
+impl State {
+    fn current_secrets(&self) -> Arc<Vec<NamedSecret>> {
+        self.secrets
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn reload_secrets(&self, config: &Config) {
+        match config.secrets() {
+            Ok(new_secrets) => {
+                let cur = self.current_secrets();
+                let same = cur.len() == new_secrets.len()
+                    && cur
+                        .iter()
+                        .zip(new_secrets.iter())
+                        .all(|(a, b)| a.name == b.name && a.key == b.key);
+                if !same {
+                    let count = new_secrets.len();
+                    *self.secrets.write().unwrap_or_else(|e| e.into_inner()) =
+                        Arc::new(new_secrets);
+                    telemetry::event("users_reloaded", 0, json!({"users": count}));
+                }
+            }
+            Err(err) => {
+                telemetry::event(
+                    "users_reload_failed",
+                    0,
+                    json!({"error": format!("{err:#}")}),
+                );
+            }
+        }
+    }
+}
+
+// OS-level exclusive advisory file lock (flock on Unix, LockFileEx on Windows) so the
+// kernel automatically releases the lock if a CLI user-add/user-del process crashes.
+#[allow(unsafe_code)]
+fn lock_users_file(users_file: &std::path::Path) -> Result<std::fs::File> {
+    if let Some(parent) = users_file.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let lock_path = users_file.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening lock file {}", lock_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        const LOCK_EX: i32 = 2;
+        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("locking {}", lock_path.display()));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset: u32,
+            offset_high: u32,
+            h_event: isize,
+        }
+        extern "system" {
+            fn LockFileEx(
+                h_file: isize,
+                dw_flags: u32,
+                dw_reserved: u32,
+                n_number_of_bytes_to_lock_low: u32,
+                n_number_of_bytes_to_lock_high: u32,
+                lp_overlapped: *mut Overlapped,
+            ) -> i32;
+        }
+        const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+        let mut overlapped = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            h_event: 0,
+        };
+        let ok = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as isize,
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("locking {}", lock_path.display()));
+        }
+    }
+    Ok(file)
+}
+
+fn write_users_map_atomic(
+    users_file: &std::path::Path,
+    map: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    use std::io::Write;
+    let encoded = Zeroizing::new(serde_json::to_string_pretty(map)?);
+    let tmp = users_file.with_extension(format!("tmp.{}", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    {
+        let mut f = options.open(&tmp)?;
+        f.write_all(encoded.as_bytes())?;
+        f.write_all(b"\n")?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, users_file)?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -218,7 +506,6 @@ async fn main() -> Result<()> {
             }
             Action::UserAdd { users_file, name } => {
                 use rand::RngCore;
-                use std::io::Write;
                 ensure!(
                     !name.is_empty()
                         && name.len() <= 32
@@ -227,30 +514,12 @@ async fn main() -> Result<()> {
                             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
                     "invalid user name"
                 );
-                if let Some(parent) = users_file.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                }
-                let lock_path = users_file.with_extension("lock");
-                struct LockGuard(PathBuf);
-                impl Drop for LockGuard {
-                    fn drop(&mut self) {
-                        let _ = std::fs::remove_file(&self.0);
-                    }
-                }
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&lock_path)
-                    .with_context(|| format!("users file is locked ({})", lock_path.display()))?;
-                let _guard = LockGuard(lock_path);
-
-                let mut map: HashMap<String, String> = if users_file.exists() {
+                let _lock = lock_users_file(&users_file)?;
+                let mut map: std::collections::BTreeMap<String, String> = if users_file.exists() {
                     let text = Zeroizing::new(std::fs::read_to_string(&users_file)?);
                     serde_json::from_str(&text).context("invalid users file JSON")?
                 } else {
-                    HashMap::new()
+                    std::collections::BTreeMap::new()
                 };
                 ensure!(
                     !map.contains_key(&name),
@@ -259,23 +528,34 @@ async fn main() -> Result<()> {
                 let mut bytes = Zeroizing::new([0u8; 16]);
                 rand::rngs::OsRng.fill_bytes(&mut bytes[..]);
                 map.insert(name.clone(), hex::encode(&bytes[..]));
-                let encoded = Zeroizing::new(serde_json::to_string_pretty(&map)?);
-                let tmp = users_file.with_extension(format!("tmp.{}", std::process::id()));
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create(true).truncate(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                {
-                    let mut f = options.open(&tmp)?;
-                    f.write_all(encoded.as_bytes())?;
-                    f.write_all(b"\n")?;
-                    f.sync_all()?;
-                }
-                std::fs::rename(&tmp, &users_file)?;
+                write_users_map_atomic(&users_file, &map)?;
                 println!("user '{name}' added");
+                return Ok(());
+            }
+            Action::UserDel { users_file, name } => {
+                let _lock = lock_users_file(&users_file)?;
+                ensure!(users_file.exists(), "users file does not exist");
+                let text = Zeroizing::new(std::fs::read_to_string(&users_file)?);
+                let mut map: std::collections::BTreeMap<String, String> =
+                    serde_json::from_str(&text).context("invalid users file JSON")?;
+                ensure!(
+                    map.remove(&name).is_some(),
+                    "user '{name}' not found in users file"
+                );
+                write_users_map_atomic(&users_file, &map)?;
+                println!("user '{name}' deleted");
+                return Ok(());
+            }
+            Action::UserList { users_file } => {
+                if !users_file.exists() {
+                    return Ok(());
+                }
+                let text = Zeroizing::new(std::fs::read_to_string(&users_file)?);
+                let map: std::collections::BTreeMap<String, String> =
+                    serde_json::from_str(&text).context("invalid users file JSON")?;
+                for name in map.keys() {
+                    println!("{name}");
+                }
                 return Ok(());
             }
             Action::Link {
@@ -428,8 +708,10 @@ async fn main() -> Result<()> {
     let max_cover_connections = (config.max_connections / 4).max(1);
     let user_count = secrets.len();
     let persistent_replay = config.replay_file.is_some();
+    let reload_config = config.users_file.is_some().then(|| config.clone());
+    let egress_count = config.egress_upstreams.len();
     let state = Arc::new(State {
-        secrets,
+        secrets: std::sync::RwLock::new(Arc::new(secrets)),
         sni: config.sni,
         cover: config.cover,
         enable_dd: config.enable_dd,
@@ -440,6 +722,8 @@ async fn main() -> Result<()> {
         egress_strategy: config.egress_strategy,
         egress_token,
         egress_rr: std::sync::atomic::AtomicUsize::new(0),
+        egress_health: std::sync::Mutex::new(EgressHealth::new(egress_count)),
+        egress_cooldown: Duration::from_secs(15),
         client_hello: Duration::from_secs(config.client_hello_timeout_secs),
         handshake: Duration::from_secs(config.handshake_timeout_secs),
         idle: Duration::from_secs(config.idle_timeout_secs),
@@ -512,6 +796,21 @@ async fn main() -> Result<()> {
             }
         })
     });
+    let (users_stop_tx, mut users_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let users_task = reload_config.map(|cfg| {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = &mut users_stop_rx => break,
+                }
+                state.reload_secrets(&cfg);
+            }
+        })
+    });
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let res = serve(listener, state.clone(), config.max_connections, async {
@@ -524,6 +823,10 @@ async fn main() -> Result<()> {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await;
+    let _ = users_stop_tx.send(());
+    if let Some(task) = users_task {
+        let _ = task.await;
+    }
     let _ = flush_stop_tx.send(());
     if let Some(task) = flush_task {
         let _ = task.await;
@@ -689,7 +992,7 @@ fn configure_tcp_socket(stream: &TcpStream) -> Result<()> {
         .with_time(Duration::from_secs(60))
         .with_interval(Duration::from_secs(15));
     #[cfg(unix)]
-    let keepalive = keepalive.with_retries(4);
+    let keepalive = keepalive.with_retries(3);
     socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive)?;
     Ok(())
 }
@@ -797,8 +1100,9 @@ async fn connection_inner(client: &mut TcpStream, state: &State, session_id: u64
         return Ok(());
     }
     if matches!(received, Ok(Ok(None))) {
+        let secrets = state.current_secrets();
         let frame: &[u8; 64] = raw.as_slice().try_into()?;
-        if let Some((user, transport)) = state.secrets.iter().find_map(|s| {
+        if let Some((user, transport)) = secrets.iter().find_map(|s| {
             wire::client_transport(frame, &s.key)
                 .ok()
                 .map(|t| (s.name.clone(), t))
@@ -852,11 +1156,12 @@ async fn connection_inner(client: &mut TcpStream, state: &State, session_id: u64
     } else {
         1
     };
+    let secrets = state.current_secrets();
     let (auth, failure) = match received {
         Ok(Ok(Some(bytes))) => {
             let mut matched = None;
             let mut last_err = String::new();
-            for s in &state.secrets {
+            for s in secrets.iter() {
                 match wire::authenticate_with_record_version(
                     &bytes,
                     record_minor,
@@ -1757,35 +2062,85 @@ async fn connect_upstream(
     let per_try = (state.handshake / (count as u32).max(1))
         .max(Duration::from_millis(150))
         .min(Duration::from_secs(2));
+    let dc_abs = dc_id.abs();
+    let ordered = state.egress_strategy == EgressStrategy::Ordered;
     timeout(state.handshake, async {
         let mut last_err = None;
         for offset in 0..count {
-            let addr = state.egress_upstreams[(start + offset) % count];
+            let idx = (start + offset) % count;
+            let claim = if ordered {
+                let Some(c) = EgressHealth::try_claim(&state.egress_health, idx, dc_abs, Instant::now()) else {
+                    continue;
+                };
+                Some(c)
+            } else {
+                None
+            };
+            let addr = state.egress_upstreams[idx];
+            enum AttemptErr {
+                Node(anyhow::Error),
+                Dc(anyhow::Error),
+            }
             let attempt = timeout(per_try, async {
-                let mut upstream = TcpStream::connect(addr).await?;
-                configure_tcp_socket(&upstream)?;
+                let mut upstream = TcpStream::connect(addr)
+                    .await
+                    .map_err(|e| AttemptErr::Node(e.into()))?;
+                configure_tcp_socket(&upstream).map_err(AttemptErr::Node)?;
                 let mut preface = [0u8; 88];
                 preface[..4].copy_from_slice(&EGRESS_MAGIC);
                 preface[4..6].copy_from_slice(&dc_id.to_le_bytes());
                 preface[8..24].copy_from_slice(&state.egress_token);
                 preface[24..88].copy_from_slice(dc_header);
-                upstream.write_all(&preface).await?;
+                upstream
+                    .write_all(&preface)
+                    .await
+                    .map_err(|e| AttemptErr::Node(e.into()))?;
                 let mut ack = [0u8; 1];
-                upstream.read_exact(&mut ack).await?;
-                ensure!(
-                    ack[0] == EGRESS_ACK_OK,
-                    "egress upstream rejected or DC unreachable"
-                );
-                Ok::<_, anyhow::Error>(upstream)
+                upstream
+                    .read_exact(&mut ack)
+                    .await
+                    .map_err(|e| AttemptErr::Node(e.into()))?;
+                if ack[0] == EGRESS_ACK_OK {
+                    Ok(upstream)
+                } else if ack[0] == EGRESS_ACK_ERR {
+                    Err(AttemptErr::Dc(anyhow::anyhow!(
+                        "egress DC {dc_abs} unreachable (negative ACK)"
+                    )))
+                } else {
+                    Err(AttemptErr::Node(anyhow::anyhow!(
+                        "egress upstream invalid ACK byte"
+                    )))
+                }
             })
             .await;
             match attempt {
-                Ok(Ok(upstream)) => return Ok((upstream, "egress")),
-                Ok(Err(err)) => last_err = Some(err),
-                Err(_) => last_err = Some(anyhow::anyhow!("egress_connect_timeout")),
+                Ok(Ok(upstream)) => {
+                    if let Some(c) = claim {
+                        c.record_success();
+                    }
+                    return Ok((upstream, "egress"));
+                }
+                Ok(Err(AttemptErr::Dc(err))) => {
+                    if let Some(c) = claim {
+                        c.record_dc_failure(state.egress_cooldown);
+                    }
+                    last_err = Some(err);
+                }
+                Ok(Err(AttemptErr::Node(err))) => {
+                    if let Some(c) = claim {
+                        c.record_node_failure(state.egress_cooldown);
+                    }
+                    last_err = Some(err);
+                }
+                Err(_) => {
+                    if let Some(c) = claim {
+                        c.record_node_failure(state.egress_cooldown);
+                    }
+                    last_err = Some(anyhow::anyhow!("egress_connect_timeout"));
+                }
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no egress upstreams configured")))
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all egress upstreams in cooldown or unavailable")))
             .context("egress_connect_failed")
     })
     .await
