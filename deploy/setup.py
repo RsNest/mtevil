@@ -930,9 +930,9 @@ def main() -> int:
     cand_compose = deploy_dir / "compose.candidate.yaml"
     cand_env = deploy_dir / ".env.candidate"
     cand_config = deploy_dir / "config.candidate.json"
-    cand_token = deploy_dir / ".egress-token.candidate"
     pending_token: str | None = None
     previous_token: str | None = None
+    cand_token_in_volume = False
     token_written_to_volume = False
     had_backup = False
     env_text = (
@@ -1021,28 +1021,11 @@ def main() -> int:
                 print("Токен MTV2 подготовлен для проверки (рабочий том state пока не изменён).")
 
         if pending_token is not None:
-            cand_token.write_text(pending_token + "\n", encoding="utf-8")
-            try:
-                os.chmod(cand_token, 0o600)
-            except OSError:
-                pass
+            write_volume_secret_stdin(cand_base, "/var/lib/mtevil/egress-token.candidate", pending_token)
+            cand_token_in_volume = True
             cand_cfg_data = dict(config_data)
-            cand_cfg_data["egress_token_file"] = "/etc/mtevil/egress-token.candidate"
+            cand_cfg_data["egress_token_file"] = "/var/lib/mtevil/egress-token.candidate"
             cand_config.write_text(json.dumps(cand_cfg_data, indent=2) + "\n", encoding="utf-8")
-            cand_compose.write_text(
-                render_compose(
-                    repo_root,
-                    deploy_dir,
-                    role,
-                    "config.candidate.json",
-                    network_host=args.network_host,
-                    health_host=health_host,
-                    health_port=pub_port,
-                    include_build=include_build,
-                    extra_volumes=["./.egress-token.candidate:/etc/mtevil/egress-token.candidate:ro"],
-                ),
-                encoding="utf-8",
-            )
 
         cfg_check = run(
             cand_base + ["run", "--rm", "--no-deps", compose_service(cand_base), "--config", "/etc/mtevil/config.json", "--check-config"],
@@ -1101,6 +1084,32 @@ def main() -> int:
             health_port=pub_port,
             include_build=include_build,
         )
+    finally:
+        if cand_token_in_volume:
+            try:
+                run(
+                    cand_base
+                    + [
+                        "run",
+                        "--rm",
+                        "--no-deps",
+                        "--entrypoint",
+                        "/bin/rm",
+                        compose_service(cand_base),
+                        "-f",
+                        "/var/lib/mtevil/egress-token.candidate",
+                    ],
+                    check=False,
+                )
+            except Exception:
+                pass
+        for p in (cand_compose, cand_env, cand_config):
+            if p.exists():
+                p.unlink()
+
+    up_succeeded = False
+    deployment_committed = False
+    try:
         # Back up existing deployment files before promoting validated candidate.
         for name in ("compose.yaml", ".env", "config.json"):
             live = deploy_dir / name
@@ -1108,24 +1117,20 @@ def main() -> int:
                 live.replace(deploy_dir / f"{name}.bak")
                 had_backup = True
         (deploy_dir / "compose.yaml").write_text(live_compose, encoding="utf-8")
-        os.replace(cand_env, deploy_dir / ".env")
-        os.replace(cand_config, deploy_dir / "config.json")
+        (deploy_dir / ".env").write_text(env_text, encoding="utf-8")
+        (deploy_dir / "config.json").write_text(cfg_text, encoding="utf-8")
         if pending_token is not None:
-            (deploy_dir / "config.json").write_text(cfg_text, encoding="utf-8")
             write_volume_secret_stdin(base, "/var/lib/mtevil/egress-token", pending_token)
             token_written_to_volume = True
             print("Токен MTV2 сохранён в томе state.")
         run(base + ["config", "--quiet"])
-    finally:
-        for p in (cand_compose, cand_env, cand_config, cand_token):
-            if p.exists():
-                p.unlink()
 
-    up_succeeded = False
-    deployment_committed = False
-    try:
         while True:
-            up_proc = run(base + ["up", "-d", compose_service(base)], check=False)
+            up_args = ["up", "-d"]
+            if had_backup:
+                up_args.append("--force-recreate")
+            up_args.append(compose_service(base))
+            up_proc = run(base + up_args, check=False)
             if up_proc.returncode == 0:
                 up_succeeded = True
                 break
@@ -1195,7 +1200,7 @@ def main() -> int:
                 except Exception as exc:
                     print(err_text(f"Не удалось вернуть прежний токен MTV2 в том state: {exc}"), file=sys.stderr)
             if had_backup and up_succeeded:
-                run(base + ["up", "-d", compose_service(base)], check=False)
+                run(base + ["up", "-d", "--force-recreate", compose_service(base)], check=False)
 
     print(ok_text("Контейнер исправен"))
 

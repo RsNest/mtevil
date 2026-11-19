@@ -212,7 +212,7 @@ class SetupValidationTests(unittest.TestCase):
 
             def fake_run(argv, **_kwargs):
                 cmd = " ".join(argv)
-                if "up -d mtevil" in cmd:
+                if "up -d" in cmd:
                     return subprocess.CompletedProcess(
                         argv,
                         1,
@@ -312,8 +312,8 @@ class SetupValidationTests(unittest.TestCase):
             ):
                 rc = setup.main()
             self.assertEqual(rc, 1)
-            mock_write_tok.assert_not_called()
-            self.assertFalse((d / ".egress-token.candidate").exists())
+            for call in mock_write_tok.call_args_list:
+                self.assertNotEqual(call.args[1], "/var/lib/mtevil/egress-token")
 
         with tempfile.TemporaryDirectory() as td2:
             d2 = Path(td2)
@@ -461,27 +461,66 @@ class SetupValidationTests(unittest.TestCase):
                     self.assertEqual(setup.main(), 1)
 
                 # 5. Verify real Docker volume token rolled back to old_tok, config rolled back to eg1_port,
-                #    and real check-egress from rolled-back Edge to Egress 1 succeeds!
+                #    and a new client connection through edge's listening port is routed to Egress 1!
                 self.assertEqual(setup.read_volume_secret(edge_base, "/var/lib/mtevil/egress-token"), old_tok)
                 setup.wait_healthy(edge_base)
-                chk = setup.run(
+
+                # Set edge's proxy-secret to the prototype vector key and restart edge so we can
+                # send a real FakeTLS + obfuscated2 client connection through edge_port.
+                vec_secret_hex = "000102030405060708090a0b0c0d0e0f"
+                setup.write_volume_secret_stdin(edge_base, "/var/lib/mtevil/proxy-secret", vec_secret_hex)
+                setup.run(edge_base + ["up", "-d", "--force-recreate", setup.compose_service(edge_base)])
+                setup.wait_healthy(edge_base)
+
+                eg1_base = setup.compose_cmd(d_eg1, p_eg1)
+                eg2_base = setup.compose_cmd(d_eg2, p_eg2)
+                eg1_before = setup.run(eg1_base + ["logs", setup.compose_service(eg1_base)]).stdout.count('"event":"session_open"')
+                eg2_before = setup.run(eg2_base + ["logs", setup.compose_service(eg2_base)]).stdout.count('"event":"session_open"')
+
+                repo_root = Path(__file__).resolve().parent.parent
+                init_frame = bytes.fromhex((repo_root / "tests" / "vectors" / "prototype" / "client-init.hex").read_text(encoding="utf-8").strip())
+                ch_template = bytearray(bytes.fromhex((repo_root / "tests" / "vectors" / "prototype" / "synthetic-ch.hex").read_text(encoding="utf-8").strip()))
+                import hashlib
+                import hmac
+                import struct
+                import time
+                ch_template[11:43] = b"\x00" * 32
+                digest = hmac.new(bytes.fromhex(vec_secret_hex), bytes(ch_template), hashlib.sha256).digest()
+                ts = struct.pack("<I", int(time.time()) & 0xFFFFFFFF)
+                ch_template[11:43] = digest[:28] + bytes(a ^ b for a, b in zip(digest[28:32], ts))
+                client_payload = bytes(ch_template) + b"\x17\x03\x03\x00\x40" + init_frame
+
+                # Connect to edge's listening port from inside the shared container network namespace
+                # and complete FakeTLS ClientHello -> ServerHello -> obfuscated2 inner frame -> Egress 1!
+                ch_b64 = __import__("base64").b64encode(bytes(ch_template)).decode("ascii")
+                init_b64 = __import__("base64").b64encode(b"\x17\x03\x03\x00\x40" + init_frame).decode("ascii")
+                bash_client = (
+                    f"exec 3<>/dev/tcp/127.0.0.1/{edge_port} && "
+                    f"printf '%s' '{ch_b64}' | base64 -d >&3 && "
+                    "dd bs=1 count=1 <&3 >/dev/null 2>&1 && "
+                    f"printf '%s' '{init_b64}' | base64 -d >&3 && "
+                    "sleep 0.5 && exec 3>&-"
+                )
+                client_proc = setup.run(
                     edge_base
                     + [
                         "exec",
                         "-T",
                         setup.compose_service(edge_base),
-                        "mtevil",
-                        "check-egress",
-                        "--config",
-                        "/etc/mtevil/config.json",
-                        "--dc",
-                        "2",
+                        "/bin/bash",
+                        "-c",
+                        bash_client,
                     ],
                     check=False,
                 )
-                self.assertEqual(chk.returncode, 0, chk.stdout + chk.stderr)
-                self.assertIn(f"127.0.0.1:{eg1_port}", chk.stdout)
-                self.assertIn('"token_status": "accepted"', chk.stdout)
+                self.assertEqual(client_proc.returncode, 0, client_proc.stdout + client_proc.stderr)
+
+                edge_logs = setup.run(edge_base + ["logs", setup.compose_service(edge_base)]).stdout
+                eg1_after = setup.run(eg1_base + ["logs", setup.compose_service(eg1_base)]).stdout.count('"event":"session_open"')
+                eg2_after = setup.run(eg2_base + ["logs", setup.compose_service(eg2_base)]).stdout.count('"event":"session_open"')
+                self.assertIn('"event":"authenticated"', edge_logs)
+                self.assertGreater(eg1_after, eg1_before, f"Egress 1 did not receive forwarded session; edge logs:\n{edge_logs}")
+                self.assertEqual(eg2_after, eg2_before, "Egress 2 must not receive session after rollback to Egress 1")
             finally:
                 for d_path, proj in ((d_edge, p_edge), (d_eg2, p_eg2), (d_eg1, p_eg1)):
                     if (d_path / "compose.yaml").exists():
