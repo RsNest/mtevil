@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Unit and container tests for deploy/setup.py DNS and HTTPS-cover checks."""
 import importlib.util
+import io
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SETUP_PATH = Path(__file__).resolve().parent / "setup.py"
 SPEC = importlib.util.spec_from_file_location("mtveil_setup", SETUP_PATH)
@@ -102,6 +105,64 @@ class SetupValidationTests(unittest.TestCase):
         )
         self.assertNotIn("build:", yaml_text)
         self.assertIn("image:", yaml_text)
+
+    def test_is_port_available_and_restore_backup(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        busy_port = sock.getsockname()[1]
+        try:
+            self.assertFalse(setup.is_port_available("127.0.0.1", busy_port))
+        finally:
+            sock.close()
+        self.assertTrue(setup.is_port_available("127.0.0.1", busy_port))
+
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "compose.yaml.bak").write_text("old-compose", encoding="utf-8")
+            (d / ".env.bak").write_text("old-env", encoding="utf-8")
+            (d / "config.json.bak").write_text("old-cfg", encoding="utf-8")
+            (d / "compose.yaml").write_text("new-compose", encoding="utf-8")
+            self.assertTrue(setup.restore_backup_files(d))
+            self.assertEqual((d / "compose.yaml").read_text(encoding="utf-8"), "old-compose")
+            self.assertEqual((d / ".env").read_text(encoding="utf-8"), "old-env")
+            self.assertEqual((d / "config.json").read_text(encoding="utf-8"), "old-cfg")
+
+    def test_busy_443_prompts_new_port_and_starts_container(self):
+        image = None
+        for candidate in ("ghcr.io/rsnest/mtevil:v0.1.0-alpha.3", "mtveil:wizard-test"):
+            if subprocess.run(["docker", "image", "inspect", candidate], capture_output=True).returncode == 0:
+                image = candidate
+                break
+        if image is None:
+            self.skipTest("no local mtveil image available")
+
+        s_free = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s_free.bind(("127.0.0.1", 0))
+        free_port = s_free.getsockname()[1]
+        s_free.close()
+
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            project = f"mtveil-port-test-{free_port}"
+            stdin_data = f"1\n127.0.0.1\n443\n127.0.0.1\n{free_port}\nexample.com\nexample.com:443\n"
+            out_buf = io.StringIO()
+            try:
+                with (
+                    mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d), "--project", project, "--image", image, "--no-build"]),
+                    mock.patch.object(sys, "stdin", io.StringIO(stdin_data)),
+                    mock.patch.object(sys, "stdout", out_buf),
+                    mock.patch.object(setup, "is_port_available", side_effect=lambda _ip, port: port != 443),
+                ):
+                    rc = setup.main()
+                out = out_buf.getvalue()
+                self.assertEqual(rc, 0, out)
+                self.assertIn("Порт 443 на 127.0.0.1 уже занят", out)
+                self.assertIn(f"https://t.me/proxy?server=127.0.0.1&port={free_port}&secret=", out)
+            finally:
+                base = setup.compose_cmd(d, project)
+                if (d / "compose.yaml").exists():
+                    subprocess.run(base + ["down", "-v"], capture_output=True)
 
 
 if __name__ == "__main__":

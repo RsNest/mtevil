@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Interactive Docker Compose setup wizard for mtveil (Direct, Egress, Edge)."""
 import argparse
+import errno
 import getpass
 import ipaddress
 import json
@@ -267,7 +268,110 @@ def ask_hidden_token(prompt: str) -> str:
             val = sys.stdin.readline().strip().lower()
         if HEX32_RE.match(val):
             return val
-        print("Invalid token: must be exactly 32 hexadecimal characters.")
+        print("Некорректный токен: требуется ровно 32 шестнадцатеричных символа.")
+
+
+def _proc_net_port_in_use(port: int) -> bool:
+    hex_port = f":{port:04X}"
+    for proc_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+        p = Path(proc_file)
+        if not p.is_file():
+            continue
+        try:
+            lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 4 and parts[3] == "0A" and parts[1].endswith(hex_port):
+                return True
+    return False
+
+
+def is_port_available(bind_ip: str, port: int) -> bool:
+    family = socket.AF_INET6 if ":" in bind_ip else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        if family == socket.AF_INET6:
+            sock.bind((bind_ip, port, 0, 0))
+        else:
+            sock.bind((bind_ip, port))
+        return True
+    except OSError as exc:
+        if exc.errno == errno.EACCES:
+            return not _proc_net_port_in_use(port)
+        return False
+    finally:
+        sock.close()
+
+
+def deployment_owns_port(deploy_dir: Path, project: str, bind_ip: str, port: int) -> bool:
+    compose_file = deploy_dir / "compose.yaml"
+    env_file = deploy_dir / ".env"
+    if not compose_file.is_file() or not env_file.is_file():
+        return False
+    base = compose_cmd(deploy_dir, project)
+    proc = run(base + ["ps", "-q", "mtveil"], check=False)
+    cid = proc.stdout.strip()
+    if not cid:
+        return False
+    insp = run(["docker", "inspect", cid], check=False)
+    if insp.returncode != 0:
+        return False
+    try:
+        info = json.loads(insp.stdout)[0]
+    except Exception:
+        return False
+    if not info.get("State", {}).get("Running"):
+        return False
+    if info.get("HostConfig", {}).get("NetworkMode") == "host":
+        cfg_file = deploy_dir / "config.json"
+        if cfg_file.is_file():
+            try:
+                listen = json.loads(cfg_file.read_text(encoding="utf-8")).get("listen", "")
+                if listen.endswith(f":{port}"):
+                    return True
+            except Exception:
+                pass
+    ports = info.get("NetworkSettings", {}).get("Ports") or {}
+    for bindings in ports.values():
+        if not bindings:
+            continue
+        for b in bindings:
+            if str(b.get("HostPort", "")) == str(port):
+                host_ip = b.get("HostIp") or "0.0.0.0"
+                if host_ip in ("0.0.0.0", "::", bind_ip) or bind_ip in ("0.0.0.0", "::"):
+                    return True
+    return False
+
+
+def ensure_available_port(deploy_dir: Path, project: str, bind_ip: str, pub_port: int, prompt: str) -> int:
+    while True:
+        if deployment_owns_port(deploy_dir, project, bind_ip, pub_port) or is_port_available(bind_ip, pub_port):
+            return pub_port
+        print(f"Порт {pub_port} на {bind_ip} уже занят другим сервисом.")
+        pub_port = ask_validated(prompt, validate_port)
+
+
+def restore_backup_files(deploy_dir: Path) -> bool:
+    restored = False
+    for name in ("compose.yaml", ".env", "config.json"):
+        bak = deploy_dir / f"{name}.bak"
+        live = deploy_dir / name
+        if bak.is_file():
+            os.replace(bak, live)
+            restored = True
+    return restored
+
+
+def compute_listen_and_health(bind_ip: str, pub_port: int, network_host: bool) -> tuple[str, str]:
+    if not network_host:
+        return "", "127.0.0.1"
+    if bind_ip == "::":
+        return f"[::]:{pub_port}", "::1"
+    if ":" in bind_ip:
+        return f"[{bind_ip}]:{pub_port}", bind_ip
+    return f"{bind_ip}:{pub_port}", ("127.0.0.1" if bind_ip == "0.0.0.0" else bind_ip)
 
 
 def render_compose(
@@ -483,6 +587,7 @@ def main() -> int:
         public_host = prompt_client_host_and_dns("Публичный домен или IP для ссылки Telegram")
         pub_port = ask_validated("Публичный TCP-порт", validate_port, "443")
         bind_ip = ask_validated("IP интерфейса для привязки на хосте", validate_ip, "0.0.0.0")
+        pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, "Укажите другой публичный TCP-порт")
         sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, "example.com")
         cover = ask("Адрес HTTPS-cover (host:port)", f"{sni}:443")
         config_data = {
@@ -508,6 +613,7 @@ def main() -> int:
         print("\nПримечание: укажите приватный туннельный IP (SharX, WireGuard или AmneziaWG), доступный с edge.")
         bind_ip = ask_validated("Локальный IP туннеля для прослушивания egress", validate_egress_ip)
         pub_port = ask_validated("TCP-порт egress", validate_port, "29443")
+        pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, "Укажите другой TCP-порт egress")
         public_host = bind_ip
         config_data = {
             "role": "egress",
@@ -523,6 +629,7 @@ def main() -> int:
         public_host = prompt_client_host_and_dns("Публичный домен или IP для ссылки Telegram")
         pub_port = ask_validated("Публичный TCP-порт для клиентов", validate_port, "443")
         bind_ip = ask_validated("IP интерфейса для привязки на хосте", validate_ip, "0.0.0.0")
+        pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, "Укажите другой публичный TCP-порт")
         sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, "example.com")
         cover = ask("Адрес HTTPS-cover (host:port)", f"{sni}:443")
         print("\nУкажите один или несколько адресов egress (IP:port) в порядке приоритета (через запятую или по одному).")
@@ -665,10 +772,12 @@ def main() -> int:
                     return 1
 
         # Back up existing deployment files before promoting validated candidate.
+        had_backup = False
         for name in ("compose.yaml", ".env", "config.json"):
             live = deploy_dir / name
             if live.exists():
                 live.replace(deploy_dir / f"{name}.bak")
+                had_backup = True
         (deploy_dir / "compose.yaml").write_text(
             render_compose(
                 repo_root,
@@ -691,7 +800,48 @@ def main() -> int:
                 p.unlink()
 
     print("\nЗапуск сервиса mtveil...")
-    run(base + ["up", "-d", "mtveil"], capture=False)
+    up_succeeded = False
+    try:
+        while True:
+            up_proc = run(base + ["up", "-d", "mtveil"], check=False)
+            if up_proc.returncode == 0:
+                up_succeeded = True
+                break
+            err_detail = (up_proc.stderr or up_proc.stdout or "").strip()
+            print(f"Не удалось запустить контейнер на {bind_ip}:{pub_port}.\n{err_detail}", file=sys.stderr)
+            try:
+                retry = ask_yes_no("Указать другой порт и повторить запуск (настройки и секрет сохранятся)?", default=True)
+            except EOFError:
+                retry = False
+            if not retry:
+                return 1
+            pub_port = ask_validated("Укажите другой TCP-порт", validate_port)
+            pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, "Укажите другой TCP-порт")
+            (deploy_dir / ".env").write_text(
+                f"MTVEIL_PROJECT={project}\nMTVEIL_IMAGE={args.image}\nMTVEIL_BIND={bind_ip}\nMTVEIL_PORT={pub_port}\n",
+                encoding="utf-8",
+            )
+            if args.network_host:
+                listen_addr, health_host = compute_listen_and_health(bind_ip, pub_port, True)
+                config_data["listen"] = listen_addr
+                (deploy_dir / "config.json").write_text(json.dumps(config_data, indent=2) + "\n", encoding="utf-8")
+                (deploy_dir / "compose.yaml").write_text(
+                    render_compose(
+                        repo_root,
+                        deploy_dir,
+                        role,
+                        "config.json",
+                        network_host=True,
+                        health_host=health_host,
+                        health_port=pub_port,
+                        include_build=include_build,
+                    ),
+                    encoding="utf-8",
+                )
+    finally:
+        if not up_succeeded and had_backup:
+            restore_backup_files(deploy_dir)
+            print("Предыдущая рабочая конфигурация восстановлена.", file=sys.stderr)
     wait_healthy(base)
     print("Статус контейнера: healthy (порт открыт; проверьте передачу данных в Telegram, отправив или загрузив фото).")
 
