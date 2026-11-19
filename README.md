@@ -58,16 +58,16 @@ bash install.sh
 Для большинства задач хватает **одного зарубежного VPS (`direct`)**. Схема **`edge → egress`** нужна, если вы хотите принимать клиентов на узле в РФ (`edge`) и пересылать трафик через один или несколько зарубежных узлов (`egress`) по приватному туннелю.
 
 ```mermaid
-flowchart LR
-  subgraph Direct ["Один сервер (direct)"]
-    T1["Telegram"] --> V1["VPS (direct)"] --> DC1["Telegram DC"]
+flowchart TD
+  subgraph Direct[Один сервер]
+    T1[Telegram] --> V1[VPS direct] --> DC1[Telegram DC]
   end
 
-  subgraph EdgeEgress ["Цепочка (edge → egress)"]
-    T2["Telegram"] --> E["Edge VPS"]
-    E -->|"основной"| G1["Egress 1"]
-    E -.->|"резервный"| G2["Egress 2"]
-    G1 --> DC2["Telegram DC"]
+  subgraph EdgeEgress[Цепочка edge-egress]
+    T2[Telegram] --> E[Edge VPS]
+    E -->|основной| G1[Egress 1]
+    E -.->|резервный| G2[Egress 2]
+    G1 --> DC2[Telegram DC]
     G2 --> DC2
   end
 ```
