@@ -231,7 +231,7 @@ impl Config {
         }
         Ok(dcs)
     }
-    pub fn secrets(&self) -> Result<Vec<NamedSecret>> {
+    pub fn load_secrets_allow_empty(&self) -> Result<Vec<NamedSecret>> {
         let mut out = Vec::new();
         if let Some(path) = &self.secret_file {
             out.push(NamedSecret {
@@ -268,6 +268,11 @@ impl Config {
                 }
             }
         }
+        Ok(out)
+    }
+
+    pub fn secrets(&self) -> Result<Vec<NamedSecret>> {
+        let out = self.load_secrets_allow_empty()?;
         ensure!(!out.is_empty(), "at least one secret is required");
         Ok(out)
     }

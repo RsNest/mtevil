@@ -391,6 +391,102 @@ class SetupValidationTests(unittest.TestCase):
             self.assertEqual(volume_store["/var/lib/mtevil/egress-token"], old_tok)
             self.assertEqual((d / "compose.yaml").read_text(encoding="utf-8"), "working-compose")
 
+    def test_real_container_token_rotation_rollback_reconnects_edge_to_egress(self):
+        image = self._local_image()
+        if image is None:
+            self.skipTest("no local mtevil image available")
+
+        eg1_port = self._free_port()
+        eg2_port = self._free_port()
+        edge_port = self._free_port()
+        old_tok = "11111111111111111111111111111111"
+        new_tok = "22222222222222222222222222222222"
+
+        with (
+            tempfile.TemporaryDirectory() as td_eg1,
+            tempfile.TemporaryDirectory() as td_eg2,
+            tempfile.TemporaryDirectory() as td_edge,
+        ):
+            d_eg1 = Path(td_eg1)
+            d_eg2 = Path(td_eg2)
+            d_edge = Path(td_edge)
+            p_eg1 = f"mtevil-eg1-{eg1_port}"
+            p_eg2 = f"mtevil-eg2-{eg2_port}"
+            p_edge = f"mtevil-edge-{edge_port}"
+            try:
+                # 1. Start real Egress 1 with old_tok (--network-host on 127.0.0.1:eg1_port).
+                stdin_eg1 = f"2\n1\n127.0.0.1\n{eg1_port}\nn\n{old_tok}\n"
+                with (
+                    mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d_eg1), "--project", p_eg1, "--image", image, "--no-build", "--network-host"]),
+                    mock.patch.object(sys, "stdin", io.StringIO(stdin_eg1)),
+                    mock.patch.object(sys, "stdout", io.StringIO()),
+                    mock.patch.object(sys, "stderr", io.StringIO()),
+                ):
+                    self.assertEqual(setup.main(), 0)
+
+                # 2. Start real Egress 2 with new_tok (--network-host on 127.0.0.1:eg2_port).
+                stdin_eg2 = f"2\n1\n127.0.0.1\n{eg2_port}\nn\n{new_tok}\n"
+                with (
+                    mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d_eg2), "--project", p_eg2, "--image", image, "--no-build", "--network-host"]),
+                    mock.patch.object(sys, "stdin", io.StringIO(stdin_eg2)),
+                    mock.patch.object(sys, "stdout", io.StringIO()),
+                    mock.patch.object(sys, "stderr", io.StringIO()),
+                ):
+                    self.assertEqual(setup.main(), 0)
+
+                # 3. Start real Edge connected to Egress 1 with old_tok.
+                stdin_edge1 = f"2\n2\n127.0.0.1\n{edge_port}\nn\n127.0.0.1:{eg1_port}\nn\n1\n{old_tok}\n"
+                with (
+                    mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d_edge), "--project", p_edge, "--image", image, "--no-build", "--network-host"]),
+                    mock.patch.object(sys, "stdin", io.StringIO(stdin_edge1)),
+                    mock.patch.object(sys, "stdout", io.StringIO()),
+                    mock.patch.object(sys, "stderr", io.StringIO()),
+                ):
+                    self.assertEqual(setup.main(), 0)
+
+                edge_base = setup.compose_cmd(d_edge, p_edge)
+                self.assertEqual(setup.read_volume_secret(edge_base, "/var/lib/mtevil/egress-token"), old_tok)
+
+                # 4. Reconfigure Edge to rotate to Egress 2 + new_tok:
+                #    check-egress passes against real Egress 2, new_tok is written to real Docker volume,
+                #    up -d runs, and then wait_healthy raises TimeoutError -> full rollback runs!
+                stdin_edge2 = f"y\n2\n2\n127.0.0.1\n{edge_port}\nn\n127.0.0.1:{eg2_port}\nn\n1\nn\n{new_tok}\n"
+                with (
+                    mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d_edge), "--project", p_edge, "--image", image, "--no-build", "--network-host"]),
+                    mock.patch.object(sys, "stdin", io.StringIO(stdin_edge2)),
+                    mock.patch.object(sys, "stdout", io.StringIO()),
+                    mock.patch.object(sys, "stderr", io.StringIO()),
+                    mock.patch.object(setup, "wait_healthy", side_effect=TimeoutError("simulated health timeout")),
+                ):
+                    self.assertEqual(setup.main(), 1)
+
+                # 5. Verify real Docker volume token rolled back to old_tok, config rolled back to eg1_port,
+                #    and real check-egress from rolled-back Edge to Egress 1 succeeds!
+                self.assertEqual(setup.read_volume_secret(edge_base, "/var/lib/mtevil/egress-token"), old_tok)
+                setup.wait_healthy(edge_base)
+                chk = setup.run(
+                    edge_base
+                    + [
+                        "exec",
+                        "-T",
+                        setup.compose_service(edge_base),
+                        "mtevil",
+                        "check-egress",
+                        "--config",
+                        "/etc/mtevil/config.json",
+                        "--dc",
+                        "2",
+                    ],
+                    check=False,
+                )
+                self.assertEqual(chk.returncode, 0, chk.stdout + chk.stderr)
+                self.assertIn(f"127.0.0.1:{eg1_port}", chk.stdout)
+                self.assertIn('"token_status": "accepted"', chk.stdout)
+            finally:
+                for d_path, proj in ((d_edge, p_edge), (d_eg2, p_eg2), (d_eg1, p_eg1)):
+                    if (d_path / "compose.yaml").exists():
+                        subprocess.run(setup.compose_cmd(d_path, proj) + ["down", "-v"], capture_output=True)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

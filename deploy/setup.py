@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -930,8 +931,10 @@ def main() -> int:
     cand_env = deploy_dir / ".env.candidate"
     cand_config = deploy_dir / "config.candidate.json"
     cand_token = deploy_dir / ".egress-token.candidate"
-    pending_edge_token: str | None = None
+    pending_token: str | None = None
     previous_token: str | None = None
+    token_written_to_volume = False
+    had_backup = False
     env_text = (
         f"MTEVIL_PROJECT={project}\n"
         f"MTEVIL_IMAGE={args.image}\n"
@@ -998,30 +1001,13 @@ def main() -> int:
                     previous_token = read_volume_secret(cand_base, "/var/lib/mtevil/egress-token")
                 is_first = ask_yes_no("Это первый узел egress (сгенерировать новый токен MTV2)?", default=True)
                 if is_first:
-                    if has_egress_tok:
-                        tok = run(
-                            cand_base
-                            + [
-                                "run",
-                                "--rm",
-                                "--no-deps",
-                                "--entrypoint",
-                                "/bin/sh",
-                                compose_service(cand_base),
-                                "-c",
-                                "rm -f /var/lib/mtevil/egress-token && /usr/local/bin/mtevil secret --output /var/lib/mtevil/egress-token >/dev/null && cat /var/lib/mtevil/egress-token",
-                            ]
-                        ).stdout.strip()
-                    else:
-                        ensure_generated_secret(cand_base, "/var/lib/mtevil/egress-token")
-                    print("Токен MTV2 сгенерирован и сохранён в томе state (0600).")
+                    pending_token = secrets.token_hex(16)
+                    print("Токен MTV2 сгенерирован и подготовлен для проверки (0600).")
                     if ask_yes_no("Показать сгенерированный токен MTV2 для копирования на edge?", default=False):
-                        tok = read_volume_secret(cand_base, "/var/lib/mtevil/egress-token")
-                        print(f"Токен MTV2: {tok}")
+                        print(f"Токен MTV2: {pending_token}")
                 else:
-                    tok = ask_hidden_token("Введите токен MTV2 с основного egress")
-                    write_volume_secret_stdin(cand_base, "/var/lib/mtevil/egress-token", tok)
-                    print("Токен MTV2 импортирован в том state.")
+                    pending_token = ask_hidden_token("Введите токен MTV2 с основного egress")
+                    print("Токен MTV2 подготовлен для проверки (рабочий том state пока не изменён).")
         elif role == "edge":
             has_edge_tok = volume_file_exists(cand_base, "/var/lib/mtevil/egress-token")
             if has_edge_tok and ask_yes_no(
@@ -1031,30 +1017,32 @@ def main() -> int:
             else:
                 if has_edge_tok:
                     previous_token = read_volume_secret(cand_base, "/var/lib/mtevil/egress-token")
-                pending_edge_token = ask_hidden_token("Введите общий токен MTV2")
-                cand_token.write_text(pending_edge_token + "\n", encoding="utf-8")
-                try:
-                    os.chmod(cand_token, 0o600)
-                except OSError:
-                    pass
-                cand_cfg_data = dict(config_data)
-                cand_cfg_data["egress_token_file"] = "/etc/mtevil/egress-token.candidate"
-                cand_config.write_text(json.dumps(cand_cfg_data, indent=2) + "\n", encoding="utf-8")
-                cand_compose.write_text(
-                    render_compose(
-                        repo_root,
-                        deploy_dir,
-                        role,
-                        "config.candidate.json",
-                        network_host=args.network_host,
-                        health_host=health_host,
-                        health_port=pub_port,
-                        include_build=include_build,
-                        extra_volumes=["./.egress-token.candidate:/etc/mtevil/egress-token.candidate:ro"],
-                    ),
-                    encoding="utf-8",
-                )
+                pending_token = ask_hidden_token("Введите общий токен MTV2")
                 print("Токен MTV2 подготовлен для проверки (рабочий том state пока не изменён).")
+
+        if pending_token is not None:
+            cand_token.write_text(pending_token + "\n", encoding="utf-8")
+            try:
+                os.chmod(cand_token, 0o600)
+            except OSError:
+                pass
+            cand_cfg_data = dict(config_data)
+            cand_cfg_data["egress_token_file"] = "/etc/mtevil/egress-token.candidate"
+            cand_config.write_text(json.dumps(cand_cfg_data, indent=2) + "\n", encoding="utf-8")
+            cand_compose.write_text(
+                render_compose(
+                    repo_root,
+                    deploy_dir,
+                    role,
+                    "config.candidate.json",
+                    network_host=args.network_host,
+                    health_host=health_host,
+                    health_port=pub_port,
+                    include_build=include_build,
+                    extra_volumes=["./.egress-token.candidate:/etc/mtevil/egress-token.candidate:ro"],
+                ),
+                encoding="utf-8",
+            )
 
         cfg_check = run(
             cand_base + ["run", "--rm", "--no-deps", compose_service(cand_base), "--config", "/etc/mtevil/config.json", "--check-config"],
@@ -1114,7 +1102,6 @@ def main() -> int:
             include_build=include_build,
         )
         # Back up existing deployment files before promoting validated candidate.
-        had_backup = False
         for name in ("compose.yaml", ".env", "config.json"):
             live = deploy_dir / name
             if live.exists():
@@ -1123,9 +1110,10 @@ def main() -> int:
         (deploy_dir / "compose.yaml").write_text(live_compose, encoding="utf-8")
         os.replace(cand_env, deploy_dir / ".env")
         os.replace(cand_config, deploy_dir / "config.json")
-        if pending_edge_token is not None:
+        if pending_token is not None:
             (deploy_dir / "config.json").write_text(cfg_text, encoding="utf-8")
-            write_volume_secret_stdin(base, "/var/lib/mtevil/egress-token", pending_edge_token)
+            write_volume_secret_stdin(base, "/var/lib/mtevil/egress-token", pending_token)
+            token_written_to_volume = True
             print("Токен MTV2 сохранён в томе state.")
         run(base + ["config", "--quiet"])
     finally:
@@ -1134,6 +1122,7 @@ def main() -> int:
                 p.unlink()
 
     up_succeeded = False
+    deployment_committed = False
     try:
         while True:
             up_proc = run(base + ["up", "-d", compose_service(base)], check=False)
@@ -1186,32 +1175,28 @@ def main() -> int:
                     ),
                     encoding="utf-8",
                 )
+
+        print(ok_text("Контейнер запущен"))
+        try:
+            wait_healthy(base)
+        except TimeoutError:
+            print(err_text("Контейнер не перешёл в статус healthy за 45 секунд."), file=sys.stderr)
+            print(f"Проверьте логи этой установки: docker compose {compose_ref} logs --tail=100 {compose_service(base)}", file=sys.stderr)
+            return 1
+        deployment_committed = True
     finally:
-        if not up_succeeded:
-            if previous_token is not None:
-                try:
-                    write_volume_secret_stdin(base, "/var/lib/mtevil/egress-token", previous_token)
-                except Exception:
-                    pass
+        if not deployment_committed:
             if had_backup:
                 restore_backup_files(deploy_dir)
                 print("Прежние файлы конфигурации восстановлены.", file=sys.stderr)
+            if token_written_to_volume and previous_token is not None:
+                try:
+                    write_volume_secret_stdin(base, "/var/lib/mtevil/egress-token", previous_token)
+                except Exception as exc:
+                    print(err_text(f"Не удалось вернуть прежний токен MTV2 в том state: {exc}"), file=sys.stderr)
+            if had_backup and up_succeeded:
+                run(base + ["up", "-d", compose_service(base)], check=False)
 
-    print(ok_text("Контейнер запущен"))
-    try:
-        wait_healthy(base)
-    except TimeoutError:
-        if previous_token is not None:
-            try:
-                write_volume_secret_stdin(base, "/var/lib/mtevil/egress-token", previous_token)
-            except Exception:
-                pass
-        if had_backup:
-            restore_backup_files(deploy_dir)
-            print("Прежние файлы конфигурации восстановлены.", file=sys.stderr)
-        print(err_text("Контейнер не перешёл в статус healthy за 45 секунд."), file=sys.stderr)
-        print(f"Проверьте логи этой установки: docker compose {compose_ref} logs --tail=100 {compose_service(base)}", file=sys.stderr)
-        return 1
     print(ok_text("Контейнер исправен"))
 
     if role in ("direct", "edge"):

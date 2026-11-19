@@ -351,7 +351,7 @@ impl State {
     }
 
     fn reload_secrets(&self, config: &Config) {
-        match config.secrets() {
+        match config.load_secrets_allow_empty() {
             Ok(new_secrets) => {
                 let cur = self.current_secrets();
                 let same = cur.len() == new_secrets.len()
@@ -375,6 +375,25 @@ impl State {
             }
         }
     }
+}
+
+fn spawn_users_reloader(
+    state: Arc<State>,
+    cfg: Config,
+    period: Duration,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = &mut stop_rx => break,
+            }
+            state.reload_secrets(&cfg);
+        }
+    })
 }
 
 // OS-level exclusive advisory file lock (flock on Unix, LockFileEx on Windows) so the
@@ -796,21 +815,9 @@ async fn main() -> Result<()> {
             }
         })
     });
-    let (users_stop_tx, mut users_stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let users_task = reload_config.map(|cfg| {
-        let state = state.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            interval.tick().await;
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    _ = &mut users_stop_rx => break,
-                }
-                state.reload_secrets(&cfg);
-            }
-        })
-    });
+    let (users_stop_tx, users_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let users_task = reload_config
+        .map(|cfg| spawn_users_reloader(state.clone(), cfg, Duration::from_secs(1), users_stop_rx));
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let res = serve(listener, state.clone(), config.max_connections, async {

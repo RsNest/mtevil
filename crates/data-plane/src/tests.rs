@@ -1207,17 +1207,18 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     ));
     std::fs::create_dir_all(&dir)?;
-    let secret_path = dir.join("proxy-secret");
     let users_path = dir.join("users.json");
-    // Primary secret uses a distinct key (`[0x44; 16]`), while dynamically added `alice`
-    // uses the fixture `secret()` so we can send precomputed valid ClientHello vectors for `alice`.
-    std::fs::write(&secret_path, hex::encode([0x44u8; 16]))?;
-    std::fs::write(&users_path, "{}\n")?;
+    // Start with ONLY `users_file` (no `secret_file`) containing a single initial user `bob`,
+    // so we test both background adding of `alice` and background deletion of the LAST user!
+    std::fs::write(
+        &users_path,
+        format!("{{\"bob\":\"{}\"}}\n", hex::encode([0x44u8; 16])),
+    )?;
 
     let file_cfg = Config {
         role: Role::Direct,
         listen: "127.0.0.1:0".parse()?,
-        secret_file: Some(secret_path.clone()),
+        secret_file: None,
         users_file: Some(users_path.clone()),
         replay_file: None,
         sni: "example.com".into(),
@@ -1250,31 +1251,34 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         sm.idle = Duration::from_secs(3);
     }
 
-    // 1. Add user `bob` and `carol` via OS lock helper & atomic writer, verify sorted names.
-    {
-        let _lock = lock_users_file(&users_path)?;
-        let mut map = std::collections::BTreeMap::new();
-        map.insert("alice".to_string(), hex::encode(secret()));
-        write_users_map_atomic(&users_path, &map)?;
-    }
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let reload_task = spawn_users_reloader(
+        proxy_state.clone(),
+        file_cfg.clone(),
+        Duration::from_millis(60),
+        stop_rx,
+    );
 
-    // Malformed JSON must not clobber existing secrets when reload runs.
+    // 1. Malformed JSON must not clobber existing `bob` when background reloader runs.
     std::fs::write(&users_path, "{invalid json")?;
-    proxy_state.reload_secrets(&file_cfg);
+    tokio::time::sleep(Duration::from_millis(160)).await;
     assert_eq!(proxy_state.current_secrets().len(), 1);
-    assert_eq!(proxy_state.current_secrets()[0].name, "default");
+    assert_eq!(proxy_state.current_secrets()[0].name, "bob");
 
-    // Restore valid JSON with `alice` and reload.
+    // 2. Replace with ONLY `alice` (using the fixture secret) and wait for background reloader.
     {
         let _lock = lock_users_file(&users_path)?;
         let mut map = std::collections::BTreeMap::new();
         map.insert("alice".to_string(), hex::encode(secret()));
         write_users_map_atomic(&users_path, &map)?;
     }
-    proxy_state.reload_secrets(&file_cfg);
-    assert_eq!(proxy_state.current_secrets().len(), 2);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while proxy_state.current_secrets().first().map(|s| s.name.as_str()) != Some("alice") {
+        ensure!(Instant::now() < deadline, "background reloader did not load alice");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
 
-    // 2. Open an active session for `alice` and keep it open while deleting `alice` from users.json.
+    // 3. Open an active session for `alice` and keep it open while deleting the LAST user `alice`!
     let (mut alice_open, alice_task) = proxy(proxy_state.clone()).await?;
     let dc_task = tokio::spawn(async move {
         let (mut peer, _) = dc.accept().await?;
@@ -1300,26 +1304,32 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
     alice_open.write_all(&raw).await?;
     flight(&mut alice_open, &raw).await?;
 
-    // Delete `alice` and hot-reload while `alice_open` is still in-flight!
+    // Delete the LAST user (`alice`) leaving `{}` in `users.json`, and wait for background reloader!
     {
         let _lock = lock_users_file(&users_path)?;
         let map = std::collections::BTreeMap::new();
         write_users_map_atomic(&users_path, &map)?;
     }
-    proxy_state.reload_secrets(&file_cfg);
-    assert_eq!(proxy_state.current_secrets().len(), 1);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !proxy_state.current_secrets().is_empty() {
+        ensure!(
+            Instant::now() < deadline,
+            "background reloader did not revoke the last deleted user"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
 
-    // 3. New connection with `alice`'s deleted secret is now rejected to cover.
+    // 4. New connection with `alice`'s deleted last secret is rejected to cover.
     let (mut alice_new, new_task) = proxy(proxy_state.clone()).await?;
     alice_new.write_all(&hello()?).await?;
     alice_new.shutdown().await?;
     let relayed_to_cover = timeout(Duration::from_secs(2), cover.received.recv())
         .await?
-        .context("deleted user hello must go to cover")?;
+        .context("deleted last user hello must go to cover")?;
     assert!(!relayed_to_cover.is_empty());
     timeout(Duration::from_secs(2), new_task).await???;
 
-    // 4. Meanwhile, `alice_open` (already authenticated before deletion) completes its download!
+    // 5. Meanwhile, `alice_open` (already authenticated before deletion) completes its download!
     let mut bytes = fixture("init")?;
     bytes.extend_from_slice(&fixture("payload")?);
     alice_open.write_all(&wire::record(0x17, &bytes)?).await?;
@@ -1334,6 +1344,8 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
     timeout(Duration::from_secs(2), alice_task).await???;
     timeout(Duration::from_secs(2), dc_task).await???;
 
+    let _ = stop_tx.send(());
+    let _ = reload_task.await;
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
