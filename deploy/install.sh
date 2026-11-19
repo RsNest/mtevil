@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MTVEIL_REPO="${MTVEIL_REPO:-RsNest/mtevil}"
-MTVEIL_VERSION="${MTVEIL_VERSION:-v0.1.0-alpha.4}"
-MTVEIL_DIR="${MTVEIL_DIR:-$HOME/mtveil}"
-REPO_LOWER="$(printf '%s' "$MTVEIL_REPO" | tr '[:upper:]' '[:lower:]')"
-MTVEIL_IMAGE="${MTVEIL_IMAGE:-ghcr.io/${REPO_LOWER}:${MTVEIL_VERSION}}"
+MTEVIL_REPO="${MTEVIL_REPO:-${MTVEIL_REPO:-RsNest/mtevil}}"
+MTEVIL_VERSION="${MTEVIL_VERSION:-${MTVEIL_VERSION:-v0.1.0-alpha.5}}"
+if [[ -z "${MTEVIL_DIR:-${MTVEIL_DIR:-}}" && -f "$HOME/mtveil/compose.yaml" ]]; then
+  if [[ ! -e "$HOME/mtevil" && ! -L "$HOME/mtevil" ]]; then
+    # Keep existing bind mounts valid while exposing the new path.
+    ln -s -- "$HOME/mtveil" "$HOME/mtevil"
+  elif [[ ! "$HOME/mtevil" -ef "$HOME/mtveil" ]]; then
+    echo 'Найдены два разных каталога. Укажите каталог нужной установки через MTEVIL_DIR и повторите запуск.' >&2
+    exit 1
+  fi
+fi
+MTEVIL_DIR="${MTEVIL_DIR:-${MTVEIL_DIR:-$HOME/mtevil}}"
+REPO_LOWER="$(printf '%s' "$MTEVIL_REPO" | tr '[:upper:]' '[:lower:]')"
+MTEVIL_IMAGE="${MTEVIL_IMAGE:-${MTVEIL_IMAGE:-ghcr.io/${REPO_LOWER}:${MTEVIL_VERSION}}}"
 
 missing=()
 if ! command -v docker >/dev/null 2>&1; then
@@ -41,24 +50,24 @@ if ! docker_err="$(docker info 2>&1 >/dev/null)"; then
   exit 1
 fi
 
-mkdir -p "$MTVEIL_DIR"
-SETUP_URL="https://github.com/${MTVEIL_REPO}/releases/download/${MTVEIL_VERSION}/setup.py"
-echo "Скачивание мастера настройки mtveil (${MTVEIL_VERSION})..."
+mkdir -p "$MTEVIL_DIR"
+SETUP_URL="https://github.com/${MTEVIL_REPO}/releases/download/${MTEVIL_VERSION}/setup.py"
+echo "Скачивание мастера настройки mtevil (${MTEVIL_VERSION})..."
 if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$SETUP_URL" -o "${MTVEIL_DIR}/setup.py"
+  curl -fsSL "$SETUP_URL" -o "${MTEVIL_DIR}/setup.py"
 else
-  wget -qO "${MTVEIL_DIR}/setup.py" "$SETUP_URL"
+  wget -qO "${MTEVIL_DIR}/setup.py" "$SETUP_URL"
 fi
 
-echo "Загрузка Docker-образа ${MTVEIL_IMAGE}..."
-if ! docker pull "$MTVEIL_IMAGE"; then
-  echo "Не удалось загрузить Docker-образ ${MTVEIL_IMAGE}." >&2
+echo "Загрузка Docker-образа ${MTEVIL_IMAGE}..."
+if ! docker pull "$MTEVIL_IMAGE"; then
+  echo "Не удалось загрузить Docker-образ ${MTEVIL_IMAGE}." >&2
   echo "Дальше: проверьте интернет-соединение и доступ к ghcr.io, затем повторите запуск." >&2
   exit 1
 fi
 
-exec python3 "${MTVEIL_DIR}/setup.py" \
-  --dir "$MTVEIL_DIR" \
-  --image "$MTVEIL_IMAGE" \
+exec python3 "${MTEVIL_DIR}/setup.py" \
+  --dir "$MTEVIL_DIR" \
+  --image "$MTEVIL_IMAGE" \
   --no-build \
   "$@"
