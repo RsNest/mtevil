@@ -649,27 +649,37 @@ class SetupValidationTests(unittest.TestCase):
         t = threading.Thread(target=srv.serve_forever, daemon=True)
         t.start()
         try:
-            image = self._local_image()
-            if image is None:
-                self.skipTest("no local mtevil image available")
             with tempfile.TemporaryDirectory() as td:
                 d = Path(td)
                 pinned_path = d / "install.alpha6.sh"
                 pinned_path.write_text(pinned_alpha6, encoding="utf-8", newline="\n")
-                # Execute inside container or local bash if available:
-                # Using `docker run --rm` or local bash? No, on Windows `bash` might be WSL stub,
-                # so let's test on Linux / Git Bash or verify via python + bash when `/bin/bash` is present.
+                fake_bin = d / "bin"
+                fake_bin.mkdir()
+                pulled_file = d / "pulled.txt"
+                fake_docker = fake_bin / "docker"
+                fake_docker.write_text(
+                    "#!/usr/bin/env bash\n"
+                    'if [ "$1" = "pull" ]; then echo "$2" > "' + str(pulled_file).replace("\\", "/") + '"; exit 0; fi\n'
+                    "exit 0\n",
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                try:
+                    setup.os.chmod(fake_docker, 0o755)
+                except OSError:
+                    pass
                 bash_bin = "/bin/bash" if Path("/bin/bash").is_file() else None
                 if bash_bin is not None:
                     env = dict(setup.os.environ)
+                    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
                     env["MTEVIL_DIR"] = str(d / "install_dir")
                     env["MTEVIL_RELEASES_API_URL"] = f"http://127.0.0.1:{port}/releases"
                     env["MTEVIL_RELEASE_BASE_URL"] = f"http://127.0.0.1:{port}/download"
-                    env["MTEVIL_IMAGE"] = image
                     proc = subprocess.run([bash_bin, str(pinned_path)], env=env, capture_output=True, text=True)
                     self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                     self.assertIn("/download/v0.1.0-alpha.6/setup.py", requested_paths)
                     self.assertNotIn("/releases", requested_paths)
+                    self.assertEqual(pulled_file.read_text(encoding="utf-8").strip(), "ghcr.io/rsnest/mtevil:v0.1.0-alpha.6")
         finally:
             srv.shutdown()
             srv.server_close()
