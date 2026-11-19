@@ -1098,21 +1098,22 @@ def run_update_command(deploy_dir: Path, target_version_override: str | None = N
         print(ok_text(f"Уже установлена актуальная версия {target_version}. Перезапуск не требуется."))
         return 0
 
-    # Validate existing config.json against the newly pulled image before touching live files or stopping the container.
-    cfg_check = run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "-v",
-            f"{str(cfg_file.resolve())}:/etc/mtevil/config.json:ro",
-            target_image,
-            "--config",
-            "/etc/mtevil/config.json",
-            "--check-config",
-        ],
-        check=False,
-    )
+    # Validate existing config.json + state volume against the newly pulled image before touching live files or stopping the container.
+    cand_env_file = deploy_dir / ".env.update_check"
+    orig_env_text = env_file.read_text(encoding="utf-8", errors="ignore")
+    try:
+        cand_env_file.write_text(set_env_image(orig_env_text, target_image), encoding="utf-8")
+        cand_base = compose_cmd(deploy_dir, project, "compose.yaml", ".env.update_check")
+        cfg_check = run(
+            cand_base + ["run", "--rm", "--no-deps", compose_service(cand_base), "--config", "/etc/mtevil/config.json", "--check-config"],
+            check=False,
+        )
+    finally:
+        if cand_env_file.exists():
+            try:
+                cand_env_file.unlink()
+            except OSError:
+                pass
     if cfg_check.returncode != 0:
         detail = (cfg_check.stderr or cfg_check.stdout or "").strip()
         print(err_text("Существующая конфигурация не прошла проверку на новом образе. Обновление отменено."), file=sys.stderr)
