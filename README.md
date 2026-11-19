@@ -1,19 +1,24 @@
+![Схема работы mtveil: клиентский трафик проходит через один или два узла ретрансляции](docs/assets/hero.webp)
+
 # mtveil
 
-MTProto FakeTLS-прокси с внешним HTTPS-cover, поддержкой мульти-секретов, персистентного replay-кэша, неравномерной нарезкой `ServerHello` и схемой `edge -> egress` с failover.
+**mtveil** — это MTProto-прокси для Telegram на Rust с интерактивным установщиком на Docker Compose и опциональным резервированием через цепочку `edge → egress` ([RsNest/mtevil](https://github.com/RsNest/mtevil)).
 
-## Быстрый старт (без сборки и `git clone`)
+---
 
-На Linux VPS (нужны Docker Engine, плагин Docker Compose и Python 3):
+## Быстрый старт на одном VPS (`direct`)
 
-```bash
-curl -fsSL https://github.com/RsNest/mtevil/releases/download/v0.1.0-alpha.2/install.sh -o install.sh
-bash install.sh
-```
+Если вы поднимаете прокси на одном зарубежном Linux-сервере впервые, этого варианта достаточно. Установка занимает пару минут и не требует ручного редактирования конфигов.
 
-Скрипт проверит Docker Compose и Python 3, скачает `setup.py` и готовый образ `ghcr.io/rsnest/mtevil:v0.1.0-alpha.2` и запустит интерактивный мастер без локальной сборки Rust.
+### Что понадобится заранее
 
-## Вариант из исходников (`git clone`)
+- **Linux VPS** за пределами РФ с открытым входящим TCP-портом (обычно `443` или любой свободный порт).
+- **Docker Engine** и плагин **Docker Compose v2** (`docker compose version`).
+- **Python 3** и **Git** (для сборки из исходников).
+
+### Установка из исходников (доступна сейчас)
+
+Подключитесь к серверу по SSH и выполните:
 
 ```bash
 git clone https://github.com/RsNest/mtevil.git
@@ -21,88 +26,73 @@ cd mtevil
 python3 deploy/setup.py
 ```
 
-- Для одного зарубежного сервера выберите роль **`direct`** (по умолчанию).
-- Для схемы РФ `edge` → зарубежный `egress` сначала запустите `python3 deploy/setup.py` с ролью **`egress`** на зарубежных узлах, затем с ролью **`edge`** на узле в РФ (если между ними policy-routed туннель вроде SharX/WireGuard — запускайте на `edge` с флагом `--network-host`).
+Что выбрать в мастере:
 
-Подробности, диагностика (`check-egress`), обновление и откат — в [deploy/README.md](deploy/README.md).
+1. На первом шаге выберите роль **`1` (`direct`)** — она предложена по умолчанию.
+2. Укажите публичный IP или домен вашего VPS (например, `203.0.113.10` или `proxy.example.com`) и порт публикации (например, `443`).
+3. Для HTTPS-маскировки (cover) оставьте `example.com` или укажите свой домен — мастер сам проверит TLS-рукопожатие и сертификат изнутри контейнера.
+
+После запуска мастер выведет готовую ссылку вида `https://t.me/proxy?server=...&port=...&secret=...`.
+
+### Как проверить прокси в Telegram
+
+1. Откройте полученную ссылку на телефоне (попробуйте и по Wi-Fi, и с мобильного интернета) или на компьютере и подтвердите добавление прокси.
+2. Откройте любой чат или канал и **загрузите фото** — это проверяет не только рукопожатие, но и передачу медиафайлов.
+
+### Установка без сборки и `git clone` (ожидает публикации релиза)
+
+> [!NOTE]
+> Артефакты релиза `v0.1.0-alpha.2` (`install.sh`, `setup.py` и публичный образ в GHCR) ещё не опубликованы. Пока они недоступны, используйте установку из исходников выше.
+
+Когда релиз и публичный образ будут опубликованы, для установки достаточно двух команд:
+
+```bash
+curl -fsSL https://github.com/RsNest/mtevil/releases/download/v0.1.0-alpha.2/install.sh -o install.sh
+bash install.sh
+```
 
 ---
 
-Тестовый Direct-релиз **0.1.0-alpha.1**: [запуск через Docker Compose](deploy/README.md).
-Конфигурация проверяется до старта, секрет хранится отдельно от image/config,
-предусмотрены лимиты ресурсов, перезапуск процесса и процедура отката.
-Это alpha для ограниченного тестирования; production-готовность не заявляется.
+## Варианты развёртывания
 
-MTProto proxy data plane с covert-обложкой (FakeTLS + внешний cover), ownership-моделью
-ME-writer'ов и измеримым поведением при отказах. Цель — не «больше функций», а детерминированные
-инварианты и честные, методологически подтверждённые гарантии.
+Для большинства задач хватает **одного зарубежного VPS (`direct`)**. Схема **`edge → egress`** нужна, если вы хотите принимать клиентов на узле в РФ (`edge`) и пересылать трафик через один или несколько зарубежных узлов (`egress`) по приватному туннелю.
 
-## Иерархия документов
+```mermaid
+flowchart LR
+  subgraph Direct ["Один сервер (direct)"]
+    T1["Telegram"] --> V1["VPS (direct)"] --> DC1["Telegram DC"]
+  end
 
-1. [docs/adr/000-architecture-baseline.md](docs/adr/000-architecture-baseline.md) — **baseline v1.3**, обязателен. Изменения — только через ADR.
-2. [docs/specs/](docs/specs/) — спецификации компонентов, методики верификации.
-3. Код.
-
-**Текущее решение:** [ADR-001](docs/adr/001-own-core-prototype.md) разрешает
-собственное тестовое ядро по сокращённому gate. Полный Phase 0 не объявляется
-завершённым. Контракт прототипа: [prototype.md](docs/specs/prototype.md).
-
-## Структура (§14.1 baseline)
-
-```text
-docs/adr/                  ADR-000 (baseline), ADR-001 (gate), ...
-docs/specs/                спеки компонентов, failure-matrix, методики
-crates/
-  proto/                   чистые парсеры/кодеки, без I/O          [spec-first, после ADR-001]
-  data-plane/              listener/demux/faketls/transport        [запрещён до ADR-001]
-  me-pool/                 writer'ы, Direct                        [spec-first, после ADR-001]
-  egress/                  upstreams, health, routing              [spec-first, после ADR-001]
-  control/                 epoch-конфиги, users, API, metrics      [spec-first, после ADR-001]
-  guard/                   replay (tmpfs robust-mutex), suspects   [spec-first, после ADR-001]
-  harness/                 генератор, стенд, eBPF/nstat, отчёты    [Phase 0 — активная работа]
-tests/vectors/             wire-векторы
-tests/inv/                 тесты инвариантов (имена ссылаются на INV-xx)
+  subgraph EdgeEgress ["Цепочка (edge → egress)"]
+    T2["Telegram"] --> E["Edge VPS"]
+    E -->|"основной"| G1["Egress 1"]
+    E -.->|"резервный"| G2["Egress 2"]
+    G1 --> DC2["Telegram DC"]
+    G2 --> DC2
+  end
 ```
 
-## Процесс (§14.3)
+- **Один сервер (`direct`):** минимальная задержка и простая настройка; подойдёт, если зарубежный сервер стабильно доступен напрямую.
+- **Цепочка (`edge → egress`):** `edge` принимает подключения клиентов и открывает соединения к `egress` по приватному туннелю (SharX, WireGuard или AmneziaWG). При отказе основного `egress` активные сессии на нём могут оборваться, Telegram на секунду покажет «Подключение…» с той же ссылкой, а **новые подключения** автоматически пойдут на резервный `egress`.
 
-`Spec → INV-check → тесты → код`. Каждый тест, защищающий инвариант, ссылается на `INV-xx`
-в имени. PR без INV-проверки при затрагивании инварианта не принимается. Код конкурентов
-не заимствуется до проверки лицензии (§15 baseline).
+Подробная инструкция для нескольких узлов — роли, настройка приватных маршрутов, диагностика `check-egress` и флаг `--network-host` для policy-routed туннелей — вынесена в [руководство по развёртыванию](deploy/README.md).
 
-## Статус
+---
 
-- Phase 0 (baseline harness + wire-корпус + генератор + методики + бенчмарк конкурентов) — в работе.
-- Gate: exit-критерии §11.5 baseline → ADR-001.
+## Что умеет текущая версия и что проверено
 
-### Direct-прототип, 17.11.2026
+- **Защита и маскировка:** FakeTLS (`ee`) с проверкой внешнего HTTPS-cover на стадии настройки, персистентным replay-кэшем на диске и формированием пакетов при старте соединения (`flight_shaping`, настройка MSS).
+- **Несколько пользователей:** поддержка отдельных секретов через `users_file` и команду `mtveil user-add`.
+- **Управление и диагностика:** встроенный `healthcheck`, проверка туннелей `mtveil check-egress`, сохранение секретов/токенов в Docker volume и резервные копии `*.bak` при перенастройке.
+- **Проверено на практике (IPv4):** отправка сообщений, загрузка фото и медиа по IPv4 на Telegram Desktop (Windows) и iOS (Wi-Fi и мобильная сеть) как в режиме `direct`, так и в схеме `edge → egress` с переключением на резервный узел. Сквозная работа по **IPv6** на реальных серверах пока не проверялась, поэтому для клиентских ссылок используйте IPv4.
 
-Собственное ядро `mtveil` принимает FakeTLS, проверяет секрет/timestamp/replay,
-преобразует obfuscated2 и пересылает MTProto в разрешённые DC. Неавторизованные
-входы передаются byte relay на настоящий HTTPS-cover. Прототип прошёл полный
-обмен ключами и encrypted ping, TLS cover HTTP 200 и ручной smoke Telegram
-Desktop (отправка сообщений, обновления, медиа). Это не production-релиз и
-не доказательство браузерной неотличимости. Replay-cache пока process-local.
+---
 
-Сборка: `cargo build --release --locked -p mtveil-data-plane`.
-Пример тестового запуска (секрет — отдельный файл с 32 hex-символами):
+## Архитектура и документация
 
-```text
-mtveil --listen 127.0.0.1:24443 --secret-file /path/to/test-secret --sni example.com --cover example.com:443 --dc 2=149.154.167.51:443
-```
+Детали протокола, спецификации и архитектурные решения собраны отдельно, чтобы не перегружать установку:
 
-Для прямого теста padded intermediate включите `"enable_dd": true` в JSON или
-передайте `--enable-dd` при ручном запуске. Тот же порт принимает `ee` и `dd`.
-Команда `mtveil link --config config.json --server proxy.example.com --port 24443 --dd`
-выдаёт отдельную ссылку для `dd`.
-
-Проверка P09 из корня workspace:
-
-```text
-mtveil-harness probe --host 127.0.0.1 --port 24443 --secret-file /path/to/test-secret --sni example.com
-```
-
-P09 требует Python с `cryptography` и `Telethon`; пользовательский аккаунт/API
-ключи не нужны, сессия не сохраняется. Интерпретатор можно задать переменной
-`MTVEIL_PYTHON`. Этот отдельный тест не превращает полный preflight Phase 0 в PASS.
-Wire-корпус стоковых клиентов и сравнительные/нагрузочные испытания ещё не завершены.
+- [Руководство по развёртыванию, обновлению и откату](deploy/README.md) · [setup.py](deploy/setup.py) · [compose.yaml](deploy/compose.yaml)
+- [Архитектурный baseline (ADR-000)](docs/adr/000-architecture-baseline.md) и [прототип ядра (ADR-001)](docs/adr/001-own-core-prototype.md)
+- [Контракт прототипа](docs/specs/prototype.md) · [FakeTLS-профиль](docs/specs/fake-tls-profile.md) · [Phase 0](docs/specs/phase-0.md)
+- [Матрица отказов](docs/failure-matrix.md) и [журнал проверок](docs/evidence-log.md)
