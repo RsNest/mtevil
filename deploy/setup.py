@@ -144,7 +144,7 @@ def ask_yes_no(prompt: str, *, default: bool = False) -> bool:
         raw = input(f"{prompt} [{hint}]: ").strip().lower()
         if not raw:
             return default
-        if raw in ("y", "yes", "д", "да"):
+        if raw in ("y", "yes", "д", "да", "у"):
             return True
         if raw in ("n", "no", "н", "нет"):
             return False
@@ -232,10 +232,25 @@ def compare_dns_records(records: dict[str, list[str]], expected_ips: list[str]) 
     return ok, lines
 
 
-def prompt_client_address() -> tuple[str, dict[str, list[str]] | None]:
+def detect_local_global_ipv4() -> str | None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("1.1.1.1", 80))
+        addr = sock.getsockname()[0]
+        ip = ipaddress.ip_address(addr)
+        if ip.version == 4 and ip.is_global and not ip.is_private and not ip.is_loopback and not ip.is_link_local:
+            return str(ip)
+    except OSError:
+        return None
+    finally:
+        sock.close()
+    return None
+
+
+def prompt_client_address(default_host: str | None = None) -> tuple[str, dict[str, list[str]] | None]:
     print("\nКакой адрес Telegram будет использовать для подключения?")
     print("Введите публичный IP этого сервера или домен, который на него указывает.")
-    host = ask_validated("Адрес", validate_host)
+    host = ask_validated("Адрес", validate_host, default_host)
     if is_ip_literal(host):
         return host, None
     records = resolve_domain_records(host)
@@ -740,7 +755,8 @@ def main() -> int:
 
     if role == "direct":
         default_port = str(saved.get("MTVEIL_PORT") or "443")
-        public_host, dns_records = prompt_client_address()
+        default_host = str(saved.get("MTVEIL_PUBLIC_HOST") or "") or detect_local_global_ipv4()
+        public_host, dns_records = prompt_client_address(default_host)
         print(f"\nНа каком TCP-порту принимать подключения?")
         print(f"Нажмите Enter, чтобы использовать {default_port}.")
         pub_port = ask_validated("Порт", validate_port, default_port)
@@ -801,7 +817,8 @@ def main() -> int:
         }
     else:  # edge
         default_port = str(saved.get("MTVEIL_PORT") or "443")
-        public_host, dns_records = prompt_client_address()
+        default_host = str(saved.get("MTVEIL_PUBLIC_HOST") or "") or detect_local_global_ipv4()
+        public_host, dns_records = prompt_client_address(default_host)
         print(f"\nНа каком TCP-порту принимать подключения?")
         print(f"Нажмите Enter, чтобы использовать {default_port}.")
         pub_port = ask_validated("Порт", validate_port, default_port)
@@ -896,7 +913,13 @@ def main() -> int:
     cand_compose = deploy_dir / "compose.candidate.yaml"
     cand_env = deploy_dir / ".env.candidate"
     cand_config = deploy_dir / "config.candidate.json"
-    env_text = f"MTVEIL_PROJECT={project}\nMTVEIL_IMAGE={args.image}\nMTVEIL_BIND={bind_ip}\nMTVEIL_PORT={pub_port}\n"
+    env_text = (
+        f"MTVEIL_PROJECT={project}\n"
+        f"MTVEIL_IMAGE={args.image}\n"
+        f"MTVEIL_BIND={bind_ip}\n"
+        f"MTVEIL_PORT={pub_port}\n"
+        + (f"MTVEIL_PUBLIC_HOST={public_host}\n" if role in ("direct", "edge") else "")
+    )
     cfg_text = json.dumps(config_data, indent=2) + "\n"
 
     cand_base = compose_cmd(deploy_dir, project, "compose.candidate.yaml", ".env.candidate")
@@ -1074,7 +1097,8 @@ def main() -> int:
                 pub_port = ask_validated("Другой порт", validate_port)
             pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=(role in ("direct", "edge")))
             (deploy_dir / ".env").write_text(
-                f"MTVEIL_PROJECT={project}\nMTVEIL_IMAGE={args.image}\nMTVEIL_BIND={bind_ip}\nMTVEIL_PORT={pub_port}\n",
+                f"MTVEIL_PROJECT={project}\nMTVEIL_IMAGE={args.image}\nMTVEIL_BIND={bind_ip}\nMTVEIL_PORT={pub_port}\n"
+                + (f"MTVEIL_PUBLIC_HOST={public_host}\n" if role in ("direct", "edge") else ""),
                 encoding="utf-8",
             )
             if args.network_host:

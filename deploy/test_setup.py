@@ -125,6 +125,32 @@ class SetupValidationTests(unittest.TestCase):
             (d / "compose.yaml").write_text("new-compose", encoding="utf-8")
             self.assertTrue(setup.restore_backup_files(d))
             self.assertEqual((d / "compose.yaml").read_text(encoding="utf-8"), "old-compose")
+
+    def test_detect_local_global_ipv4_and_cyrillic_yes(self):
+        class FakeSock:
+            def __init__(self, ip: str):
+                self._ip = ip
+            def connect(self, _addr):
+                pass
+            def getsockname(self):
+                return (self._ip, 12345)
+            def close(self):
+                pass
+
+        for priv in ("192.168.1.10", "10.203.0.9", "100.64.0.1"):
+            with mock.patch.object(setup.socket, "socket", return_value=FakeSock(priv)):
+                self.assertIsNone(setup.detect_local_global_ipv4())
+
+        with mock.patch.object(setup.socket, "socket", return_value=FakeSock("93.184.216.34")):
+            self.assertEqual(setup.detect_local_global_ipv4(), "93.184.216.34")
+
+        with mock.patch.object(sys, "stdin", io.StringIO("у\n")), mock.patch.object(sys, "stdout", io.StringIO()):
+            self.assertTrue(setup.ask_yes_no("Продолжить?", default=False))
+
+        with mock.patch.object(sys, "stdin", io.StringIO("\n")), mock.patch.object(sys, "stdout", io.StringIO()):
+            host, recs = setup.prompt_client_address("93.184.216.34")
+            self.assertEqual(host, "93.184.216.34")
+            self.assertIsNone(recs)
             self.assertEqual((d / ".env").read_text(encoding="utf-8"), "old-env")
             self.assertEqual((d / "config.json").read_text(encoding="utf-8"), "old-cfg")
 
@@ -247,6 +273,32 @@ class SetupValidationTests(unittest.TestCase):
             self.assertIn("docker.sock", err)
             self.assertIn("Прежние файлы конфигурации восстановлены.", err)
             self.assertEqual((d / "compose.yaml").read_text(encoding="utf-8"), "old-compose")
+
+    def test_detect_local_global_ipv4_and_cyrillic_yes(self):
+        class FakeSock:
+            def __init__(self, ip: str):
+                self._ip = ip
+            def connect(self, _addr):
+                pass
+            def getsockname(self):
+                return (self._ip, 12345)
+            def close(self):
+                pass
+
+        for priv in ("192.168.1.10", "10.203.0.9", "100.64.0.1"):
+            with mock.patch.object(setup.socket, "socket", return_value=FakeSock(priv)):
+                self.assertIsNone(setup.detect_local_global_ipv4())
+
+        with mock.patch.object(setup.socket, "socket", return_value=FakeSock("93.184.216.34")):
+            self.assertEqual(setup.detect_local_global_ipv4(), "93.184.216.34")
+
+        with mock.patch.object(sys, "stdin", io.StringIO("у\n")), mock.patch.object(sys, "stdout", io.StringIO()):
+            self.assertTrue(setup.ask_yes_no("Продолжить?", default=False))
+
+        with mock.patch.object(sys, "stdin", io.StringIO("\n")), mock.patch.object(sys, "stdout", io.StringIO()):
+            host, recs = setup.prompt_client_address("93.184.216.34")
+            self.assertEqual(host, "93.184.216.34")
+            self.assertIsNone(recs)
 
 
 if __name__ == "__main__":
