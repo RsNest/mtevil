@@ -46,11 +46,11 @@ def check_prerequisites() -> None:
     try:
         run(["docker", "info"], capture=True)
     except Exception as exc:
-        fail(f"Docker Engine is required and must be running ({exc})")
+        fail(f"Требуется запущенный Docker Engine ({exc})")
     try:
         run(["docker", "compose", "version"], capture=True)
     except Exception as exc:
-        fail(f"Docker Compose v2 plugin is required ({exc})")
+        fail(f"Требуется плагин Docker Compose v2 ({exc})")
 
 
 def ask(prompt: str, default: str | None = None) -> str:
@@ -61,7 +61,7 @@ def ask(prompt: str, default: str | None = None) -> str:
             return raw
         if default is not None:
             return default
-        print("Value is required.")
+        print("Значение обязательно.")
 
 
 def ask_yes_no(prompt: str, *, default: bool = False) -> bool:
@@ -70,11 +70,11 @@ def ask_yes_no(prompt: str, *, default: bool = False) -> bool:
         raw = input(f"{prompt} [{hint}]: ").strip().lower()
         if not raw:
             return default
-        if raw in ("y", "yes"):
+        if raw in ("y", "yes", "д", "да"):
             return True
-        if raw in ("n", "no"):
+        if raw in ("n", "no", "н", "нет"):
             return False
-        print("Please enter y or n.")
+        print("Ответьте y (да) или n (нет).")
 
 
 def validate_host(value: str) -> str:
@@ -162,18 +162,24 @@ def prompt_client_host_and_dns(prompt: str) -> str:
     host = ask_validated(prompt, validate_host)
     if not is_ip_literal(host):
         records = resolve_domain_records(host)
-        raw_exp = input("Expected public IPv4/IPv6 addresses (comma-separated, Enter to skip check): ").strip()
-        expected: list[str] = []
-        if raw_exp:
-            for item in raw_exp.split(","):
-                item = item.strip()
-                if item:
-                    expected.append(validate_ip(item))
+        while True:
+            raw_exp = input("Ожидаемые публичные IPv4/IPv6-адреса (через запятую, Enter — пропустить проверку): ").strip()
+            expected: list[str] = []
+            if not raw_exp:
+                break
+            try:
+                for item in raw_exp.split(","):
+                    item = item.strip()
+                    if item:
+                        expected.append(validate_ip(item))
+                break
+            except ValueError as exc:
+                print(f"Некорректный IP-адрес: {exc}")
         ok, lines = compare_dns_records(records, expected)
         for line in lines:
             print(f"  {line}")
-        print("  Note: DNS resolution does not verify external port reachability; test the published port from outside (e.g. mobile network).")
-        if not ok and not ask_yes_no("DNS check reported a missing/mismatched record. Continue anyway?", default=False):
+        print("  Примечание: DNS-проверка не проверяет доступность порта снаружи; проверьте порт с телефона или другого хоста.")
+        if not ok and not ask_yes_no("Проверка DNS обнаружила расхождение или отсутствие записи. Продолжить?", default=False):
             raise SystemExit(1)
     return host
 
@@ -434,14 +440,14 @@ def wait_healthy(base: list[str], timeout_s: int = 45) -> None:
 
 
 def configure_role() -> str:
-    print("\nSelect deployment role:")
-    print("  1) direct (default) - single overseas VPS")
-    print("  2) egress           - overseas relay node (run before edge)")
-    print("  3) edge             - client-facing VPS forwarding to egress nodes")
-    choice = ask("Role [1/2/3]", "1").lower()
+    print("\nВыберите режим установки:")
+    print("  1) direct (по умолчанию) — один зарубежный VPS")
+    print("  2) egress                — зарубежный узел-ретранслятор (настраивается до edge)")
+    print("  3) edge                  — входной VPS (например, в РФ), пересылающий трафик на egress")
+    choice = ask("Режим [1/2/3]", "1").lower()
     mapping = {"1": "direct", "direct": "direct", "2": "egress", "egress": "egress", "3": "edge", "edge": "edge"}
     while choice not in mapping:
-        choice = ask("Please choose 1 (direct), 2 (egress), or 3 (edge)", "1").lower()
+        choice = ask("Выберите 1 (direct), 2 (egress) или 3 (edge)", "1").lower()
     return mapping[choice]
 
 
@@ -465,20 +471,20 @@ def main() -> int:
 
     existing_cfg = deploy_dir / "config.json"
     if existing_cfg.exists():
-        print(f"\nExisting deployment found at {deploy_dir}")
-        if not ask_yes_no("Reconfigure it while preserving existing secrets/tokens?", default=False):
-            print("Aborted without changes.")
+        print(f"\nНайдена существующая конфигурация в {deploy_dir}")
+        if not ask_yes_no("Перенастроить её с сохранением текущих секретов/токенов?", default=False):
+            print("Отменено без изменений.")
             return 0
 
     role = configure_role()
     project = args.project or f"mtveil-{role}"
 
     if role == "direct":
-        public_host = prompt_client_host_and_dns("Public hostname or IP for Telegram link")
-        pub_port = ask_validated("Published TCP port", validate_port, "443")
-        bind_ip = ask_validated("Host bind IP", validate_ip, "0.0.0.0")
-        sni = ask_validated("HTTPS cover hostname (SNI)", validate_sni, "example.com")
-        cover = ask("HTTPS cover endpoint (host:port)", f"{sni}:443")
+        public_host = prompt_client_host_and_dns("Публичный домен или IP для ссылки Telegram")
+        pub_port = ask_validated("Публичный TCP-порт", validate_port, "443")
+        bind_ip = ask_validated("IP интерфейса для привязки на хосте", validate_ip, "0.0.0.0")
+        sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, "example.com")
+        cover = ask("Адрес HTTPS-cover (host:port)", f"{sni}:443")
         config_data = {
             "role": "direct",
             "listen": "0.0.0.0:24443",
@@ -499,9 +505,9 @@ def main() -> int:
             "client_mss_bulk": 1380,
         }
     elif role == "egress":
-        print("\nNote: Enter the private tunnel IP (SharX, WireGuard, or AmneziaWG) reachable by the edge.")
-        bind_ip = ask_validated("Local tunnel IP to bind egress listener", validate_egress_ip)
-        pub_port = ask_validated("Egress TCP port", validate_port, "29443")
+        print("\nПримечание: укажите приватный туннельный IP (SharX, WireGuard или AmneziaWG), доступный с edge.")
+        bind_ip = ask_validated("Локальный IP туннеля для прослушивания egress", validate_egress_ip)
+        pub_port = ask_validated("TCP-порт egress", validate_port, "29443")
         public_host = bind_ip
         config_data = {
             "role": "egress",
@@ -514,19 +520,19 @@ def main() -> int:
             "drain_timeout_secs": 5,
         }
     else:  # edge
-        public_host = prompt_client_host_and_dns("Public client hostname or IP for Telegram link")
-        pub_port = ask_validated("Published client TCP port", validate_port, "443")
-        bind_ip = ask_validated("Host bind IP", validate_ip, "0.0.0.0")
-        sni = ask_validated("HTTPS cover hostname (SNI)", validate_sni, "example.com")
-        cover = ask("HTTPS cover endpoint (host:port)", f"{sni}:443")
-        print("\nEnter one or more egress IP:port endpoints in priority order (comma-separated or one by one).")
+        public_host = prompt_client_host_and_dns("Публичный домен или IP для ссылки Telegram")
+        pub_port = ask_validated("Публичный TCP-порт для клиентов", validate_port, "443")
+        bind_ip = ask_validated("IP интерфейса для привязки на хосте", validate_ip, "0.0.0.0")
+        sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, "example.com")
+        cover = ask("Адрес HTTPS-cover (host:port)", f"{sni}:443")
+        print("\nУкажите один или несколько адресов egress (IP:port) в порядке приоритета (через запятую или по одному).")
         upstreams: list[str] = []
-        raw_list = ask("Primary (or comma-separated) egress endpoint (IP:port)")
+        raw_list = ask("Основной (или список через запятую) адрес egress (IP:port)")
         for item in raw_list.split(","):
             upstreams.append(validate_endpoint(item))
-        while ask_yes_no("Add another backup egress endpoint?", default=False):
-            upstreams.append(ask_validated("Backup egress endpoint (IP:port)", validate_endpoint))
-        strat_choice = ask("Egress selection strategy: 1) ordered (primary then backups), 2) round-robin", "1").lower()
+        while ask_yes_no("Добавить резервный egress?", default=False):
+            upstreams.append(ask_validated("Резервный адрес egress (IP:port)", validate_endpoint))
+        strat_choice = ask("Стратегия выбора egress: 1) ordered (основной, затем резервные), 2) round-robin", "1").lower()
         strategy = "ordered" if strat_choice in ("1", "ordered") else "round-robin"
         config_data = {
             "role": "edge",
@@ -592,55 +598,55 @@ def main() -> int:
 
         run(cand_base + ["config", "--quiet"])
         if not args.no_build:
-            print("\nBuilding mtveil Docker image...")
+            print("\nСборка Docker-образа mtveil...")
             run(cand_base + ["build"], capture=False)
 
         # Ensure secrets / tokens in the state volume without overwriting existing ones.
         if role in ("direct", "edge"):
             created = ensure_generated_secret(cand_base, "/var/lib/mtveil/proxy-secret")
-            print("Client secret: generated in state volume." if created else "Client secret: reused existing secret from state volume.")
+            print("Клиентский секрет: сгенерирован в томе state." if created else "Клиентский секрет: сохранён существующий из тома state.")
 
         if role == "egress":
             if volume_file_exists(cand_base, "/var/lib/mtveil/egress-token"):
-                print("MTV2 token: reused existing token from state volume.")
+                print("Токен MTV2: сохранён существующий из тома state.")
             else:
-                is_first = ask_yes_no("Is this the first egress node (generate a new MTV2 token)?", default=True)
+                is_first = ask_yes_no("Это первый узел egress (сгенерировать новый токен MTV2)?", default=True)
                 if is_first:
                     ensure_generated_secret(cand_base, "/var/lib/mtveil/egress-token")
-                    print("MTV2 token generated and stored in state volume (0600).")
-                    if ask_yes_no("Show generated MTV2 token to copy to other nodes?", default=False):
+                    print("Токен MTV2 сгенерирован и сохранён в томе state (0600).")
+                    if ask_yes_no("Показать сгенерированный токен MTV2 для копирования на другие узлы?", default=False):
                         tok = read_volume_secret(cand_base, "/var/lib/mtveil/egress-token")
-                        print(f"MTV2 token: {tok}")
+                        print(f"Токен MTV2: {tok}")
                 else:
-                    tok = ask_hidden_token("Enter existing MTV2 token from primary egress")
+                    tok = ask_hidden_token("Введите токен MTV2 с основного egress")
                     write_volume_secret_stdin(cand_base, "/var/lib/mtveil/egress-token", tok)
-                    print("MTV2 token imported into state volume.")
+                    print("Токен MTV2 импортирован в том state.")
         elif role == "edge":
             if volume_file_exists(cand_base, "/var/lib/mtveil/egress-token") and ask_yes_no(
-                "Reuse existing MTV2 token in state volume?", default=True
+                "Использовать существующий токен MTV2 из тома state?", default=True
             ):
-                print("MTV2 token: reused existing token from state volume.")
+                print("Токен MTV2: сохранён существующий из тома state.")
             else:
-                tok = ask_hidden_token("Enter shared MTV2 token")
+                tok = ask_hidden_token("Введите общий токен MTV2")
                 write_volume_secret_stdin(cand_base, "/var/lib/mtveil/egress-token", tok)
-                print("MTV2 token stored in state volume.")
+                print("Токен MTV2 сохранён в томе state.")
 
-        print("\nValidating candidate configuration with mtveil...")
+        print("\nПроверка конфигурации через mtveil...")
         run(cand_base + ["run", "--rm", "--no-deps", "mtveil", "--config", "/etc/mtveil/config.json", "--check-config"], capture=False)
 
         if role in ("direct", "edge"):
-            print(f"\nChecking HTTPS cover {cover} (SNI {sni}) from inside the container...")
+            print(f"\nПроверка HTTPS-cover {cover} (SNI {sni}) изнутри контейнера...")
             cover_ok, cover_out = check_cover_from_container(cand_base, cover, sni)
             if cover_ok:
-                print("HTTPS cover check: OK (DNS, TCP, TLS, and certificate hostname verified).")
+                print("Проверка HTTPS-cover: OK (DNS, TCP, TLS и имя в сертификате подтверждены).")
             else:
-                print(f"HTTPS cover check FAILED:\n{cover_out}", file=sys.stderr)
-                if not ask_yes_no("HTTPS cover check failed. Promote config and start container anyway?", default=False):
-                    print("Aborted before promoting candidate files. Existing configuration left untouched.")
+                print(f"Проверка HTTPS-cover НЕ ПРОШЛА:\n{cover_out}", file=sys.stderr)
+                if not ask_yes_no("Проверка HTTPS-cover не прошла. Всё равно применить конфиг и запустить контейнер?", default=False):
+                    print("Прервано до применения изменений. Текущая конфигурация не затронута.")
                     return 1
 
         if role == "edge":
-            print("\nChecking configured egress endpoints from inside the edge network context (DC 2)...")
+            print("\nПроверка узлов egress из сетевого контекста edge (DC 2)...")
             check_proc = run(
                 cand_base + ["run", "--rm", "--no-deps", "mtveil", "check-egress", "--config", "/etc/mtveil/config.json", "--dc", "2"],
                 check=False,
@@ -650,12 +656,12 @@ def main() -> int:
                 print(check_proc.stderr.strip(), file=sys.stderr)
                 if "tcp_connect_timeout" in check_proc.stdout and not args.network_host:
                     print(
-                        "Hint: if egress is reachable from the host over a mesh/VPN tunnel (e.g. SharX/WireGuard) "
-                        "but times out from Docker bridge, re-run with --network-host.",
+                        "Подсказка: если egress доступен с хоста по mesh/VPN-туннелю (SharX/WireGuard), "
+                        "но не отвечает из Docker bridge, перезапустите мастер с флагом --network-host.",
                         file=sys.stderr,
                     )
-                if not ask_yes_no("One or more egress checks failed. Promote config and start edge container anyway?", default=False):
-                    print("Aborted before promoting candidate files. Existing configuration left untouched.")
+                if not ask_yes_no("Один или несколько egress не прошли проверку. Всё равно применить конфиг и запустить edge?", default=False):
+                    print("Прервано до применения изменений. Текущая конфигурация не затронута.")
                     return 1
 
         # Back up existing deployment files before promoting validated candidate.
@@ -684,10 +690,10 @@ def main() -> int:
             if p.exists():
                 p.unlink()
 
-    print("\nStarting mtveil service...")
+    print("\nЗапуск сервиса mtveil...")
     run(base + ["up", "-d", "mtveil"], capture=False)
     wait_healthy(base)
-    print("Container status: healthy (listener reachable; run an end-to-end Telegram test to verify DC relay).")
+    print("Статус контейнера: healthy (порт открыт; проверьте передачу данных в Telegram, отправив или загрузив фото).")
 
     if role in ("direct", "edge"):
         link = run(
@@ -706,16 +712,16 @@ def main() -> int:
                 str(pub_port),
             ]
         ).stdout.strip()
-        print(f"\nTelegram proxy link:\n{link}\n")
+        print(f"\nСсылка для Telegram:\n{link}\n")
     else:
-        print(f"\nEgress endpoint to enter on the edge node:\n{bind_ip}:{pub_port}\n")
+        print(f"\nАдрес egress для ввода на узле edge:\n{bind_ip}:{pub_port}\n")
 
     try:
         rel_dir = os.path.relpath(deploy_dir, repo_root).replace("\\", "/")
     except ValueError:
         rel_dir = str(deploy_dir)
     compose_ref = f"--env-file {rel_dir}/.env -f {rel_dir}/compose.yaml"
-    print("Useful commands:")
+    print("Полезные команды:")
     print(f"  docker compose {compose_ref} ps")
     print(f"  docker compose {compose_ref} logs --tail=100 mtveil")
     if role == "edge":
@@ -725,4 +731,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\nОтменено пользователем.")
+        raise SystemExit(130)
