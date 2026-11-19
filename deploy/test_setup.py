@@ -66,14 +66,14 @@ class SetupValidationTests(unittest.TestCase):
         self.assertTrue(any("unexpected AAAA" in l for l in lines2))
 
     def test_cover_cert_hostname_mismatch_from_container(self) -> None:
-        # Requires local image mtevil:wizard-test with openssl + ca-certificates.
-        if subprocess.run(["docker", "image", "inspect", "mtevil:wizard-test"], capture_output=True).returncode != 0:
-            self.skipTest("mtevil:wizard-test image not built")
+        image = self._local_image()
+        if image is None:
+            self.skipTest("no local mtevil image available")
         repo = Path(__file__).resolve().parent.parent
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             (d / "compose.yaml").write_text(setup.render_compose(repo, d, "direct"), encoding="utf-8")
-            (d / ".env").write_text("MTEVIL_PROJECT=mtevil-cov-test\nMTEVIL_IMAGE=mtevil:wizard-test\nMTEVIL_BIND=127.0.0.1\nMTEVIL_PORT=26449\n", encoding="utf-8")
+            (d / ".env").write_text(f"MTEVIL_PROJECT=mtevil-cov-test\nMTEVIL_IMAGE={image}\nMTEVIL_BIND=127.0.0.1\nMTEVIL_PORT=26449\n", encoding="utf-8")
             (d / "config.json").write_text("{}\n", encoding="utf-8")
             base = setup.compose_cmd(d, "mtevil-cov-test")
             ok_good, out_good = setup.check_cover_from_container(base, "example.com:443", "example.com")
@@ -120,13 +120,15 @@ class SetupValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             (d / "compose.yaml.bak").write_text("old-compose", encoding="utf-8")
-            (d / ".env.bak").write_text("old-env", encoding="utf-8")
-            (d / "config.json.bak").write_text("old-cfg", encoding="utf-8")
+            (d / ".env.bak").write_text("stale-env-from-previous-run", encoding="utf-8")
+            (d / "config.json.bak").write_text("stale-cfg-from-previous-run", encoding="utf-8")
             (d / "compose.yaml").write_text("new-compose", encoding="utf-8")
-            self.assertTrue(setup.restore_backup_files(d))
+            (d / ".env").write_text("current-env", encoding="utf-8")
+            (d / "config.json").write_text("current-cfg", encoding="utf-8")
+            self.assertTrue(setup.restore_backup_files(d, ["compose.yaml"]))
             self.assertEqual((d / "compose.yaml").read_text(encoding="utf-8"), "old-compose")
-            self.assertEqual((d / ".env").read_text(encoding="utf-8"), "old-env")
-            self.assertEqual((d / "config.json").read_text(encoding="utf-8"), "old-cfg")
+            self.assertEqual((d / ".env").read_text(encoding="utf-8"), "current-env")
+            self.assertEqual((d / "config.json").read_text(encoding="utf-8"), "current-cfg")
 
     def _local_image(self):
         for candidate in ("mtevil:wizard-test", "ghcr.io/rsnest/mtevil:v0.1.0-alpha.5"):
@@ -447,30 +449,42 @@ class SetupValidationTests(unittest.TestCase):
                 edge_base = setup.compose_cmd(d_edge, p_edge)
                 self.assertEqual(setup.read_volume_secret(edge_base, "/var/lib/mtevil/egress-token"), old_tok)
 
+                # Prepare the prototype vector proxy-secret BEFORE rotation so that after
+                # setup.main() rolls back and exits, we do NOT restart Edge in the test!
+                vec_secret_hex = "000102030405060708090a0b0c0d0e0f"
+                setup.write_volume_secret_stdin(edge_base, "/var/lib/mtevil/proxy-secret", vec_secret_hex)
+                setup.run(edge_base + ["up", "-d", "--force-recreate", setup.compose_service(edge_base)])
+                setup.wait_healthy(edge_base)
+
                 # 4. Reconfigure Edge to rotate to Egress 2 + new_tok:
                 #    check-egress passes against real Egress 2, new_tok is written to real Docker volume,
-                #    up -d runs, and then wait_healthy raises TimeoutError -> full rollback runs!
+                #    up -d --force-recreate runs (loading new_tok), and then wait_healthy raises TimeoutError
+                #    on that 1st wait_healthy call -> setup.py's rollback restores old_tok + config and
+                #    recreates the original Edge container itself (calling real wait_healthy on the 2nd call)!
+                orig_wait_healthy = setup.wait_healthy
+                wait_calls = 0
+
+                def fail_first_wait_healthy(base, timeout_s=45):
+                    nonlocal wait_calls
+                    wait_calls += 1
+                    if wait_calls == 1:
+                        raise TimeoutError("simulated health timeout on rotated container")
+                    return orig_wait_healthy(base, timeout_s)
+
                 stdin_edge2 = f"y\n2\n2\n127.0.0.1\n{edge_port}\nn\n127.0.0.1:{eg2_port}\nn\n1\nn\n{new_tok}\n"
                 with (
                     mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d_edge), "--project", p_edge, "--image", image, "--no-build", "--network-host"]),
                     mock.patch.object(sys, "stdin", io.StringIO(stdin_edge2)),
                     mock.patch.object(sys, "stdout", io.StringIO()),
                     mock.patch.object(sys, "stderr", io.StringIO()),
-                    mock.patch.object(setup, "wait_healthy", side_effect=TimeoutError("simulated health timeout")),
+                    mock.patch.object(setup, "wait_healthy", side_effect=fail_first_wait_healthy),
                 ):
                     self.assertEqual(setup.main(), 1)
+                self.assertEqual(wait_calls, 2)
 
-                # 5. Verify real Docker volume token rolled back to old_tok, config rolled back to eg1_port,
-                #    and a new client connection through edge's listening port is routed to Egress 1!
+                # 5. Without restarting Edge in the test, connect a client immediately through
+                #    edge's listening port and verify the session appears on Egress 1!
                 self.assertEqual(setup.read_volume_secret(edge_base, "/var/lib/mtevil/egress-token"), old_tok)
-                setup.wait_healthy(edge_base)
-
-                # Set edge's proxy-secret to the prototype vector key and restart edge so we can
-                # send a real FakeTLS + obfuscated2 client connection through edge_port.
-                vec_secret_hex = "000102030405060708090a0b0c0d0e0f"
-                setup.write_volume_secret_stdin(edge_base, "/var/lib/mtevil/proxy-secret", vec_secret_hex)
-                setup.run(edge_base + ["up", "-d", "--force-recreate", setup.compose_service(edge_base)])
-                setup.wait_healthy(edge_base)
 
                 eg1_base = setup.compose_cmd(d_eg1, p_eg1)
                 eg2_base = setup.compose_cmd(d_eg2, p_eg2)

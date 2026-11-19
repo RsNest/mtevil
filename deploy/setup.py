@@ -483,9 +483,12 @@ def ensure_available_port(
             pub_port = ask_validated("Другой порт", validate_port)
 
 
-def restore_backup_files(deploy_dir: Path) -> bool:
+def restore_backup_files(
+    deploy_dir: Path,
+    names: tuple[str, ...] | list[str] = ("compose.yaml", ".env", "config.json"),
+) -> bool:
     restored = False
-    for name in ("compose.yaml", ".env", "config.json"):
+    for name in names:
         bak = deploy_dir / f"{name}.bak"
         live = deploy_dir / name
         if bak.is_file():
@@ -1107,14 +1110,17 @@ def main() -> int:
             if p.exists():
                 p.unlink()
 
+    up_attempted = False
     up_succeeded = False
     deployment_committed = False
+    backed_up_files: list[str] = []
     try:
         # Back up existing deployment files before promoting validated candidate.
         for name in ("compose.yaml", ".env", "config.json"):
             live = deploy_dir / name
             if live.exists():
                 live.replace(deploy_dir / f"{name}.bak")
+                backed_up_files.append(name)
                 had_backup = True
         (deploy_dir / "compose.yaml").write_text(live_compose, encoding="utf-8")
         (deploy_dir / ".env").write_text(env_text, encoding="utf-8")
@@ -1130,6 +1136,7 @@ def main() -> int:
             if had_backup:
                 up_args.append("--force-recreate")
             up_args.append(compose_service(base))
+            up_attempted = True
             up_proc = run(base + up_args, check=False)
             if up_proc.returncode == 0:
                 up_succeeded = True
@@ -1191,16 +1198,25 @@ def main() -> int:
         deployment_committed = True
     finally:
         if not deployment_committed:
-            if had_backup:
-                restore_backup_files(deploy_dir)
+            if backed_up_files:
+                restore_backup_files(deploy_dir, backed_up_files)
                 print("Прежние файлы конфигурации восстановлены.", file=sys.stderr)
             if token_written_to_volume and previous_token is not None:
                 try:
                     write_volume_secret_stdin(base, "/var/lib/mtevil/egress-token", previous_token)
                 except Exception as exc:
                     print(err_text(f"Не удалось вернуть прежний токен MTV2 в том state: {exc}"), file=sys.stderr)
-            if had_backup and up_succeeded:
-                run(base + ["up", "-d", "--force-recreate", compose_service(base)], check=False)
+            if had_backup and up_attempted:
+                rb_up = run(base + ["up", "-d", "--force-recreate", compose_service(base)], check=False)
+                if rb_up.returncode == 0:
+                    try:
+                        wait_healthy(base)
+                        print("Прежний контейнер снова работает.", file=sys.stderr)
+                    except Exception as exc:
+                        print(err_text(f"Прежний контейнер запущен, но не подтвердил статус healthy: {exc}"), file=sys.stderr)
+                else:
+                    rb_err = (rb_up.stderr or rb_up.stdout or "").strip()
+                    print(err_text(f"Не удалось перезапустить прежний контейнер после отката: {rb_err}"), file=sys.stderr)
 
     print(ok_text("Контейнер исправен"))
 
