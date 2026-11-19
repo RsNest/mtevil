@@ -26,8 +26,79 @@ SNI_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 
 def fail(msg: str) -> "NoReturn":
-    print(f"Error: {msg}", file=sys.stderr)
+    print(f"Ошибка: {msg}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def use_color() -> bool:
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def style(text: str, code: str) -> str:
+    if not use_color():
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def heading(text: str) -> str:
+    return style(text, "1;36")
+
+
+def ok_text(text: str) -> str:
+    return style(text, "32")
+
+
+def warn_text(text: str) -> str:
+    return style(text, "33")
+
+
+def err_text(text: str) -> str:
+    return style(text, "31")
+
+
+def is_wsl() -> bool:
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        return "microsoft" in Path("/proc/version").read_text(encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        return False
+
+
+def is_port_conflict_error(detail: str) -> bool:
+    low = detail.lower()
+    return any(
+        needle in low
+        for needle in (
+            "port is already allocated",
+            "address already in use",
+            "failed to bind",
+            "bind for",
+        )
+    )
+
+
+def diagnose_docker_error(detail: str, image: str = "") -> tuple[str, str]:
+    low = detail.lower()
+    if "permission denied" in low and "docker.sock" in low:
+        return (
+            "Нет прав на доступ к сокету Docker (/var/run/docker.sock).",
+            "Добавьте пользователя в группу docker (sudo usermod -aG docker $USER), перелогиньтесь и повторите запуск.",
+        )
+    if any(k in low for k in ("cannot connect to the docker daemon", "is the docker daemon running", "error during connect")):
+        hint = (
+            "Откройте Docker Desktop на Windows и включите интеграцию с WSL, затем повторите запуск."
+            if is_wsl()
+            else "Запустите службу Docker (например: sudo systemctl start docker) и повторите запуск."
+        )
+        return ("Docker Engine не запущен или недоступен.", hint)
+    if any(k in low for k in ("pull access denied", "manifest unknown", "not found", "unauthorized")):
+        target = f" ({image})" if image else ""
+        return (
+            f"Не удалось получить Docker-образ{target}.",
+            "Проверьте имя и тег образа или соберите его локально из исходников.",
+        )
+    return ("Команда Docker завершилась с ошибкой.", detail.splitlines()[-1] if detail else "Проверьте вывод docker compose.")
 
 
 def run(argv: list[str], *, capture: bool = True, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -47,7 +118,9 @@ def check_prerequisites() -> None:
     try:
         run(["docker", "info"], capture=True)
     except Exception as exc:
-        fail(f"Требуется запущенный Docker Engine ({exc})")
+        summary, action = diagnose_docker_error(str(exc))
+        print(f"{err_text(summary)}\nДальше: {action}", file=sys.stderr)
+        raise SystemExit(1)
     try:
         run(["docker", "compose", "version"], capture=True)
     except Exception as exc:
@@ -159,30 +232,49 @@ def compare_dns_records(records: dict[str, list[str]], expected_ips: list[str]) 
     return ok, lines
 
 
-def prompt_client_host_and_dns(prompt: str) -> str:
-    host = ask_validated(prompt, validate_host)
-    if not is_ip_literal(host):
-        records = resolve_domain_records(host)
-        while True:
-            raw_exp = input("Ожидаемые публичные IPv4/IPv6-адреса (через запятую, Enter — пропустить проверку): ").strip()
-            expected: list[str] = []
-            if not raw_exp:
-                break
-            try:
-                for item in raw_exp.split(","):
-                    item = item.strip()
-                    if item:
-                        expected.append(validate_ip(item))
-                break
-            except ValueError as exc:
-                print(f"Некорректный IP-адрес: {exc}")
-        ok, lines = compare_dns_records(records, expected)
-        for line in lines:
-            print(f"  {line}")
-        print("  Примечание: DNS-проверка не проверяет доступность порта снаружи; проверьте порт с телефона или другого хоста.")
-        if not ok and not ask_yes_no("Проверка DNS обнаружила расхождение или отсутствие записи. Продолжить?", default=False):
+def prompt_client_address() -> tuple[str, dict[str, list[str]] | None]:
+    print("\nКакой адрес Telegram будет использовать для подключения?")
+    print("Введите публичный IP этого сервера или домен, который на него указывает.")
+    host = ask_validated("Адрес", validate_host)
+    if is_ip_literal(host):
+        return host, None
+    records = resolve_domain_records(host)
+    if records["cnames"]:
+        print(f"  DNS CNAME: {' -> '.join(records['cnames'])}")
+    if records["a"]:
+        print(f"  DNS IPv4 (A): {', '.join(records['a'])}")
+    if records["aaaa"]:
+        print(f"  DNS IPv6 (AAAA): {', '.join(records['aaaa'])}")
+    if not records["a"] and not records["aaaa"]:
+        print(warn_text("  DNS: домен пока не разрешился ни в IPv4, ни в IPv6."))
+        if not ask_yes_no("Продолжить настройку с этим доменом?", default=False):
             raise SystemExit(1)
-    return host
+    else:
+        print("  Примечание: проверка DNS не подтверждает, что порт открыт снаружи.")
+    return host, records
+
+
+def check_domain_expected_ips(records: dict[str, list[str]]) -> None:
+    while True:
+        raw_exp = input("Ожидаемые публичные IPv4/IPv6-адреса (через запятую, Enter — пропустить): ").strip()
+        if not raw_exp:
+            return
+        expected: list[str] = []
+        try:
+            for item in raw_exp.split(","):
+                item = item.strip()
+                if item:
+                    expected.append(validate_ip(item))
+            break
+        except ValueError as exc:
+            print(f"Некорректный IP-адрес: {exc}")
+    ok, lines = compare_dns_records(records, expected)
+    for line in lines:
+        print(f"  {line}")
+    if not ok:
+        print(warn_text("  Некоторые DNS-записи не совпадают с ожидаемыми адресами (проверьте A и AAAA в панели DNS)."))
+        if not ask_yes_no("Всё равно продолжить с этим доменом?", default=False):
+            raise SystemExit(1)
 
 
 def check_cover_from_container(base: list[str], cover: str, sni: str) -> tuple[bool, str]:
@@ -345,12 +437,34 @@ def deployment_owns_port(deploy_dir: Path, project: str, bind_ip: str, port: int
     return False
 
 
-def ensure_available_port(deploy_dir: Path, project: str, bind_ip: str, pub_port: int, prompt: str) -> int:
+def find_free_port(bind_ip: str, exclude_port: int) -> int | None:
+    for cand in (25443, 24443, 26443, 27443, 28443, 8443, 9443):
+        if cand != exclude_port and is_port_available(bind_ip, cand):
+            return cand
+    return None
+
+
+def ensure_available_port(
+    deploy_dir: Path,
+    project: str,
+    bind_ip: str,
+    pub_port: int,
+    *,
+    show_link_note: bool = True,
+) -> int:
     while True:
         if deployment_owns_port(deploy_dir, project, bind_ip, pub_port) or is_port_available(bind_ip, pub_port):
             return pub_port
-        print(f"Порт {pub_port} на {bind_ip} уже занят другим сервисом.")
-        pub_port = ask_validated(prompt, validate_port)
+        print(warn_text(f"\nПорт {pub_port} уже занят на этом сервере."))
+        alt = find_free_port(bind_ip, pub_port)
+        if alt is not None:
+            if show_link_note:
+                print(f"Можно использовать {alt}. В ссылке Telegram порт подставится автоматически.")
+            else:
+                print(f"Можно использовать {alt}.")
+            pub_port = ask_validated("Другой порт", validate_port, str(alt))
+        else:
+            pub_port = ask_validated("Другой порт", validate_port)
 
 
 def restore_backup_files(deploy_dir: Path) -> bool:
@@ -491,7 +605,7 @@ def ensure_generated_secret(base: list[str], path_in_container: str) -> bool:
             "--output",
             path_in_container,
         ],
-        capture=False,
+        capture=True,
     )
     return True
 
@@ -544,15 +658,48 @@ def wait_healthy(base: list[str], timeout_s: int = 45) -> None:
 
 
 def configure_role() -> str:
-    print("\nВыберите режим установки:")
-    print("  1) direct (по умолчанию) — один зарубежный VPS")
-    print("  2) egress                — зарубежный узел-ретранслятор (настраивается до edge)")
-    print("  3) edge                  — входной VPS (например, в РФ), пересылающий трафик на egress")
-    choice = ask("Режим [1/2/3]", "1").lower()
-    mapping = {"1": "direct", "direct": "direct", "2": "egress", "egress": "egress", "3": "edge", "edge": "edge"}
-    while choice not in mapping:
-        choice = ask("Выберите 1 (direct), 2 (egress) или 3 (edge)", "1").lower()
-    return mapping[choice]
+    print()
+    print(heading("Настройка прокси для Telegram"))
+    print("\nКак вы хотите подключаться?")
+    print("  1. Через один зарубежный сервер — подойдёт для первой установки")
+    print("  2. Через несколько серверов — отдельный вход и зарубежный выход")
+    print()
+    choice = ask("Ваш выбор", "1").lower()
+    while choice not in ("1", "2", "direct", "egress", "edge"):
+        choice = ask("Введите 1 или 2", "1").lower()
+    if choice in ("1", "direct"):
+        return "direct"
+    if choice in ("egress", "edge"):
+        return choice
+
+    print("\nЧто вы настраиваете на этом сервере?")
+    print("  1. Зарубежный сервер выхода (egress) — принимает трафик от входного сервера и отправляет в Telegram. Настраивается первым.")
+    print("  2. Входной сервер (edge) — принимает подключения Telegram и передаёт их на один или несколько egress.")
+    print()
+    sub = ask("Ваш выбор", "1").lower()
+    mapping = {"1": "egress", "egress": "egress", "2": "edge", "edge": "edge"}
+    while sub not in mapping:
+        sub = ask("Введите 1 (egress) или 2 (edge)", "1").lower()
+    return mapping[sub]
+
+
+def load_existing_defaults(deploy_dir: Path) -> dict[str, object]:
+    defaults: dict[str, object] = {}
+    env_file = deploy_dir / ".env"
+    if env_file.is_file():
+        for line in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                defaults[k.strip()] = v.strip()
+    cfg_file = deploy_dir / "config.json"
+    if cfg_file.is_file():
+        try:
+            cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
+            if isinstance(cfg, dict):
+                defaults["config"] = cfg
+        except Exception:
+            pass
+    return defaults
 
 
 def main() -> int:
@@ -561,6 +708,7 @@ def main() -> int:
     parser.add_argument("--project", type=str, default=None, help="Docker Compose project name")
     parser.add_argument("--image", type=str, default=DEFAULT_IMAGE, help="Docker image tag")
     parser.add_argument("--no-build", action="store_true", help="Skip docker compose build")
+    parser.add_argument("--role", choices=("direct", "egress", "edge"), default=None, help="Deployment role (non-interactive override)")
     parser.add_argument(
         "--network-host",
         action="store_true",
@@ -573,6 +721,8 @@ def main() -> int:
 
     check_prerequisites()
 
+    saved = load_existing_defaults(deploy_dir)
+    saved_cfg = saved.get("config") if isinstance(saved.get("config"), dict) else {}
     existing_cfg = deploy_dir / "config.json"
     if existing_cfg.exists():
         print(f"\nНайдена существующая конфигурация в {deploy_dir}")
@@ -580,16 +730,37 @@ def main() -> int:
             print("Отменено без изменений.")
             return 0
 
-    role = configure_role()
-    project = args.project or f"mtveil-{role}"
+    role = args.role or configure_role()
+    project = args.project or str(saved.get("MTVEIL_PROJECT") or f"mtveil-{role}")
+
+    default_bind = str(saved.get("MTVEIL_BIND") or "0.0.0.0")
+    default_sni = str(saved_cfg.get("sni") or "example.com")
+    default_cover = str(saved_cfg.get("cover") or f"{default_sni}:443")
+    advanced_changed: list[str] = []
 
     if role == "direct":
-        public_host = prompt_client_host_and_dns("Публичный домен или IP для ссылки Telegram")
-        pub_port = ask_validated("Публичный TCP-порт", validate_port, "443")
-        bind_ip = ask_validated("IP интерфейса для привязки на хосте", validate_ip, "0.0.0.0")
-        pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, "Укажите другой публичный TCP-порт")
-        sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, "example.com")
-        cover = ask("Адрес HTTPS-cover (host:port)", f"{sni}:443")
+        default_port = str(saved.get("MTVEIL_PORT") or "443")
+        public_host, dns_records = prompt_client_address()
+        print(f"\nНа каком TCP-порту принимать подключения?")
+        print(f"Нажмите Enter, чтобы использовать {default_port}.")
+        pub_port = ask_validated("Порт", validate_port, default_port)
+        bind_ip = default_bind
+        sni = default_sni
+        cover = default_cover
+        print("\nРасширенные настройки (по умолчанию):")
+        print(f"  IP прослушивания: {bind_ip}")
+        print(f"  Маскировка (HTTPS-cover): {cover} (SNI: {sni})")
+        if ask_yes_no("Изменить расширенные настройки?", default=False):
+            bind_ip = ask_validated("IP интерфейса для привязки на хосте", validate_ip, default_bind)
+            sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, default_sni)
+            cover = ask("Адрес HTTPS-cover (host:port)", f"{sni}:443")
+            if dns_records is not None:
+                check_domain_expected_ips(dns_records)
+            if bind_ip != default_bind:
+                advanced_changed.append(f"IP привязки: {bind_ip}")
+            if sni != default_sni or cover != default_cover:
+                advanced_changed.append(f"HTTPS-cover: {cover} (SNI: {sni})")
+        pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=True)
         config_data = {
             "role": "direct",
             "listen": "0.0.0.0:24443",
@@ -610,10 +781,13 @@ def main() -> int:
             "client_mss_bulk": 1380,
         }
     elif role == "egress":
-        print("\nПримечание: укажите приватный туннельный IP (SharX, WireGuard или AmneziaWG), доступный с edge.")
-        bind_ip = ask_validated("Локальный IP туннеля для прослушивания egress", validate_egress_ip)
-        pub_port = ask_validated("TCP-порт egress", validate_port, "29443")
-        pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, "Укажите другой TCP-порт egress")
+        default_egress_port = str(saved.get("MTVEIL_PORT") or "29443")
+        default_egress_bind = str(saved.get("MTVEIL_BIND") or "")
+        print("\nУкажите приватный IP этого сервера, по которому до него сможет дотянуться входной сервер (edge).")
+        print("(Например, адрес интерфейса WireGuard, AmneziaWG или SharX; 0.0.0.0 запрещён.)")
+        bind_ip = ask_validated("Локальный IP туннеля", validate_egress_ip, default_egress_bind or None)
+        pub_port = ask_validated("TCP-порт egress", validate_port, default_egress_port)
+        pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=False)
         public_host = bind_ip
         config_data = {
             "role": "egress",
@@ -626,20 +800,42 @@ def main() -> int:
             "drain_timeout_secs": 5,
         }
     else:  # edge
-        public_host = prompt_client_host_and_dns("Публичный домен или IP для ссылки Telegram")
-        pub_port = ask_validated("Публичный TCP-порт для клиентов", validate_port, "443")
-        bind_ip = ask_validated("IP интерфейса для привязки на хосте", validate_ip, "0.0.0.0")
-        pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, "Укажите другой публичный TCP-порт")
-        sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, "example.com")
-        cover = ask("Адрес HTTPS-cover (host:port)", f"{sni}:443")
+        default_port = str(saved.get("MTVEIL_PORT") or "443")
+        public_host, dns_records = prompt_client_address()
+        print(f"\nНа каком TCP-порту принимать подключения?")
+        print(f"Нажмите Enter, чтобы использовать {default_port}.")
+        pub_port = ask_validated("Порт", validate_port, default_port)
+        bind_ip = default_bind
+        sni = default_sni
+        cover = default_cover
+        print("\nРасширенные настройки (по умолчанию):")
+        print(f"  IP прослушивания: {bind_ip}")
+        print(f"  Маскировка (HTTPS-cover): {cover} (SNI: {sni})")
+        if ask_yes_no("Изменить расширенные настройки?", default=False):
+            bind_ip = ask_validated("IP интерфейса для привязки на хосте", validate_ip, default_bind)
+            sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, default_sni)
+            cover = ask("Адрес HTTPS-cover (host:port)", f"{sni}:443")
+            if dns_records is not None:
+                check_domain_expected_ips(dns_records)
+            if bind_ip != default_bind:
+                advanced_changed.append(f"IP привязки: {bind_ip}")
+            if sni != default_sni or cover != default_cover:
+                advanced_changed.append(f"HTTPS-cover: {cover} (SNI: {sni})")
+        pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=True)
         print("\nУкажите один или несколько адресов egress (IP:port) в порядке приоритета (через запятую или по одному).")
+        saved_upstreams = saved_cfg.get("egress_upstreams") if isinstance(saved_cfg.get("egress_upstreams"), list) else []
+        default_upstreams = ",".join(str(x) for x in saved_upstreams) if saved_upstreams else None
         upstreams: list[str] = []
-        raw_list = ask("Основной (или список через запятую) адрес egress (IP:port)")
+        raw_list = ask("Основной (или список через запятую) адрес egress (IP:port)", default_upstreams)
         for item in raw_list.split(","):
             upstreams.append(validate_endpoint(item))
         while ask_yes_no("Добавить резервный egress?", default=False):
             upstreams.append(ask_validated("Резервный адрес egress (IP:port)", validate_endpoint))
-        strat_choice = ask("Стратегия выбора egress: 1) ordered (основной, затем резервные), 2) round-robin", "1").lower()
+        print("\nКак распределять новые подключения между узлами egress:")
+        print("  1. ordered     — новые подключения идут на основной egress; при его сбое — на резервные по порядку")
+        print("  2. round-robin — новые подключения распределяются по кругу между всеми egress")
+        default_strat = "2" if saved_cfg.get("egress_strategy") == "round-robin" else "1"
+        strat_choice = ask("Стратегия [1/2]", default_strat).lower()
         strategy = "ordered" if strat_choice in ("1", "ordered") else "round-robin"
         config_data = {
             "role": "edge",
@@ -662,6 +858,26 @@ def main() -> int:
             "client_mss": 100,
             "client_mss_bulk": 1380,
         }
+
+    print()
+    print(heading("Параметры установки"))
+    role_names = {
+        "direct": "Один зарубежный сервер (direct)",
+        "egress": "Зарубежный сервер выхода (egress)",
+        "edge": "Входной сервер (edge)",
+    }
+    print(f"  Режим: {role_names[role]}")
+    if role in ("direct", "edge"):
+        print(f"  Адрес для Telegram: {public_host}:{pub_port}")
+    else:
+        print(f"  Адрес выхода: {bind_ip}:{pub_port}")
+    if role == "edge":
+        print(f"  Узлы egress: {', '.join(upstreams)} ({strategy})")
+    if advanced_changed:
+        for item in advanced_changed:
+            print(f"  {item}")
+    elif role in ("direct", "edge"):
+        print("  Расширенные настройки: по умолчанию")
 
     deploy_dir.mkdir(parents=True, exist_ok=True)
     if args.network_host:
@@ -706,22 +922,35 @@ def main() -> int:
         run(cand_base + ["config", "--quiet"])
         if not args.no_build:
             print("\nСборка Docker-образа mtveil...")
-            run(cand_base + ["build"], capture=False)
+            build_proc = run(cand_base + ["build"], capture=True, check=False)
+            if build_proc.returncode != 0:
+                detail = (build_proc.stderr or build_proc.stdout or "").strip()
+                summary, action = diagnose_docker_error(detail, args.image)
+                print(f"{err_text(summary)}\nДальше: {action}", file=sys.stderr)
+                if detail:
+                    print(f"Детали: {detail}", file=sys.stderr)
+                return 1
+            print(ok_text("Docker-образ собран"))
 
         # Ensure secrets / tokens in the state volume without overwriting existing ones.
         if role in ("direct", "edge"):
-            created = ensure_generated_secret(cand_base, "/var/lib/mtveil/proxy-secret")
-            print("Клиентский секрет: сгенерирован в томе state." if created else "Клиентский секрет: сохранён существующий из тома state.")
+            try:
+                created = ensure_generated_secret(cand_base, "/var/lib/mtveil/proxy-secret")
+            except RuntimeError as exc:
+                summary, action = diagnose_docker_error(str(exc), args.image)
+                print(f"{err_text(summary)}\nДальше: {action}", file=sys.stderr)
+                return 1
+            print("Секрет клиента: создан в томе state." if created else "Секрет клиента: сохранён прежний из тома state.")
 
         if role == "egress":
             if volume_file_exists(cand_base, "/var/lib/mtveil/egress-token"):
-                print("Токен MTV2: сохранён существующий из тома state.")
+                print("Токен MTV2: сохранён прежний из тома state.")
             else:
                 is_first = ask_yes_no("Это первый узел egress (сгенерировать новый токен MTV2)?", default=True)
                 if is_first:
                     ensure_generated_secret(cand_base, "/var/lib/mtveil/egress-token")
                     print("Токен MTV2 сгенерирован и сохранён в томе state (0600).")
-                    if ask_yes_no("Показать сгенерированный токен MTV2 для копирования на другие узлы?", default=False):
+                    if ask_yes_no("Показать сгенерированный токен MTV2 для копирования на edge?", default=False):
                         tok = read_volume_secret(cand_base, "/var/lib/mtveil/egress-token")
                         print(f"Токен MTV2: {tok}")
                 else:
@@ -732,23 +961,34 @@ def main() -> int:
             if volume_file_exists(cand_base, "/var/lib/mtveil/egress-token") and ask_yes_no(
                 "Использовать существующий токен MTV2 из тома state?", default=True
             ):
-                print("Токен MTV2: сохранён существующий из тома state.")
+                print("Токен MTV2: сохранён прежний из тома state.")
             else:
                 tok = ask_hidden_token("Введите общий токен MTV2")
                 write_volume_secret_stdin(cand_base, "/var/lib/mtveil/egress-token", tok)
                 print("Токен MTV2 сохранён в томе state.")
 
-        print("\nПроверка конфигурации через mtveil...")
-        run(cand_base + ["run", "--rm", "--no-deps", "mtveil", "--config", "/etc/mtveil/config.json", "--check-config"], capture=False)
+        cfg_check = run(
+            cand_base + ["run", "--rm", "--no-deps", "mtveil", "--config", "/etc/mtveil/config.json", "--check-config"],
+            check=False,
+        )
+        if cfg_check.returncode != 0:
+            detail = (cfg_check.stderr or cfg_check.stdout or "").strip()
+            print(err_text("Конфигурация не прошла проверку."), file=sys.stderr)
+            if detail:
+                print(detail, file=sys.stderr)
+            return 1
+        print(ok_text("Конфигурация проверена"))
 
         if role in ("direct", "edge"):
-            print(f"\nПроверка HTTPS-cover {cover} (SNI {sni}) изнутри контейнера...")
             cover_ok, cover_out = check_cover_from_container(cand_base, cover, sni)
             if cover_ok:
-                print("Проверка HTTPS-cover: OK (DNS, TCP, TLS и имя в сертификате подтверждены).")
+                print(ok_text("HTTPS-сайт для маскировки доступен"))
             else:
-                print(f"Проверка HTTPS-cover НЕ ПРОШЛА:\n{cover_out}", file=sys.stderr)
-                if not ask_yes_no("Проверка HTTPS-cover не прошла. Всё равно применить конфиг и запустить контейнер?", default=False):
+                print(err_text(f"HTTPS-сайт для маскировки ({cover}, SNI {sni}) не прошёл проверку."), file=sys.stderr)
+                print("Дальше: проверьте имя домена/сертификата в расширенных настройках или выберите другой HTTPS-сайт.", file=sys.stderr)
+                if cover_out:
+                    print(f"Детали: {cover_out}", file=sys.stderr)
+                if not ask_yes_no("Всё равно применить конфиг и запустить контейнер?", default=False):
                     print("Прервано до применения изменений. Текущая конфигурация не затронута.")
                     return 1
 
@@ -758,16 +998,19 @@ def main() -> int:
                 cand_base + ["run", "--rm", "--no-deps", "mtveil", "check-egress", "--config", "/etc/mtveil/config.json", "--dc", "2"],
                 check=False,
             )
-            print(check_proc.stdout)
+            print(check_proc.stdout.strip())
             if check_proc.returncode != 0:
-                print(check_proc.stderr.strip(), file=sys.stderr)
+                if check_proc.stderr.strip():
+                    print(check_proc.stderr.strip(), file=sys.stderr)
                 if "tcp_connect_timeout" in check_proc.stdout and not args.network_host:
                     print(
-                        "Подсказка: если egress доступен с хоста по mesh/VPN-туннелю (SharX/WireGuard), "
+                        "Подсказка: если egress доступен с хоста по приватному маршруту/туннелю, "
                         "но не отвечает из Docker bridge, перезапустите мастер с флагом --network-host.",
                         file=sys.stderr,
                     )
-                if not ask_yes_no("Один или несколько egress не прошли проверку. Всё равно применить конфиг и запустить edge?", default=False):
+                else:
+                    print("Дальше: проверьте, что egress запущен, порт открыт по туннелю и токен MTV2 совпадает.", file=sys.stderr)
+                if not ask_yes_no("Один или несколько egress не прошли проверку. Всё равно запустить edge?", default=False):
                     print("Прервано до применения изменений. Текущая конфигурация не затронута.")
                     return 1
 
@@ -799,7 +1042,6 @@ def main() -> int:
             if p.exists():
                 p.unlink()
 
-    print("\nЗапуск сервиса mtveil...")
     up_succeeded = False
     try:
         while True:
@@ -808,15 +1050,29 @@ def main() -> int:
                 up_succeeded = True
                 break
             err_detail = (up_proc.stderr or up_proc.stdout or "").strip()
-            print(f"Не удалось запустить контейнер на {bind_ip}:{pub_port}.\n{err_detail}", file=sys.stderr)
+            if not is_port_conflict_error(err_detail):
+                summary, action = diagnose_docker_error(err_detail, args.image)
+                print(f"{err_text(summary)}\nДальше: {action}", file=sys.stderr)
+                if err_detail:
+                    print(f"Детали: {err_detail}", file=sys.stderr)
+                return 1
+            print(warn_text(f"\nПорт {pub_port} оказался занят при запуске контейнера."))
             try:
-                retry = ask_yes_no("Указать другой порт и повторить запуск (настройки и секрет сохранятся)?", default=True)
+                retry = ask_yes_no("Выбрать другой порт и повторить запуск (настройки и секрет сохранятся)?", default=True)
             except EOFError:
                 retry = False
             if not retry:
                 return 1
-            pub_port = ask_validated("Укажите другой TCP-порт", validate_port)
-            pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, "Укажите другой TCP-порт")
+            alt = find_free_port(bind_ip, pub_port)
+            if alt is not None:
+                if role in ("direct", "edge"):
+                    print(f"Можно использовать {alt}. В ссылке Telegram порт подставится автоматически.")
+                else:
+                    print(f"Можно использовать {alt}.")
+                pub_port = ask_validated("Другой порт", validate_port, str(alt))
+            else:
+                pub_port = ask_validated("Другой порт", validate_port)
+            pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=(role in ("direct", "edge")))
             (deploy_dir / ".env").write_text(
                 f"MTVEIL_PROJECT={project}\nMTVEIL_IMAGE={args.image}\nMTVEIL_BIND={bind_ip}\nMTVEIL_PORT={pub_port}\n",
                 encoding="utf-8",
@@ -841,9 +1097,17 @@ def main() -> int:
     finally:
         if not up_succeeded and had_backup:
             restore_backup_files(deploy_dir)
-            print("Предыдущая рабочая конфигурация восстановлена.", file=sys.stderr)
+            print("Прежние файлы конфигурации восстановлены.", file=sys.stderr)
+
+    print(ok_text("Контейнер запущен"))
     wait_healthy(base)
-    print("Статус контейнера: healthy (порт открыт; проверьте передачу данных в Telegram, отправив или загрузив фото).")
+    print(ok_text("Контейнер исправен"))
+
+    try:
+        rel_dir = os.path.relpath(deploy_dir, repo_root).replace("\\", "/")
+    except ValueError:
+        rel_dir = str(deploy_dir)
+    compose_ref = f"--env-file {rel_dir}/.env -f {rel_dir}/compose.yaml"
 
     if role in ("direct", "edge"):
         link = run(
@@ -862,16 +1126,19 @@ def main() -> int:
                 str(pub_port),
             ]
         ).stdout.strip()
-        print(f"\nСсылка для Telegram:\n{link}\n")
+        print("\n" + heading("Ссылка для подключения в Telegram"))
+        print(f"  {link}\n")
+        print("Дальше:")
+        print("  1. Откройте ссылку на телефоне или компьютере и нажмите «Подключить прокси».")
+        print("  2. Ссылка даёт доступ к прокси — передавайте её только тем, кому доверяете.")
+        print("  3. Для проверки откройте любой чат и загрузите фото или видео (включая мобильную сеть).")
     else:
-        print(f"\nАдрес egress для ввода на узле edge:\n{bind_ip}:{pub_port}\n")
+        print("\n" + heading("Что указать на входном сервере (edge)"))
+        print(f"  Адрес выхода: {bind_ip}:{pub_port}")
+        print(f"  Режим в мастере на edge: 2 (несколько серверов) -> 2 (Входной сервер (edge))")
+        print(f"  Получить токен MTV2 безопасно: docker compose {compose_ref} exec -T mtveil cat /var/lib/mtveil/egress-token")
 
-    try:
-        rel_dir = os.path.relpath(deploy_dir, repo_root).replace("\\", "/")
-    except ValueError:
-        rel_dir = str(deploy_dir)
-    compose_ref = f"--env-file {rel_dir}/.env -f {rel_dir}/compose.yaml"
-    print("Полезные команды:")
+    print("\nУправление и диагностика:")
     print(f"  docker compose {compose_ref} ps")
     print(f"  docker compose {compose_ref} logs --tail=100 mtveil")
     if role == "edge":
@@ -883,6 +1150,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         print("\nОтменено пользователем.")
         raise SystemExit(130)

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MTVEIL_REPO="${MTVEIL_REPO:-RsNest/mtevil}"
-MTVEIL_VERSION="${MTVEIL_VERSION:-v0.1.0-alpha.3}"
+MTVEIL_VERSION="${MTVEIL_VERSION:-v0.1.0-alpha.4}"
 MTVEIL_DIR="${MTVEIL_DIR:-$HOME/mtveil}"
 REPO_LOWER="$(printf '%s' "$MTVEIL_REPO" | tr '[:upper:]' '[:lower:]')"
 MTVEIL_IMAGE="${MTVEIL_IMAGE:-ghcr.io/${REPO_LOWER}:${MTVEIL_VERSION}}"
