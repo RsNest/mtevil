@@ -92,6 +92,17 @@ class SetupValidationTests(unittest.TestCase):
         self.assertNotIn("ports:", yaml_text)
         self.assertIn("127.0.0.1:27443", yaml_text)
 
+    def test_render_compose_without_build(self):
+        repo_root = Path(__file__).resolve().parent.parent
+        yaml_text = setup.render_compose(
+            repo_root,
+            repo_root / "deploy" / "wizard",
+            "direct",
+            include_build=False,
+        )
+        self.assertNotIn("build:", yaml_text)
+        self.assertIn("image:", yaml_text)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

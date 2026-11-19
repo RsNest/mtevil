@@ -2,9 +2,18 @@
 
 MTProto FakeTLS-прокси с внешним HTTPS-cover, поддержкой мульти-секретов, персистентного replay-кэша, неравномерной нарезкой `ServerHello` и схемой `edge -> egress` с failover.
 
-## Быстрый старт (Docker Compose мастер)
+## Быстрый старт (без сборки и `git clone`)
 
-На Linux VPS с установленными Docker Engine и Docker Compose:
+На Linux VPS (нужны Docker Engine, плагин Docker Compose и Python 3):
+
+```bash
+curl -fsSL https://github.com/RsNest/mtevil/releases/download/v0.1.0-alpha.2/install.sh -o install.sh
+bash install.sh
+```
+
+Скрипт проверит Docker Compose и Python 3, скачает `setup.py` и готовый образ `ghcr.io/rsnest/mtevil:v0.1.0-alpha.2` и запустит интерактивный мастер без локальной сборки Rust.
+
+## Вариант из исходников (`git clone`)
 
 ```bash
 git clone https://github.com/RsNest/mtevil.git

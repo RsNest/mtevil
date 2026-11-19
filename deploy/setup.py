@@ -272,6 +272,7 @@ def render_compose(
     network_host: bool = False,
     health_host: str = "127.0.0.1",
     health_port: int | None = None,
+    include_build: bool = True,
 ) -> str:
     try:
         rel_context = os.path.relpath(repo_root, deploy_dir).replace("\\", "/")
@@ -279,6 +280,11 @@ def render_compose(
         rel_context = str(repo_root).replace("\\", "/")
     internal_port = 29443 if role == "egress" else 24443
     hc_port = health_port if (network_host and health_port is not None) else internal_port
+    build_block = (
+        f"\n  build:\n    context: {rel_context}\n    dockerfile: Dockerfile"
+        if include_build
+        else ""
+    )
     net_block = (
         "    network_mode: host"
         if network_host
@@ -287,10 +293,7 @@ def render_compose(
     return f"""name: ${{MTVEIL_PROJECT:-mtveil-{role}}}
 
 x-image: &image
-  image: ${{MTVEIL_IMAGE:-{DEFAULT_IMAGE}}}
-  build:
-    context: {rel_context}
-    dockerfile: Dockerfile
+  image: ${{MTVEIL_IMAGE:-{DEFAULT_IMAGE}}}{build_block}
 
 services:
   mtveil:
@@ -569,6 +572,7 @@ def main() -> int:
 
     cand_base = compose_cmd(deploy_dir, project, "compose.candidate.yaml", ".env.candidate")
     base = compose_cmd(deploy_dir, project)
+    include_build = not args.no_build and (repo_root / "Dockerfile").is_file()
     try:
         cand_compose.write_text(
             render_compose(
@@ -579,6 +583,7 @@ def main() -> int:
                 network_host=args.network_host,
                 health_host=health_host,
                 health_port=pub_port,
+                include_build=include_build,
             ),
             encoding="utf-8",
         )
@@ -667,6 +672,7 @@ def main() -> int:
                 network_host=args.network_host,
                 health_host=health_host,
                 health_port=pub_port,
+                include_build=include_build,
             ),
             encoding="utf-8",
         )
