@@ -13,15 +13,80 @@ permissions:
   packages: write
 
 concurrency:
-  group: ghcr-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+  group: mtevil-release-pipeline
+  cancel-in-progress: false
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run Rust tests and Clippy
+        run: |
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Resolve candidate release version
+        id: ver
+        run: |
+          git fetch origin main --tags --force
+          repo_lower=$(printf '%s' "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "repo_lower=${repo_lower}" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+            is_new="false"
+          else
+            read -r tag is_new < <(python3 - "$GITHUB_SHA" <<'PY'
+          import subprocess, sys
+          sys.path.insert(0, "deploy")
+          import setup
+          sha = sys.argv[1]
+          sha_tags = subprocess.check_output(["git", "tag", "--points-at", sha], text=True).splitlines()
+          all_tags = subprocess.check_output(["git", "tag"], text=True).splitlines()
+          tag, is_new = setup.resolve_commit_release_tag(sha_tags, all_tags, min_alpha=5)
+          print(tag, "true" if is_new else "false")
+          PY
+            )
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "is_new=${is_new}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=${tag} (is_new=${is_new}) for commit ${GITHUB_SHA}"
+
+      - name: Build and test release Docker image
+        id: build
+        run: |
+          tag="${{ steps.ver.outputs.tag }}"
+          repo_lower="${{ steps.ver.outputs.repo_lower }}"
+          local_img="ghcr.io/${repo_lower}:${tag}"
+
+          docker build \
+            --build-arg MTEVIL_VERSION="${tag}" \
+            --build-arg MTEVIL_REVISION="${GITHUB_SHA}" \
+            -t "${local_img}" \
+            .
+
+          ver_out="$(docker run --rm "${local_img}" --version)"
+          echo "Binary version output: ${ver_out}"
+          test "${ver_out}" = "mtevil ${tag}"
+
+          oci_ver="$(docker image inspect "${local_img}" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')"
+          oci_rev="$(docker image inspect "${local_img}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+          test "${oci_ver}" = "${tag}"
+          test "${oci_rev}" = "${GITHUB_SHA}"
+
+          MTEVIL_TEST_IMAGE="${local_img}" MTEVIL_REQUIRE_ALL_TESTS=1 python3 deploy/test_setup.py
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -30,35 +95,108 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Prepare image tags
-        id: meta
+      - name: Allocate tag and push GHCR images
+        id: publish_img
         run: |
-          repo_lower=$(printf '%s' "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            tags="ghcr.io/${repo_lower}:${GITHUB_REF_NAME}"
-          elif [ "${GITHUB_REF}" = "refs/heads/main" ]; then
-            tags=$(printf "ghcr.io/%s:main\nghcr.io/%s:sha-%s" "$repo_lower" "$repo_lower" "$GITHUB_SHA")
-          else
-            tags=$(printf "ghcr.io/%s:%s\nghcr.io/%s:sha-%s" "$repo_lower" "$GITHUB_REF_NAME" "$repo_lower" "$GITHUB_SHA")
+          repo_lower="${{ steps.ver.outputs.repo_lower }}"
+          tag="${{ steps.ver.outputs.tag }}"
+          is_new="${{ steps.ver.outputs.is_new }}"
+          built_img="ghcr.io/${repo_lower}:${tag}"
+
+          if [ "${is_new}" = "true" ]; then
+            while true; do
+              if git tag "${tag}" "${GITHUB_SHA}" 2>/dev/null && git push origin "refs/tags/${tag}"; then
+                break
+              fi
+              git tag -d "${tag}" 2>/dev/null || true
+              git fetch origin --tags --force
+              read -r tag is_new < <(python3 - "$GITHUB_SHA" <<'PY'
+          import subprocess, sys
+          sys.path.insert(0, "deploy")
+          import setup
+          sha = sys.argv[1]
+          sha_tags = subprocess.check_output(["git", "tag", "--points-at", sha], text=True).splitlines()
+          all_tags = subprocess.check_output(["git", "tag"], text=True).splitlines()
+          tag, is_new = setup.resolve_commit_release_tag(sha_tags, all_tags, min_alpha=5)
+          print(tag, "true" if is_new else "false")
+          PY
+              )
+              if [ "${is_new}" = "false" ]; then
+                break
+              fi
+            done
           fi
-          {
-            echo "tags<<EOF"
-            echo "$tags"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          final_img="ghcr.io/${repo_lower}:${tag}"
+          if [ "${final_img}" != "${built_img}" ]; then
+            docker build \
+              --build-arg MTEVIL_VERSION="${tag}" \
+              --build-arg MTEVIL_REVISION="${GITHUB_SHA}" \
+              -t "${final_img}" \
+              .
+          fi
 
-      - name: Publish GitHub Release
-        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            deploy/install.sh
-            deploy/setup.py
-          generate_release_notes: true
+          sha_img="ghcr.io/${repo_lower}:sha-${GITHUB_SHA}"
+          docker tag "${final_img}" "${sha_img}"
+          docker push "${final_img}"
+          docker push "${sha_img}"
+
+          # Update :main only if GITHUB_SHA is not behind origin/main.
+          git fetch origin main
+          origin_main_sha="$(git rev-parse origin/main)"
+          if git merge-base --is-ancestor "${origin_main_sha}" "${GITHUB_SHA}"; then
+            main_img="ghcr.io/${repo_lower}:main"
+            docker tag "${final_img}" "${main_img}"
+            docker push "${main_img}"
+          fi
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "image=${final_img}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify anonymous GHCR pull before release publication
+        run: |
+          anon_cfg="$(mktemp -d)"
+          trap 'rm -rf "$anon_cfg"' EXIT
+          DOCKER_CONFIG="$anon_cfg" docker pull "${{ steps.publish_img.outputs.image }}"
+
+      - name: Publish GitHub Release and verify assets anonymously
+        run: |
+          tag="${{ steps.publish_img.outputs.tag }}"
+          mkdir -p dist
+          sed "s/MTEVIL_PINNED_VERSION=\"__AUTO__\"/MTEVIL_PINNED_VERSION=\"${tag}\"/" deploy/install.sh > dist/install.sh
+          grep -q "MTEVIL_PINNED_VERSION=\"${tag}\"" dist/install.sh
+          cp deploy/setup.py dist/setup.py
+
+          prerelease_flag=""
+          if [[ "${tag}" == *-* ]]; then
+            prerelease_flag="--prerelease"
+          fi
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            is_draft="$(gh release view "${tag}" --json isDraft -q .isDraft)"
+            assets="$(gh release view "${tag}" --json assets -q '.assets[].name')"
+            if ! printf '%s\n' "$assets" | grep -qx "install.sh"; then
+              gh release upload "${tag}" dist/install.sh
+            fi
+            if ! printf '%s\n' "$assets" | grep -qx "setup.py"; then
+              gh release upload "${tag}" dist/setup.py
+            fi
+            if [ "${is_draft}" = "true" ]; then
+              gh release edit "${tag}" --draft=false ${prerelease_flag}
+            fi
+          else
+            gh release create "${tag}" dist/install.sh dist/setup.py \
+              --target "${GITHUB_SHA}" \
+              --title "${tag}" \
+              --generate-notes \
+              --draft \
+              ${prerelease_flag}
+            gh release edit "${tag}" --draft=false
+          fi
+
+          dl_dir="$(mktemp -d)"
+          trap 'rm -rf "$dl_dir"' EXIT
+          curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${tag}/install.sh" -o "${dl_dir}/install.sh"
+          curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${tag}/setup.py" -o "${dl_dir}/setup.py"
+          grep -q "MTEVIL_PINNED_VERSION=\"${tag}\"" "${dl_dir}/install.sh"
+          cmp -s dist/setup.py "${dl_dir}/setup.py"

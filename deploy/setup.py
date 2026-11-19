@@ -14,7 +14,70 @@ import subprocess
 import sys
 import time
 
-DEFAULT_IMAGE = "mtevil:0.1.0-alpha.1"
+DEFAULT_IMAGE = "mtevil:local"
+SEMVER_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:-(alpha|beta|rc)\.(\d+))?$")
+STAGE_RANKS = {"alpha": 1, "beta": 2, "rc": 3, None: 4}
+
+
+def parse_semver_tag(tag: str) -> tuple[int, int, int, int, int] | None:
+    m = SEMVER_TAG_RE.match(tag.strip())
+    if not m:
+        return None
+    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    stage = m.group(4)
+    pre_num = int(m.group(5)) if m.group(5) is not None else 0
+    return (major, minor, patch, STAGE_RANKS[stage], pre_num)
+
+
+def select_latest_release(releases: list[dict[str, object]]) -> str:
+    if not isinstance(releases, list) or not releases:
+        raise ValueError("no releases found")
+    candidates: list[tuple[tuple[int, int, int, int, int], str]] = []
+    for rel in releases:
+        if not isinstance(rel, dict) or rel.get("draft"):
+            continue
+        tag = str(rel.get("tag_name") or "").strip()
+        key = parse_semver_tag(tag)
+        if key is None:
+            continue
+        assets = rel.get("assets")
+        if not isinstance(assets, list):
+            continue
+        ready_names = {
+            str(a.get("name") or "")
+            for a in assets
+            if isinstance(a, dict)
+            and a.get("state") in (None, "uploaded")
+            and a.get("browser_download_url")
+        }
+        if {"install.sh", "setup.py"}.issubset(ready_names):
+            candidates.append((key, tag))
+    if not candidates:
+        raise ValueError("no eligible published release with install.sh and setup.py assets")
+    candidates.sort(key=lambda item: item[0])
+    return candidates[-1][1]
+
+
+def resolve_commit_release_tag(
+    sha_tags: list[str],
+    all_tags: list[str],
+    min_alpha: int = 5,
+) -> tuple[str, bool]:
+    """Return (tag, is_new). Reuses an existing v* semver tag on the commit if present."""
+    existing: list[tuple[tuple[int, int, int, int, int], str]] = []
+    for t in sha_tags:
+        key = parse_semver_tag(t)
+        if key is not None:
+            existing.append((key, t.strip()))
+    if existing:
+        existing.sort(key=lambda item: item[0])
+        return existing[-1][1], False
+    max_n = min_alpha
+    for t in all_tags:
+        key = parse_semver_tag(t)
+        if key is not None and key[:4] == (0, 1, 0, 1):
+            max_n = max(max_n, key[4])
+    return f"v0.1.0-alpha.{max_n + 1}", True
 DEFAULT_DCS = [
     "1=149.154.175.50:443",
     "2=149.154.167.51:443",

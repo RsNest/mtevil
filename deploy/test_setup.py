@@ -131,7 +131,9 @@ class SetupValidationTests(unittest.TestCase):
             self.assertEqual((d / "config.json").read_text(encoding="utf-8"), "current-cfg")
 
     def _local_image(self):
-        for candidate in ("mtevil:wizard-test", "ghcr.io/rsnest/mtevil:v0.1.0-alpha.5"):
+        env_img = setup.os.environ.get("MTEVIL_TEST_IMAGE")
+        candidates = ([env_img] if env_img else []) + ["mtevil:wizard-test", "ghcr.io/rsnest/mtevil:v0.1.0-alpha.5"]
+        for candidate in candidates:
             if subprocess.run(["docker", "image", "inspect", candidate], capture_output=True).returncode == 0:
                 return candidate
         return None
@@ -540,6 +542,142 @@ class SetupValidationTests(unittest.TestCase):
                     if (d_path / "compose.yaml").exists():
                         subprocess.run(setup.compose_cmd(d_path, proj) + ["down", "-v"], capture_output=True)
 
+    def test_version_selection_and_commit_tag_allocation(self):
+        def rel(tag: str, *, draft: bool = False, assets=("install.sh", "setup.py")):
+            return {
+                "tag_name": tag,
+                "draft": draft,
+                "assets": [
+                    {"name": name, "state": "uploaded", "browser_download_url": f"https://example.invalid/{tag}/{name}"}
+                    for name in assets
+                ],
+            }
+
+        releases = [
+            rel("v0.1.0-alpha.5"),
+            rel("v0.1.0-alpha.9"),
+            rel("v0.1.0-alpha.10"),
+            rel("v0.1.0-alpha.11", draft=True),
+            rel("v0.1.0-alpha.12", assets=("install.sh",)),
+        ]
+        self.assertEqual(setup.select_latest_release(releases), "v0.1.0-alpha.10")
+
+        releases_with_beta = releases + [rel("v0.1.0-beta.1")]
+        self.assertEqual(setup.select_latest_release(releases_with_beta), "v0.1.0-beta.1")
+
+        with self.assertRaises(ValueError):
+            setup.select_latest_release([])
+        with self.assertRaises(ValueError):
+            setup.select_latest_release([rel("v0.1.0-alpha.6", draft=True)])
+
+        # Rerun for an already tagged commit SHA must reuse its tag without incrementing.
+        tag, is_new = setup.resolve_commit_release_tag(
+            ["v0.1.0-alpha.6"],
+            ["v0.1.0-alpha.4", "v0.1.0-alpha.5", "v0.1.0-alpha.6"],
+        )
+        self.assertEqual((tag, is_new), ("v0.1.0-alpha.6", False))
+
+        # Deliberate beta tag on the commit is reused without creating a duplicate alpha tag.
+        tag_b, is_new_b = setup.resolve_commit_release_tag(
+            ["v0.1.0-beta.1"],
+            ["v0.1.0-alpha.5", "v0.1.0-alpha.6", "v0.1.0-beta.1"],
+        )
+        self.assertEqual((tag_b, is_new_b), ("v0.1.0-beta.1", False))
+
+        # New untagged commit after alpha.5 allocates v0.1.0-alpha.6.
+        tag_next, is_new_next = setup.resolve_commit_release_tag(
+            [],
+            ["v0.1.0-alpha.2", "v0.1.0-alpha.3", "v0.1.0-alpha.4", "v0.1.0-alpha.5"],
+        )
+        self.assertEqual((tag_next, is_new_next), ("v0.1.0-alpha.6", True))
+
+    def test_pinned_install_sh_ignores_midway_newer_release(self):
+        # Verify that a release-pinned copy of install.sh (MTEVIL_PINNED_VERSION="v0.1.0-alpha.6")
+        # keeps v0.1.0-alpha.6 for setup.py and image even if v0.1.0-alpha.7 is published before setup.py downloads.
+        install_text = (Path(__file__).resolve().parent / "install.sh").read_text(encoding="utf-8")
+        self.assertIn('MTEVIL_PINNED_VERSION="__AUTO__"', install_text)
+        pinned_alpha6 = install_text.replace(
+            'MTEVIL_PINNED_VERSION="__AUTO__"',
+            'MTEVIL_PINNED_VERSION="v0.1.0-alpha.6"',
+            1,
+        )
+        self.assertIn('MTEVIL_PINNED_VERSION="v0.1.0-alpha.6"', pinned_alpha6)
+
+        import http.server
+        import threading
+
+        requested_paths: list[str] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                requested_paths.append(self.path)
+                if self.path == "/releases":
+                    # Midway through installation, the API already advertises alpha.7 as latest!
+                    body = setup.json.dumps([
+                        {
+                            "tag_name": "v0.1.0-alpha.6",
+                            "draft": False,
+                            "assets": [
+                                {"name": "install.sh", "state": "uploaded", "browser_download_url": "http://127.0.0.1/a6/install.sh"},
+                                {"name": "setup.py", "state": "uploaded", "browser_download_url": "http://127.0.0.1/a6/setup.py"},
+                            ],
+                        },
+                        {
+                            "tag_name": "v0.1.0-alpha.7",
+                            "draft": False,
+                            "assets": [
+                                {"name": "install.sh", "state": "uploaded", "browser_download_url": "http://127.0.0.1/a7/install.sh"},
+                                {"name": "setup.py", "state": "uploaded", "browser_download_url": "http://127.0.0.1/a7/setup.py"},
+                            ],
+                        },
+                    ]).encode("utf-8")
+                elif self.path == "/download/v0.1.0-alpha.6/setup.py":
+                    body = b"import sys\nprint('SETUP_ARGS:', ' '.join(sys.argv[1:]))\n"
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = srv.server_port
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            image = self._local_image()
+            if image is None:
+                self.skipTest("no local mtevil image available")
+            with tempfile.TemporaryDirectory() as td:
+                d = Path(td)
+                pinned_path = d / "install.alpha6.sh"
+                pinned_path.write_text(pinned_alpha6, encoding="utf-8", newline="\n")
+                # Execute inside container or local bash if available:
+                # Using `docker run --rm` or local bash? No, on Windows `bash` might be WSL stub,
+                # so let's test on Linux / Git Bash or verify via python + bash when `/bin/bash` is present.
+                bash_bin = "/bin/bash" if Path("/bin/bash").is_file() else None
+                if bash_bin is not None:
+                    env = dict(setup.os.environ)
+                    env["MTEVIL_DIR"] = str(d / "install_dir")
+                    env["MTEVIL_RELEASES_API_URL"] = f"http://127.0.0.1:{port}/releases"
+                    env["MTEVIL_RELEASE_BASE_URL"] = f"http://127.0.0.1:{port}/download"
+                    env["MTEVIL_IMAGE"] = image
+                    proc = subprocess.run([bash_bin, str(pinned_path)], env=env, capture_output=True, text=True)
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertIn("/download/v0.1.0-alpha.6/setup.py", requested_paths)
+                    self.assertNotIn("/releases", requested_paths)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    prog = unittest.main(verbosity=2, exit=False)
+    if setup.os.environ.get("MTEVIL_REQUIRE_ALL_TESTS") == "1" and prog.result.skipped:
+        print(f"ERROR: MTEVIL_REQUIRE_ALL_TESTS=1 but {len(prog.result.skipped)} test(s) were skipped", file=sys.stderr)
+        raise SystemExit(1)
+    raise SystemExit(0 if prog.result.wasSuccessful() else 1)

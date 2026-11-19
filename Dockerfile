@@ -4,11 +4,16 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY tests/vectors/prototype ./tests/vectors/prototype
+ARG MTEVIL_VERSION=0.1.0-dev
+ENV MTEVIL_BUILD_VERSION=${MTEVIL_VERSION}
 RUN cargo build --release --locked -p mtevil-data-plane
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+ARG MTEVIL_VERSION=0.1.0-dev
+ARG MTEVIL_REVISION=unknown
 LABEL org.opencontainers.image.title="mtevil" \
-      org.opencontainers.image.version="0.1.0-alpha.1" \
+      org.opencontainers.image.version="${MTEVIL_VERSION}" \
+      org.opencontainers.image.revision="${MTEVIL_REVISION}" \
       org.opencontainers.image.description="Experimental MTProto Direct proxy"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates openssl \

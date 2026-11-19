@@ -13,7 +13,7 @@ MTProto-прокси для Telegram на Rust. На одном Linux VPS мас
 Подключитесь к VPS по SSH и выполните эти команды в Bash. Установщик скачает готовый образ и откроет мастер настройки.
 
 ```bash
-curl -fsSL https://github.com/RsNest/mtevil/releases/download/v0.1.0-alpha.5/install.sh -o install.sh &&
+curl -fsSL https://raw.githubusercontent.com/RsNest/mtevil/main/deploy/install.sh -o install.sh &&
   bash install.sh
 ```
 
@@ -22,7 +22,7 @@ curl -fsSL https://github.com/RsNest/mtevil/releases/download/v0.1.0-alpha.5/ins
 3. По умолчанию для HTTPS-маскировки используется `example.com:443` (его можно поменять в «Расширенных настройках»).
 4. Откройте ссылку, которую выдаст мастер, в Telegram и нажмите «Подключить прокси». Для проверки переключитесь на мобильную сеть и откройте фото или видео в чате.
 
-По умолчанию файлы установки находятся в `~/mtevil`.
+По умолчанию файлы установки находятся в `~/mtevil`. Повторный запуск этой же команды обновляет существующую установку через мастер; сам выход нового релиза не перезапускает работающие VPS. Для установки конкретной версии укажите её явно: `MTEVIL_VERSION=v0.1.0-alpha.5 bash install.sh`.
 
 <details>
 <summary>Установка из исходников</summary>
@@ -41,11 +41,10 @@ python3 deploy/setup.py
 
 Если прокси установлен через мастер, зайдите по SSH на тот же VPS под тем же пользователем. Обновление запускается вручную. При замене контейнера активные звонки и загрузки могут прерваться.
 
-1. Выберите версию на [странице релизов](https://github.com/RsNest/mtevil/releases). Скачайте её установщик. В примере указан `v0.1.0-alpha.5` — для перехода на более новый релиз замените значение `version` его тегом.
+1. Скачайте установщик постоянной командой (он сам выберет свежий опубликованный релиз; при необходимости конкретную версию можно задать через `MTEVIL_VERSION=v0.1.0-alpha.5`):
 
    ```bash
-   version=v0.1.0-alpha.5
-   curl -fL "https://github.com/RsNest/mtevil/releases/download/$version/install.sh" -o install.sh
+   curl -fsSL https://raw.githubusercontent.com/RsNest/mtevil/main/deploy/install.sh -o install.sh
    ```
 
 2. После успешного скачивания выполните `bash install.sh`. Если при первой установке использовали сеть хоста (например, на `edge`), выполните `bash install.sh --network-host`. Для нестандартного каталога укажите прежний путь через `MTEVIL_DIR`, например `MTEVIL_DIR="$HOME/mtevil-cz-direct" bash install.sh`.

@@ -24,8 +24,13 @@ use config::{Config, EgressStrategy, NamedSecret, Role};
 mod telemetry;
 use serde_json::json;
 
+const BUILD_VERSION: &str = match option_env!("MTEVIL_BUILD_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
-#[command(name = "mtevil", version, about = "Experimental MTProto Direct proxy")]
+#[command(name = "mtevil", version = BUILD_VERSION, about = "Experimental MTProto Direct proxy")]
 struct Args {
     #[command(subcommand)]
     command: Option<Action>,
@@ -681,7 +686,7 @@ async fn main() -> Result<()> {
             "startup",
             0,
             json!({
-                "version":env!("CARGO_PKG_VERSION"),
+                "version":BUILD_VERSION,
                 "role":"egress",
                 "listen":listener.local_addr()?.to_string(),
                 "max_connections":config.max_connections,
@@ -761,7 +766,7 @@ async fn main() -> Result<()> {
         "startup",
         0,
         json!({
-            "version":env!("CARGO_PKG_VERSION"),
+            "version":BUILD_VERSION,
             "role": if state.egress_upstreams.is_empty() { "direct" } else { "edge" },
             "listen":listener.local_addr()?.to_string(),
             "max_connections":config.max_connections,
