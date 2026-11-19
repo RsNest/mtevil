@@ -29,6 +29,18 @@ if [ "${#missing[@]}" -gt 0 ]; then
   exit 1
 fi
 
+if ! docker_err="$(docker info 2>&1 >/dev/null)"; then
+  echo "Docker не отвечает: не удалось подключиться к Docker Engine." >&2
+  if printf '%s' "$docker_err" | grep -qi "permission denied"; then
+    echo "Дальше: добавьте пользователя в группу docker (sudo usermod -aG docker \"\$USER\"), перелогиньтесь и повторите запуск." >&2
+  elif [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; then
+    echo "Дальше: откройте Docker Desktop на Windows, включите интеграцию с WSL для этого дистрибутива и повторите запуск." >&2
+  else
+    echo "Дальше: проверьте службу Docker (sudo systemctl start docker && sudo systemctl status docker) и повторите запуск." >&2
+  fi
+  exit 1
+fi
+
 mkdir -p "$MTVEIL_DIR"
 SETUP_URL="https://github.com/${MTVEIL_REPO}/releases/download/${MTVEIL_VERSION}/setup.py"
 echo "Скачивание мастера настройки mtveil (${MTVEIL_VERSION})..."
@@ -39,7 +51,11 @@ else
 fi
 
 echo "Загрузка Docker-образа ${MTVEIL_IMAGE}..."
-docker pull "$MTVEIL_IMAGE"
+if ! docker pull "$MTVEIL_IMAGE"; then
+  echo "Не удалось загрузить Docker-образ ${MTVEIL_IMAGE}." >&2
+  echo "Дальше: проверьте интернет-соединение и доступ к ghcr.io, затем повторите запуск." >&2
+  exit 1
+fi
 
 exec python3 "${MTVEIL_DIR}/setup.py" \
   --dir "$MTVEIL_DIR" \

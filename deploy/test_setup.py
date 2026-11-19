@@ -151,6 +151,70 @@ class SetupValidationTests(unittest.TestCase):
             host, recs = setup.prompt_client_address("93.184.216.34")
             self.assertEqual(host, "93.184.216.34")
             self.assertIsNone(recs)
+
+    def test_edge_failed_check_preserves_live_token_and_wait_healthy_timeout_has_abs_logs(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "compose.yaml").write_text("old-compose", encoding="utf-8")
+            (d / ".env").write_text("MTVEIL_PORT=443\n", encoding="utf-8")
+            (d / "config.json").write_text('{"role":"edge"}\n', encoding="utf-8")
+
+            def fake_check_egress_fail(argv, **_kwargs):
+                cmd = " ".join(argv)
+                if "check-egress" in cmd:
+                    return subprocess.CompletedProcess(argv, 1, stdout='[{"status":"fail"}]', stderr="")
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            # Role 2 (edge) -> 2, address 203.0.113.10, port 443, adv n, upstream 10.203.0.9:29443,
+            # backup n, strategy 1, reuse existing token n, enter new token, confirm abort n.
+            stdin_data = (
+                "y\n2\n2\n203.0.113.10\n443\nn\n10.203.0.9:29443\nn\n1\nn\n"
+                + ("a" * 32)
+                + "\nn\n"
+            )
+            out_buf = io.StringIO()
+            err_buf = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d), "--project", "mtveil-edge-tok", "--image", "mtveil:test", "--no-build"]),
+                mock.patch.object(sys, "stdin", io.StringIO(stdin_data)),
+                mock.patch.object(sys, "stdout", out_buf),
+                mock.patch.object(sys, "stderr", err_buf),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "is_port_available", return_value=True),
+                mock.patch.object(setup, "deployment_owns_port", return_value=False),
+                mock.patch.object(setup, "volume_file_exists", return_value=True),
+                mock.patch.object(setup, "check_cover_from_container", return_value=(True, "")),
+                mock.patch.object(setup, "write_volume_secret_stdin") as mock_write_tok,
+                mock.patch.object(setup, "run", side_effect=fake_check_egress_fail),
+            ):
+                rc = setup.main()
+            self.assertEqual(rc, 1)
+            mock_write_tok.assert_not_called()
+            self.assertFalse((d / ".egress-token.candidate").exists())
+
+        with tempfile.TemporaryDirectory() as td2:
+            d2 = Path(td2)
+            out2 = io.StringIO()
+            err2 = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d2), "--project", "mtveil-hc-test", "--image", "mtveil:test", "--no-build"]),
+                mock.patch.object(sys, "stdin", io.StringIO("1\n203.0.113.10\n25443\nn\n")),
+                mock.patch.object(sys, "stdout", out2),
+                mock.patch.object(sys, "stderr", err2),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "is_port_available", return_value=True),
+                mock.patch.object(setup, "deployment_owns_port", return_value=False),
+                mock.patch.object(setup, "volume_file_exists", return_value=True),
+                mock.patch.object(setup, "check_cover_from_container", return_value=(True, "")),
+                mock.patch.object(setup, "wait_healthy", side_effect=TimeoutError("timeout")),
+                mock.patch.object(setup, "run", return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")),
+            ):
+                rc2 = setup.main()
+            self.assertEqual(rc2, 1)
+            err_text = err2.getvalue()
+            self.assertIn("healthy", err_text)
+            self.assertIn(f'"{(d2 / ".env").resolve()}"', err_text)
+            self.assertIn(f'"{(d2 / "compose.yaml").resolve()}"', err_text)
             self.assertEqual((d / ".env").read_text(encoding="utf-8"), "old-env")
             self.assertEqual((d / "config.json").read_text(encoding="utf-8"), "old-cfg")
 
@@ -299,6 +363,70 @@ class SetupValidationTests(unittest.TestCase):
             host, recs = setup.prompt_client_address("93.184.216.34")
             self.assertEqual(host, "93.184.216.34")
             self.assertIsNone(recs)
+
+    def test_edge_failed_check_preserves_live_token_and_wait_healthy_timeout_has_abs_logs(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "compose.yaml").write_text("old-compose", encoding="utf-8")
+            (d / ".env").write_text("MTVEIL_PORT=443\n", encoding="utf-8")
+            (d / "config.json").write_text('{"role":"edge"}\n', encoding="utf-8")
+
+            def fake_check_egress_fail(argv, **_kwargs):
+                cmd = " ".join(argv)
+                if "check-egress" in cmd:
+                    return subprocess.CompletedProcess(argv, 1, stdout='[{"status":"fail"}]', stderr="")
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            # Role 2 (edge) -> 2, address 203.0.113.10, port 443, adv n, upstream 10.203.0.9:29443,
+            # backup n, strategy 1, reuse existing token n, enter new token, confirm abort n.
+            stdin_data = (
+                "y\n2\n2\n203.0.113.10\n443\nn\n10.203.0.9:29443\nn\n1\nn\n"
+                + ("a" * 32)
+                + "\nn\n"
+            )
+            out_buf = io.StringIO()
+            err_buf = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d), "--project", "mtveil-edge-tok", "--image", "mtveil:test", "--no-build"]),
+                mock.patch.object(sys, "stdin", io.StringIO(stdin_data)),
+                mock.patch.object(sys, "stdout", out_buf),
+                mock.patch.object(sys, "stderr", err_buf),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "is_port_available", return_value=True),
+                mock.patch.object(setup, "deployment_owns_port", return_value=False),
+                mock.patch.object(setup, "volume_file_exists", return_value=True),
+                mock.patch.object(setup, "check_cover_from_container", return_value=(True, "")),
+                mock.patch.object(setup, "write_volume_secret_stdin") as mock_write_tok,
+                mock.patch.object(setup, "run", side_effect=fake_check_egress_fail),
+            ):
+                rc = setup.main()
+            self.assertEqual(rc, 1)
+            mock_write_tok.assert_not_called()
+            self.assertFalse((d / ".egress-token.candidate").exists())
+
+        with tempfile.TemporaryDirectory() as td2:
+            d2 = Path(td2)
+            out2 = io.StringIO()
+            err2 = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d2), "--project", "mtveil-hc-test", "--image", "mtveil:test", "--no-build"]),
+                mock.patch.object(sys, "stdin", io.StringIO("1\n203.0.113.10\n25443\nn\n")),
+                mock.patch.object(sys, "stdout", out2),
+                mock.patch.object(sys, "stderr", err2),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "is_port_available", return_value=True),
+                mock.patch.object(setup, "deployment_owns_port", return_value=False),
+                mock.patch.object(setup, "volume_file_exists", return_value=True),
+                mock.patch.object(setup, "check_cover_from_container", return_value=(True, "")),
+                mock.patch.object(setup, "wait_healthy", side_effect=TimeoutError("timeout")),
+                mock.patch.object(setup, "run", return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")),
+            ):
+                rc2 = setup.main()
+            self.assertEqual(rc2, 1)
+            err_text = err2.getvalue()
+            self.assertIn("healthy", err_text)
+            self.assertIn(f'"{(d2 / ".env").resolve()}"', err_text)
+            self.assertIn(f'"{(d2 / "compose.yaml").resolve()}"', err_text)
 
 
 if __name__ == "__main__":

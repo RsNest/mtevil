@@ -512,6 +512,7 @@ def render_compose(
     health_host: str = "127.0.0.1",
     health_port: int | None = None,
     include_build: bool = True,
+    extra_volumes: list[str] | None = None,
 ) -> str:
     try:
         rel_context = os.path.relpath(repo_root, deploy_dir).replace("\\", "/")
@@ -529,6 +530,7 @@ def render_compose(
         if network_host
         else f'    ports:\n      - "${{MTVEIL_BIND:-127.0.0.1}}:${{MTVEIL_PORT:-{internal_port}}}:{internal_port}/tcp"'
     )
+    extra_vol_lines = "".join(f"\n      - {v}" for v in (extra_volumes or []))
     return f"""name: ${{MTVEIL_PROJECT:-mtveil-{role}}}
 
 x-image: &image
@@ -542,7 +544,7 @@ services:
 {net_block}
     volumes:
       - ./{config_name}:/etc/mtveil/config.json:ro
-      - state:/var/lib/mtveil
+      - state:/var/lib/mtveil{extra_vol_lines}
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -913,6 +915,8 @@ def main() -> int:
     cand_compose = deploy_dir / "compose.candidate.yaml"
     cand_env = deploy_dir / ".env.candidate"
     cand_config = deploy_dir / "config.candidate.json"
+    cand_token = deploy_dir / ".egress-token.candidate"
+    pending_edge_token: str | None = None
     env_text = (
         f"MTVEIL_PROJECT={project}\n"
         f"MTVEIL_IMAGE={args.image}\n"
@@ -924,6 +928,9 @@ def main() -> int:
 
     cand_base = compose_cmd(deploy_dir, project, "compose.candidate.yaml", ".env.candidate")
     base = compose_cmd(deploy_dir, project)
+    abs_env = str((deploy_dir / ".env").resolve())
+    abs_compose = str((deploy_dir / "compose.yaml").resolve())
+    compose_ref = f'--env-file "{abs_env}" -f "{abs_compose}"'
     include_build = not args.no_build and (repo_root / "Dockerfile").is_file()
     try:
         cand_compose.write_text(
@@ -986,9 +993,30 @@ def main() -> int:
             ):
                 print("Токен MTV2: сохранён прежний из тома state.")
             else:
-                tok = ask_hidden_token("Введите общий токен MTV2")
-                write_volume_secret_stdin(cand_base, "/var/lib/mtveil/egress-token", tok)
-                print("Токен MTV2 сохранён в томе state.")
+                pending_edge_token = ask_hidden_token("Введите общий токен MTV2")
+                cand_token.write_text(pending_edge_token + "\n", encoding="utf-8")
+                try:
+                    os.chmod(cand_token, 0o600)
+                except OSError:
+                    pass
+                cand_cfg_data = dict(config_data)
+                cand_cfg_data["egress_token_file"] = "/etc/mtveil/egress-token.candidate"
+                cand_config.write_text(json.dumps(cand_cfg_data, indent=2) + "\n", encoding="utf-8")
+                cand_compose.write_text(
+                    render_compose(
+                        repo_root,
+                        deploy_dir,
+                        role,
+                        "config.candidate.json",
+                        network_host=args.network_host,
+                        health_host=health_host,
+                        health_port=pub_port,
+                        include_build=include_build,
+                        extra_volumes=["./.egress-token.candidate:/etc/mtveil/egress-token.candidate:ro"],
+                    ),
+                    encoding="utf-8",
+                )
+                print("Токен MTV2 подготовлен для проверки (рабочий том state пока не изменён).")
 
         cfg_check = run(
             cand_base + ["run", "--rm", "--no-deps", "mtveil", "--config", "/etc/mtveil/config.json", "--check-config"],
@@ -1059,9 +1087,13 @@ def main() -> int:
         )
         os.replace(cand_env, deploy_dir / ".env")
         os.replace(cand_config, deploy_dir / "config.json")
+        if pending_edge_token is not None:
+            (deploy_dir / "config.json").write_text(cfg_text, encoding="utf-8")
+            write_volume_secret_stdin(base, "/var/lib/mtveil/egress-token", pending_edge_token)
+            print("Токен MTV2 сохранён в томе state.")
         run(base + ["config", "--quiet"])
     finally:
-        for p in (cand_compose, cand_env, cand_config):
+        for p in (cand_compose, cand_env, cand_config, cand_token):
             if p.exists():
                 p.unlink()
 
@@ -1124,14 +1156,13 @@ def main() -> int:
             print("Прежние файлы конфигурации восстановлены.", file=sys.stderr)
 
     print(ok_text("Контейнер запущен"))
-    wait_healthy(base)
-    print(ok_text("Контейнер исправен"))
-
     try:
-        rel_dir = os.path.relpath(deploy_dir, repo_root).replace("\\", "/")
-    except ValueError:
-        rel_dir = str(deploy_dir)
-    compose_ref = f"--env-file {rel_dir}/.env -f {rel_dir}/compose.yaml"
+        wait_healthy(base)
+    except TimeoutError:
+        print(err_text("Контейнер не перешёл в статус healthy за 45 секунд."), file=sys.stderr)
+        print(f"Проверьте логи этой установки: docker compose {compose_ref} logs --tail=100 mtveil", file=sys.stderr)
+        return 1
+    print(ok_text("Контейнер исправен"))
 
     if role in ("direct", "edge"):
         link = run(
