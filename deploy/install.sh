@@ -137,6 +137,22 @@ if ! fetch_url "$SETUP_URL" "${MTEVIL_DIR}/setup.py"; then
   echo "Не удалось скачать setup.py для версии ${MTEVIL_VERSION} (${SETUP_URL})." >&2
   exit 1
 fi
+chmod +x "${MTEVIL_DIR}/setup.py" 2>/dev/null || true
+
+CTL_URL="${MTEVIL_RELEASE_BASE_URL}/${MTEVIL_VERSION}/mtevilctl"
+if fetch_url "$CTL_URL" "${MTEVIL_DIR}/mtevilctl" 2>/dev/null; then
+  chmod +x "${MTEVIL_DIR}/mtevilctl" 2>/dev/null || true
+  if [ -w "/usr/local/bin" ]; then
+    ln -sf -- "${MTEVIL_DIR}/mtevilctl" "/usr/local/bin/mtevilctl" 2>/dev/null || true
+  fi
+  if [ -n "${HOME:-}" ]; then
+    mkdir -p "$HOME/.local/bin" 2>/dev/null || true
+    ln -sf -- "${MTEVIL_DIR}/mtevilctl" "$HOME/.local/bin/mtevilctl" 2>/dev/null || true
+    if [ -d "$HOME/bin" ]; then
+      ln -sf -- "${MTEVIL_DIR}/mtevilctl" "$HOME/bin/mtevilctl" 2>/dev/null || true
+    fi
+  fi
+fi
 
 echo "Загрузка Docker-образа ${MTEVIL_IMAGE}..."
 if ! docker pull "$MTEVIL_IMAGE"; then

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Unit and container tests for deploy/setup.py DNS and HTTPS-cover checks."""
+import contextlib
 import importlib.util
 import io
 from pathlib import Path
@@ -683,6 +684,252 @@ class SetupValidationTests(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_traffic_snapshot_rendering_and_unavailable_metrics(self):
+        # 1. When runtime stats are unavailable, all metrics render as "нет данных".
+        out_none = setup.render_traffic_snapshot("edge", None, None)
+        self.assertIn("клиент -> edge", out_none)
+        self.assertIn("edge -> egress", out_none)
+        self.assertIn("нет данных", out_none)
+        self.assertNotIn("%", out_none)
+
+        # 2. On edge, distinguish client -> edge from edge -> egress and never show retransmissions as packet-loss %.
+        sample_stats = {
+            "role": "edge",
+            "started_unix_ms": 1700000000000,
+            "ts_unix_ms": 1700000065000,
+            "uptime_ms": 65000,
+            "active_sessions": 3,
+            "completed_sessions": 12,
+            "failed_sessions": 2,
+            "downstream_rx_bytes": 2048,
+            "downstream_tx_bytes": 4096,
+            "upstream_tx_bytes": 1536,
+            "upstream_rx_bytes": 3584,
+            "downstream_retrans_segs": 4,
+            "upstream_retrans_segs": 1,
+            "retrans_supported": True,
+        }
+        out_edge = setup.render_traffic_snapshot("edge", sample_stats, None)
+        self.assertIn("только сокеты процесса mtevil", out_edge)
+        self.assertIn("клиент -> edge", out_edge)
+        self.assertIn("edge -> клиент", out_edge)
+        self.assertIn("edge -> egress", out_edge)
+        self.assertIn("egress -> edge", out_edge)
+        self.assertIn("Активные сессии:   3", out_edge)
+        self.assertIn("14 (успешно: 12, с ошибкой: 2)", out_edge)
+        self.assertIn("4 сегм.", out_edge)
+        self.assertIn("1 сегм.", out_edge)
+        self.assertNotIn("%", out_edge)
+
+        # 3. When retrans_supported is False, retransmissions show "нет данных".
+        sample_no_retrans = dict(sample_stats, retrans_supported=False, downstream_retrans_segs=None, upstream_retrans_segs=None)
+        out_no_ret = setup.render_traffic_snapshot("direct", sample_no_retrans, None)
+        self.assertIn("Ретрансмиссии TCP (прокси -> клиент): нет данных", out_no_ret)
+        self.assertIn("Ретрансмиссии TCP (прокси -> Telegram DC): нет данных", out_no_ret)
+
+    def test_mtevilctl_status_update_rollback_and_traffic_commands(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: ${MTEVIL_IMAGE}\n", encoding="utf-8")
+            (d / ".env").write_text(
+                "MTEVIL_PROJECT=mtevil-direct\n"
+                "MTEVIL_IMAGE=ghcr.io/rsnest/mtevil:v0.1.0-alpha.5\n"
+                "MTEVIL_BIND=0.0.0.0\n"
+                "MTEVIL_PORT=24443\n"
+                "MTEVIL_PUBLIC_HOST=198.51.100.10\n",
+                encoding="utf-8",
+            )
+            (d / "config.json").write_text(
+                setup.json.dumps({"role": "direct", "listen": "0.0.0.0:24443", "sni": "example.com"}) + "\n",
+                encoding="utf-8",
+            )
+
+            current_img = {"version": "v0.1.0-alpha.5", "id": "sha256:aaaa5555", "fail_healthy": False}
+            pulled_images: list[str] = []
+            tagged_images: list[tuple[str, str]] = []
+            recreated_count = {"n": 0}
+
+            def fake_run(argv, **kwargs):
+                cmd = " ".join(argv)
+                if "docker info" in cmd or "docker compose version" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, "ok", "")
+                if "ps -q" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, "cid123\n", "")
+                if argv[:2] == ["docker", "inspect"] and argv[2] == "cid123":
+                    health = "starting" if current_img["fail_healthy"] else "healthy"
+                    info = [{
+                        "Image": current_img["id"],
+                        "State": {
+                            "Running": True,
+                            "Status": "running",
+                            "StartedAt": "2026-11-20T00:00:00Z",
+                            "Health": {"Status": health},
+                        },
+                    }]
+                    return subprocess.CompletedProcess(argv, 0, setup.json.dumps(info), "")
+                if argv[:3] == ["docker", "image", "inspect"]:
+                    target = argv[3]
+                    if target in (current_img["id"], "ghcr.io/rsnest/mtevil:v0.1.0-alpha.5", "mtevil:rollback-mtevil-direct"):
+                        ver = "v0.1.0-alpha.5" if "5555" in target or "alpha.5" in target or "rollback" in target else current_img["version"]
+                        img_id = "sha256:aaaa5555" if ver == "v0.1.0-alpha.5" else "sha256:bbbb6666"
+                        info = [{
+                            "Id": img_id,
+                            "RepoDigests": [f"ghcr.io/rsnest/mtevil@{img_id}"],
+                            "Config": {"Labels": {"org.opencontainers.image.version": ver}},
+                        }]
+                        return subprocess.CompletedProcess(argv, 0, setup.json.dumps(info), "")
+                    if "alpha.6" in target or target == "sha256:bbbb6666":
+                        info = [{
+                            "Id": "sha256:bbbb6666",
+                            "RepoDigests": ["ghcr.io/rsnest/mtevil@sha256:bbbb6666"],
+                            "Config": {"Labels": {"org.opencontainers.image.version": "v0.1.0-alpha.6"}},
+                        }]
+                        return subprocess.CompletedProcess(argv, 0, setup.json.dumps(info), "")
+                    if "alpha.7" in target:
+                        info = [{
+                            "Id": "sha256:cccc7777",
+                            "RepoDigests": ["ghcr.io/rsnest/mtevil@sha256:cccc7777"],
+                            "Config": {"Labels": {"org.opencontainers.image.version": "v0.1.0-alpha.7"}},
+                        }]
+                        return subprocess.CompletedProcess(argv, 0, setup.json.dumps(info), "")
+                    return subprocess.CompletedProcess(argv, 1, "", "not found")
+                if argv[:2] == ["docker", "pull"]:
+                    pulled_images.append(argv[2])
+                    return subprocess.CompletedProcess(argv, 0, "pulled", "")
+                if argv[:3] == ["docker", "image", "tag"]:
+                    tagged_images.append((argv[3], argv[4]))
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                if "--check-config" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, "configuration valid\n", "")
+                if "up -d" in cmd:
+                    recreated_count["n"] += 1
+                    env_txt = (d / ".env").read_text(encoding="utf-8")
+                    if "alpha.6" in env_txt:
+                        current_img["version"] = "v0.1.0-alpha.6"
+                        current_img["id"] = "sha256:bbbb6666"
+                    elif "alpha.7" in env_txt:
+                        current_img["version"] = "v0.1.0-alpha.7"
+                        current_img["id"] = "sha256:cccc7777"
+                        current_img["fail_healthy"] = True
+                    elif "rollback" in env_txt or "alpha.5" in env_txt:
+                        current_img["version"] = "v0.1.0-alpha.5"
+                        current_img["id"] = "sha256:aaaa5555"
+                        current_img["fail_healthy"] = False
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                if "/var/lib/mtevil/runtime-stats.json" in cmd:
+                    stats_json = setup.json.dumps({
+                        "role": "direct",
+                        "started_unix_ms": 1700000000000,
+                        "ts_unix_ms": 1700000030000,
+                        "uptime_ms": 30000,
+                        "active_sessions": 2,
+                        "completed_sessions": 5,
+                        "failed_sessions": 0,
+                        "downstream_rx_bytes": 10240,
+                        "downstream_tx_bytes": 20480,
+                        "upstream_tx_bytes": 9800,
+                        "upstream_rx_bytes": 19900,
+                        "downstream_retrans_segs": 0,
+                        "upstream_retrans_segs": 0,
+                        "retrans_supported": True,
+                    })
+                    return subprocess.CompletedProcess(argv, 0, stats_json, "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            fake_releases = [
+                {
+                    "tag_name": "v0.1.0-alpha.6",
+                    "draft": False,
+                    "assets": [
+                        {"name": "install.sh", "state": "uploaded", "browser_download_url": "https://example.invalid/install.sh"},
+                        {"name": "setup.py", "state": "uploaded", "browser_download_url": "https://example.invalid/setup.py"},
+                    ],
+                }
+            ]
+
+            with (
+                mock.patch.object(setup, "run", side_effect=fake_run),
+                mock.patch.object(setup, "fetch_json_url", return_value=fake_releases),
+                mock.patch.dict(setup.os.environ, {"MTEVIL_SKIP_ASSET_DOWNLOAD": "1"}),
+            ):
+                # 1. Update from alpha.5 -> alpha.6 succeeds and saves alpha.5 rollback snapshot.
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = setup.main(["update", "--dir", str(d)])
+                self.assertEqual(rc, 0)
+                self.assertIn("v0.1.0-alpha.5 -> v0.1.0-alpha.6", buf.getvalue())
+                self.assertTrue((d / "rollback.json").is_file())
+                rb_meta = setup.json.loads((d / "rollback.json").read_text(encoding="utf-8"))
+                self.assertEqual(rb_meta["version"], "v0.1.0-alpha.5")
+                self.assertEqual(recreated_count["n"], 1)
+
+                # 2. Running update again when already on alpha.6 skips restart and preserves alpha.5 rollback!
+                buf2 = io.StringIO()
+                with contextlib.redirect_stdout(buf2):
+                    rc2 = setup.main(["update", "--dir", str(d)])
+                self.assertEqual(rc2, 0)
+                self.assertIn("Уже установлена актуальная версия v0.1.0-alpha.6", buf2.getvalue())
+                self.assertEqual(recreated_count["n"], 1)
+                rb_meta_after = setup.json.loads((d / "rollback.json").read_text(encoding="utf-8"))
+                self.assertEqual(rb_meta_after["version"], "v0.1.0-alpha.5")
+
+                # 3. Status shows running version v0.1.0-alpha.6, healthy, and rollback v0.1.0-alpha.5.
+                buf_st = io.StringIO()
+                with contextlib.redirect_stdout(buf_st):
+                    rc_st = setup.main(["status", "--dir", str(d)])
+                self.assertEqual(rc_st, 0)
+                st_out = buf_st.getvalue()
+                self.assertIn("v0.1.0-alpha.6", st_out)
+                self.assertIn("healthy", st_out)
+                self.assertIn("v0.1.0-alpha.5", st_out)
+
+                # 4. Traffic and traf --live (2 iterations) show labeled metrics.
+                buf_tr = io.StringIO()
+                with contextlib.redirect_stdout(buf_tr):
+                    rc_tr = setup.main(["traffic", "--dir", str(d)])
+                self.assertEqual(rc_tr, 0)
+                self.assertIn("Активные сессии:   2", buf_tr.getvalue())
+                self.assertIn("клиент -> прокси", buf_tr.getvalue())
+
+                buf_live = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(buf_live),
+                    mock.patch.object(setup.time, "sleep", return_value=None),
+                ):
+                    rc_live = setup.main(["traf", "--live", "--iterations", "2", "--dir", str(d)])
+                self.assertEqual(rc_live, 0)
+                self.assertIn("Динамика за последнюю секунду", buf_live.getvalue())
+
+                # 5. Rollback restores v0.1.0-alpha.5 offline without calling fetch_json_url or docker pull.
+                pulls_before = len(pulled_images)
+                buf_rb = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(buf_rb),
+                    mock.patch.object(setup, "fetch_json_url", side_effect=AssertionError("rollback must be offline")),
+                ):
+                    rc_rb = setup.main(["rollback", "--dir", str(d)])
+                self.assertEqual(rc_rb, 0)
+                self.assertEqual(len(pulled_images), pulls_before)
+                self.assertIn("Откат выполнен: работает версия v0.1.0-alpha.5", buf_rb.getvalue())
+                self.assertEqual(current_img["version"], "v0.1.0-alpha.5")
+
+                # 6. Failed update (alpha.7 fails wait_healthy) automatically rolls back to alpha.5!
+                def fail_wait_healthy(_base, timeout_s=45):
+                    if current_img["fail_healthy"]:
+                        raise TimeoutError("not healthy")
+
+                buf_fail = io.StringIO()
+                err_fail = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(buf_fail),
+                    contextlib.redirect_stderr(err_fail),
+                    mock.patch.object(setup, "wait_healthy", side_effect=fail_wait_healthy),
+                ):
+                    rc_fail = setup.main(["update", "--version", "v0.1.0-alpha.7", "--dir", str(d)])
+                self.assertEqual(rc_fail, 1)
+                self.assertIn("Автоматический возврат предыдущей рабочей версии", err_fail.getvalue())
+                self.assertEqual(current_img["version"], "v0.1.0-alpha.5")
 
 
 if __name__ == "__main__":

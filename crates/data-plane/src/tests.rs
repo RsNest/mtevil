@@ -78,7 +78,7 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         flight_shaping: false,
         client_mss_bulk: None,
         replay: Mutex::new(ReplayCache::new(65536, Duration::from_secs(300))),
-        counters: telemetry::Counters::default(),
+        counters: Arc::new(telemetry::Counters::default()),
     })
 }
 
@@ -1465,5 +1465,106 @@ async fn ordered_egress_cooldown_8_parallel_skip_primary_and_single_probe_recove
 
     primary_task.abort();
     backup_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_stats_file_tracks_edge_and_egress_byte_counters() -> Result<()> {
+    let cover = cover_mock().await?;
+    let dc = TcpListener::bind("127.0.0.1:0").await?;
+    let dc_addr = dc.local_addr()?;
+    let token = [0x77u8; 16];
+
+    let egress_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let egress_addr = egress_listener.local_addr()?;
+    let egress_counters = Arc::new(telemetry::Counters::default());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let egress_task = tokio::spawn(serve_egress(
+        egress_listener,
+        Arc::new(HashMap::from([(2, dc_addr)])),
+        token,
+        8,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        Duration::from_millis(50),
+        egress_counters.clone(),
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let mut edge_state = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut edge_state).context("unique state")?;
+        sm.dcs.clear();
+        sm.egress_upstreams = vec![egress_addr];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_token = token;
+        sm.handshake = Duration::from_secs(1);
+    }
+
+    let dc_task = tokio::spawn(async move {
+        let (mut peer, _) = dc.accept().await?;
+        let mut header = [0u8; 64];
+        peer.read_exact(&mut header).await?;
+        let mut decode = AesCtr::new_from_slices(&header[8..40], &header[40..56])?;
+        let mut plain = header;
+        wire::crypt(&mut decode, &mut plain);
+        let mut payload = vec![0; CLIENT_PAYLOAD.len()];
+        peer.read_exact(&mut payload).await?;
+        wire::crypt(&mut decode, &mut payload);
+        assert_eq!(payload, CLIENT_PAYLOAD);
+        let reversed: Vec<_> = header[8..56].iter().rev().copied().collect();
+        let mut encode = AesCtr::new_from_slices(&reversed[..32], &reversed[32..])?;
+        let mut reply = DC_REPLY.to_vec();
+        wire::crypt(&mut encode, &mut reply);
+        peer.write_all(&reply).await?;
+        peer.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let (mut client, task) = proxy(edge_state.clone()).await?;
+    let raw = hello()?;
+    client.write_all(&raw).await?;
+    flight(&mut client, &raw).await?;
+    let mut bytes = fixture("init")?;
+    bytes.extend_from_slice(&fixture("payload")?);
+    client.write_all(&wire::record(0x17, &bytes)?).await?;
+    client.shutdown().await?;
+    let mut reply = Vec::new();
+    while reply.len() < DC_REPLY.len() {
+        let (kind, part) = read_record(&mut client).await?;
+        assert_eq!(kind, 0x17);
+        reply.extend_from_slice(&part);
+    }
+    assert_eq!(reply, fixture("reply")?);
+    timeout(Duration::from_secs(2), task).await???;
+    timeout(Duration::from_secs(2), dc_task).await???;
+
+    let edge_snap = edge_state.counters.snapshot_json("edge");
+    assert_eq!(edge_snap["completed_sessions"].as_u64(), Some(1));
+    assert_eq!(edge_snap["failed_sessions"].as_u64(), Some(0));
+    assert!(edge_snap["downstream_rx_bytes"].as_u64().unwrap_or(0) > (raw.len() + bytes.len()) as u64);
+    assert!(edge_snap["downstream_tx_bytes"].as_u64().unwrap_or(0) > DC_REPLY.len() as u64);
+    assert_eq!(
+        edge_snap["upstream_tx_bytes"].as_u64(),
+        Some((88 + CLIENT_PAYLOAD.len()) as u64)
+    );
+    assert_eq!(
+        edge_snap["upstream_rx_bytes"].as_u64(),
+        Some((1 + DC_REPLY.len()) as u64)
+    );
+
+    let dir = std::env::temp_dir().join(format!("mtevil-stats-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let stats_file = dir.join("runtime-stats.json");
+    write_runtime_stats_atomic(&stats_file, &edge_state.counters, "edge")?;
+    let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&stats_file)?)?;
+    assert_eq!(parsed["role"].as_str(), Some("edge"));
+    assert_eq!(parsed["upstream_tx_bytes"].as_u64(), Some((88 + CLIENT_PAYLOAD.len()) as u64));
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = shutdown_tx.send(());
+    timeout(Duration::from_secs(2), egress_task).await???;
     Ok(())
 }

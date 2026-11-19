@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+resolve_self_dir() {
+  local src="${BASH_SOURCE[0]}"
+  while [ -L "$src" ]; do
+    local dir
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+SELF_DIR="$(resolve_self_dir)"
+
+if [[ -z "${MTEVIL_DIR:-${MTVEIL_DIR:-}}" ]]; then
+  if [[ -f "${SELF_DIR}/compose.yaml" && -f "${SELF_DIR}/config.json" ]]; then
+    MTEVIL_DIR="$SELF_DIR"
+  elif [[ -f "$HOME/mtevil/compose.yaml" ]]; then
+    MTEVIL_DIR="$HOME/mtevil"
+  elif [[ -f "$HOME/mtveil/compose.yaml" ]]; then
+    MTEVIL_DIR="$HOME/mtveil"
+  else
+    MTEVIL_DIR="$HOME/mtevil"
+  fi
+else
+  MTEVIL_DIR="${MTEVIL_DIR:-${MTVEIL_DIR}}"
+fi
+
+print_help() {
+  cat <<'EOF'
+Управление установкой mtevil (mtevilctl)
+
+Команды:
+  mtevilctl status            Показать текущую версию, роль, состояние контейнера, время работы и версию для отката
+  mtevilctl update            Обновить контейнер до свежего релиза без повторного запуска мастера (с сохранением настроек и секретов)
+  mtevilctl rollback          Вернуть предыдущую рабочую версию и конфигурацию локально (без интернета)
+  mtevilctl traffic           Показать активные сессии, принятые/отправленные байты по участкам и период счётчиков
+  mtevilctl traffic --live    Обновлять статистику каждую секунду (скорость приёма/отдачи, отключения, ретрансмиссии TCP; выход по Ctrl+C)
+  mtevilctl traf [--live]     Короткий псевдоним для команды traffic
+  mtevilctl --help            Показать эту справку
+
+Примеры использования:
+  mtevilctl status
+  mtevilctl update
+  mtevilctl rollback
+  mtevilctl traffic
+  mtevilctl traf --live
+  MTEVIL_DIR=~/mtevil-edge mtevilctl status
+
+Переменные окружения:
+  MTEVIL_DIR      Каталог установки (по умолчанию ~/mtevil)
+  MTEVIL_VERSION  Целевая версия для update (по умолчанию выбирается свежий опубликованный релиз)
+EOF
+}
+
+CMD="${1:-}"
+case "$CMD" in
+  -h|--help|help)
+    print_help
+    exit 0
+    ;;
+  "")
+    print_help
+    exit 1
+    ;;
+  status|update|rollback|traffic|traf)
+    shift
+    for arg in "$@"; do
+      if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+        print_help
+        exit 0
+      fi
+    done
+    SETUP_PY="${MTEVIL_DIR}/setup.py"
+    if [[ ! -f "$SETUP_PY" && -f "${SELF_DIR}/setup.py" ]]; then
+      SETUP_PY="${SELF_DIR}/setup.py"
+    fi
+    if [[ ! -f "$SETUP_PY" ]]; then
+      echo "Ошибка: не найден файл ${SETUP_PY}." >&2
+      echo "Укажите каталог установки через MTEVIL_DIR или выполните первичную установку." >&2
+      exit 1
+    fi
+    exec python3 "$SETUP_PY" "$CMD" --dir "$MTEVIL_DIR" "$@"
+    ;;
+  *)
+    echo "Неизвестная команда: $CMD" >&2
+    echo "Используйте 'mtevilctl --help' для просмотра списка команд." >&2
+    exit 1
+    ;;
+esac

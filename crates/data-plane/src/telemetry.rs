@@ -15,6 +15,68 @@ pub struct Counters {
     pub active: AtomicU64,
     pub completed: AtomicU64,
     pub failed: AtomicU64,
+    pub downstream_rx_bytes: AtomicU64,
+    pub downstream_tx_bytes: AtomicU64,
+    pub upstream_rx_bytes: AtomicU64,
+    pub upstream_tx_bytes: AtomicU64,
+    pub downstream_retrans_segs: AtomicU64,
+    pub upstream_retrans_segs: AtomicU64,
+    pub started_unix_ms: AtomicU64,
+}
+
+impl Counters {
+    pub fn ensure_started(&self) -> u64 {
+        let cur = self.started_unix_ms.load(Ordering::Relaxed);
+        if cur != 0 {
+            return cur;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(1);
+        match self.started_unix_ms.compare_exchange(
+            0,
+            now,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => now,
+            Err(existing) => existing,
+        }
+    }
+
+    pub fn snapshot_json(&self, role: &str) -> Value {
+        let started_unix_ms = self.ensure_started();
+        let now_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(started_unix_ms);
+        let retrans_supported = cfg!(target_os = "linux");
+        json!({
+            "role": role,
+            "started_unix_ms": started_unix_ms,
+            "ts_unix_ms": now_unix_ms,
+            "uptime_ms": now_unix_ms.saturating_sub(started_unix_ms),
+            "active_sessions": self.active.load(Ordering::Relaxed),
+            "completed_sessions": self.completed.load(Ordering::Relaxed),
+            "failed_sessions": self.failed.load(Ordering::Relaxed),
+            "downstream_rx_bytes": self.downstream_rx_bytes.load(Ordering::Relaxed),
+            "downstream_tx_bytes": self.downstream_tx_bytes.load(Ordering::Relaxed),
+            "upstream_rx_bytes": self.upstream_rx_bytes.load(Ordering::Relaxed),
+            "upstream_tx_bytes": self.upstream_tx_bytes.load(Ordering::Relaxed),
+            "downstream_retrans_segs": if retrans_supported {
+                Value::from(self.downstream_retrans_segs.load(Ordering::Relaxed))
+            } else {
+                Value::Null
+            },
+            "upstream_retrans_segs": if retrans_supported {
+                Value::from(self.upstream_retrans_segs.load(Ordering::Relaxed))
+            } else {
+                Value::Null
+            },
+            "retrans_supported": retrans_supported,
+        })
+    }
 }
 
 pub fn event(name: &str, session: u64, fields: Value) {

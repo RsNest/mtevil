@@ -144,6 +144,11 @@ enum Action {
         #[arg(long, default_value_t = 2)]
         dc: i16,
     },
+    /// Print runtime traffic and session counters from the state volume as JSON.
+    Stats {
+        #[arg(long, default_value = RUNTIME_STATS_DEFAULT_PATH)]
+        stats_file: PathBuf,
+    },
 }
 
 impl Args {
@@ -344,7 +349,7 @@ struct State {
     flight_shaping: bool,
     client_mss_bulk: Option<u16>,
     replay: Mutex<ReplayCache>,
-    counters: telemetry::Counters,
+    counters: Arc<telemetry::Counters>,
 }
 
 impl State {
@@ -398,6 +403,155 @@ fn spawn_users_reloader(
             }
             state.reload_secrets(&cfg);
         }
+    })
+}
+
+const RUNTIME_STATS_DEFAULT_PATH: &str = "/var/lib/mtevil/runtime-stats.json";
+
+// Query TCP_INFO on Linux to measure TCP retransmissions on mtevil's own sockets only,
+// excluding unrelated VPS traffic even when running with network_mode: host.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn sample_fd_retrans(fd: Option<std::os::fd::RawFd>, prev: &mut u32, acc: &std::sync::atomic::AtomicU64) {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(raw_fd) = fd else {
+            return;
+        };
+        #[repr(C)]
+        #[derive(Default)]
+        struct LinuxTcpInfoPrefix {
+            tcpi_state: u8,
+            tcpi_ca_state: u8,
+            tcpi_retransmits: u8,
+            tcpi_probes: u8,
+            tcpi_backoff: u8,
+            tcpi_options: u8,
+            tcpi_snd_rcv_wscale: u8,
+            tcpi_delivery_rate_app_limited: u8,
+            tcpi_rto: u32,
+            tcpi_ato: u32,
+            tcpi_snd_mss: u32,
+            tcpi_rcv_mss: u32,
+            tcpi_unacked: u32,
+            tcpi_sacked: u32,
+            tcpi_lost: u32,
+            tcpi_retrans: u32,
+            tcpi_fackets: u32,
+            tcpi_last_data_sent: u32,
+            tcpi_last_ack_sent: u32,
+            tcpi_last_data_recv: u32,
+            tcpi_last_ack_recv: u32,
+            tcpi_pmtu: u32,
+            tcpi_rcv_ssthresh: u32,
+            tcpi_rtt: u32,
+            tcpi_rttvar: u32,
+            tcpi_snd_ssthresh: u32,
+            tcpi_snd_cwnd: u32,
+            tcpi_advmss: u32,
+            tcpi_reordering: u32,
+            tcpi_rcv_rtt: u32,
+            tcpi_rcv_space: u32,
+            tcpi_total_retrans: u32,
+        }
+        extern "C" {
+            fn getsockopt(
+                sockfd: i32,
+                level: i32,
+                optname: i32,
+                optval: *mut std::ffi::c_void,
+                optlen: *mut u32,
+            ) -> i32;
+        }
+        const IPPROTO_TCP: i32 = 6;
+        const TCP_INFO: i32 = 11;
+        let mut info = LinuxTcpInfoPrefix::default();
+        let mut len = std::mem::size_of::<LinuxTcpInfoPrefix>() as u32;
+        let rc = unsafe {
+            getsockopt(
+                raw_fd,
+                IPPROTO_TCP,
+                TCP_INFO,
+                (&mut info as *mut LinuxTcpInfoPrefix).cast::<std::ffi::c_void>(),
+                &mut len,
+            )
+        };
+        if rc == 0 && (len as usize) >= std::mem::size_of::<LinuxTcpInfoPrefix>() {
+            let cur = info.tcpi_total_retrans;
+            if cur >= *prev {
+                let delta = cur - *prev;
+                if delta > 0 {
+                    acc.fetch_add(u64::from(delta), std::sync::atomic::Ordering::Relaxed);
+                }
+                *prev = cur;
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, prev, acc);
+    }
+}
+
+#[cfg(not(unix))]
+fn sample_fd_retrans(_fd: Option<i32>, _prev: &mut u32, _acc: &std::sync::atomic::AtomicU64) {}
+
+#[cfg(unix)]
+fn stream_raw_fd(stream: &TcpStream) -> Option<std::os::fd::RawFd> {
+    use std::os::fd::{AsFd, AsRawFd};
+    Some(stream.as_fd().as_raw_fd())
+}
+
+#[cfg(not(unix))]
+fn stream_raw_fd(_stream: &TcpStream) -> Option<i32> {
+    None
+}
+
+fn write_runtime_stats_atomic(
+    path: &std::path::Path,
+    counters: &telemetry::Counters,
+    role: &str,
+) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Ok(());
+        }
+    }
+    let val = counters.snapshot_json(role);
+    let encoded = serde_json::to_string(&val)?;
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    f.write_all(encoded.as_bytes())?;
+    f.write_all(b"\n")?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn spawn_stats_writer(
+    counters: Arc<telemetry::Counters>,
+    role: &'static str,
+    path: PathBuf,
+    period: Duration,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    counters.ensure_started();
+    let _ = write_runtime_stats_atomic(&path, &counters, role);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = &mut stop_rx => break,
+            }
+            let _ = write_runtime_stats_atomic(&path, &counters, role);
+        }
+        let _ = write_runtime_stats_atomic(&path, &counters, role);
     })
 }
 
@@ -670,12 +824,31 @@ async fn main() -> Result<()> {
                 ensure!(all_ok, "one or more egress checks failed");
                 return Ok(());
             }
+            Action::Stats { stats_file } => {
+                let text = std::fs::read_to_string(&stats_file)
+                    .with_context(|| format!("reading runtime stats file {}", stats_file.display()))?;
+                let val: serde_json::Value = serde_json::from_str(&text)
+                    .with_context(|| format!("parsing runtime stats file {}", stats_file.display()))?;
+                println!("{}", serde_json::to_string_pretty(&val)?);
+                return Ok(());
+            }
         }
     }
     let check_config = args.check_config;
     let config = args.runtime_config()?;
     let dcs = config.datacenters().unwrap_or_default();
     let egress_token = config.egress_token()?;
+    let stats_path = std::env::var_os("MTEVIL_STATS_FILE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            config
+                .replay_file
+                .as_ref()
+                .or(config.secret_file.as_ref())
+                .or(config.egress_token_file.as_ref())
+                .and_then(|p| p.parent().map(|dir| dir.join("runtime-stats.json")))
+        })
+        .unwrap_or_else(|| PathBuf::from(RUNTIME_STATS_DEFAULT_PATH));
     if config.role == Role::Egress {
         if check_config {
             println!("configuration valid");
@@ -695,10 +868,19 @@ async fn main() -> Result<()> {
             }),
         );
         let counters = Arc::new(telemetry::Counters::default());
+        counters.ensure_started();
+        let (stats_stop_tx, stats_stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let stats_task = spawn_stats_writer(
+            counters.clone(),
+            "egress",
+            stats_path,
+            Duration::from_millis(500),
+            stats_stop_rx,
+        );
         #[cfg(unix)]
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        return serve_egress(
+        let res = serve_egress(
             listener,
             Arc::new(dcs),
             egress_token,
@@ -718,6 +900,9 @@ async fn main() -> Result<()> {
             },
         )
         .await;
+        let _ = stats_stop_tx.send(());
+        let _ = stats_task.await;
+        return res;
     }
     let secrets = config.secrets()?;
     if check_config {
@@ -734,6 +919,8 @@ async fn main() -> Result<()> {
     let persistent_replay = config.replay_file.is_some();
     let reload_config = config.users_file.is_some().then(|| config.clone());
     let egress_count = config.egress_upstreams.len();
+    let counters = Arc::new(telemetry::Counters::default());
+    counters.ensure_started();
     let state = Arc::new(State {
         secrets: std::sync::RwLock::new(Arc::new(secrets)),
         sni: config.sni,
@@ -759,15 +946,28 @@ async fn main() -> Result<()> {
         flight_shaping: config.flight_shaping,
         client_mss_bulk: config.client_mss_bulk,
         replay: Mutex::new(replay),
-        counters: telemetry::Counters::default(),
+        counters,
     });
+    let role_str: &'static str = if state.egress_upstreams.is_empty() {
+        "direct"
+    } else {
+        "edge"
+    };
+    let (stats_stop_tx, stats_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let stats_task = spawn_stats_writer(
+        state.counters.clone(),
+        role_str,
+        stats_path,
+        Duration::from_millis(500),
+        stats_stop_rx,
+    );
     let listener = bind_listener(config.listen, config.client_mss)?;
     telemetry::event(
         "startup",
         0,
         json!({
             "version":BUILD_VERSION,
-            "role": if state.egress_upstreams.is_empty() { "direct" } else { "edge" },
+            "role": role_str,
             "listen":listener.local_addr()?.to_string(),
             "max_connections":config.max_connections,
             "max_cover_connections":max_cover_connections,
@@ -835,6 +1035,8 @@ async fn main() -> Result<()> {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await;
+    let _ = stats_stop_tx.send(());
+    let _ = stats_task.await;
     let _ = users_stop_tx.send(());
     if let Some(task) = users_task {
         let _ = task.await;
@@ -1076,6 +1278,12 @@ async fn connection_inner(client: &mut TcpStream, state: &State, session_id: u64
         read_hello(client, &mut raw).await.map(Some)
     })
     .await;
+    if !raw.is_empty() {
+        state
+            .counters
+            .downstream_rx_bytes
+            .fetch_add(raw.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
     if raw.is_empty() {
         telemetry::event(
             "empty_connection_closed",
@@ -1229,6 +1437,10 @@ async fn connection_inner(client: &mut TcpStream, state: &State, session_id: u64
     // INV-01: from the first write onwards every error only closes this path.
     // No cover call exists below this boundary, including partial-write failures.
     write_server_flight(client, &flight, state.flight_shaping, state.handshake).await?;
+    state
+        .counters
+        .downstream_tx_bytes
+        .fetch_add(flight.len() as u64, std::sync::atomic::Ordering::Relaxed);
     let flight_written_us = us();
     let mut tls = TlsReader::default();
     let mut frame = [0u8; 64];
@@ -1242,6 +1454,10 @@ async fn connection_inner(client: &mut TcpStream, state: &State, session_id: u64
         Ok::<_, anyhow::Error>(())
     })
     .await;
+    state
+        .counters
+        .downstream_rx_bytes
+        .fetch_add(tls.consumed, std::sync::atomic::Ordering::Relaxed);
     let failure = match &inner {
         Ok(Ok(())) => None,
         Ok(Err(error)) => Some(format!("{error:#}")),
@@ -1362,9 +1578,16 @@ async fn relay_client(
             "fake_tls_cert_bytes":diag.fake_tls_cert_bytes,
         }),
     );
+    let client_fd = stream_raw_fd(client);
+    let upstream_fd = stream_raw_fd(&upstream);
     let (cr, cw) = client.split();
     let (ur, uw) = upstream.into_split();
-    let relay = RelayStats::default();
+    let relay = RelayStats {
+        counters: Some(state.counters.clone()),
+        client_fd,
+        upstream_fd,
+        ..RelayStats::default()
+    };
     let relay_start_us = us();
     let result = relay_until_end(
         &relay,
@@ -1484,6 +1707,9 @@ struct RelayStats {
     first_dn_kind: std::sync::atomic::AtomicU64,
     first_up_frame_len: std::sync::atomic::AtomicU64,
     first_dn_frame_len: std::sync::atomic::AtomicU64,
+    counters: Option<Arc<telemetry::Counters>>,
+    client_fd: Option<i32>,
+    upstream_fd: Option<i32>,
 }
 
 impl Default for RelayStats {
@@ -1508,6 +1734,9 @@ impl Default for RelayStats {
             first_dn_kind: AtomicU64::new(0),
             first_up_frame_len: AtomicU64::new(0),
             first_dn_frame_len: AtomicU64::new(0),
+            counters: None,
+            client_fd: None,
+            upstream_fd: None,
         }
     }
 }
@@ -1745,11 +1974,19 @@ async fn upload<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let mut buf = [0u8; wire::MAX_RECORD];
     let mut prefix = [0u8; 28];
     let mut prefix_len = 0;
+    let mut prev_retrans = 0u32;
     loop {
+        let prev_consumed = tls.as_ref().map(|t| t.consumed).unwrap_or(0);
         let read = match &mut tls {
             Some(reader) => reader.read_into(&mut r, &mut buf).await,
             None => r.read(&mut buf).await.map_err(Into::into),
         };
+        if let (Some(reader), Some(counters)) = (&tls, &stats.counters) {
+            let delta = reader.consumed.saturating_sub(prev_consumed);
+            if delta > 0 {
+                counters.downstream_rx_bytes.fetch_add(delta, Relaxed);
+            }
+        }
         let n = match read {
             Ok(n) => n,
             Err(error) => {
@@ -1761,14 +1998,23 @@ async fn upload<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 return stats.failed(tag, error);
             }
         };
+        if tls.is_none() && n > 0 {
+            if let Some(counters) = &stats.counters {
+                counters.downstream_rx_bytes.fetch_add(n as u64, Relaxed);
+            }
+        }
         if n == 0 {
             let _ = stats.first_eof.compare_exchange(0, 1, Relaxed, Relaxed);
             stats.timeline.close("client_eof", "fin");
-            return match timeout(write_timeout, w.shutdown()).await {
+            let res = match timeout(write_timeout, w.shutdown()).await {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => stats.failed("dc_write_error", error.into()),
                 Err(error) => stats.failed("dc_write_idle", error.into()),
             };
+            if let Some(counters) = &stats.counters {
+                sample_fd_retrans(stats.upstream_fd, &mut prev_retrans, &counters.upstream_retrans_segs);
+            }
+            return res;
         }
         stats.client_reads.fetch_add(1, Relaxed);
         stats.record_activity();
@@ -1781,8 +2027,22 @@ async fn upload<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         wire::crypt(&mut encrypt, &mut buf[..n]);
         match timeout(write_timeout, w.write_all(&buf[..n])).await {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => return stats.failed("dc_write_error", error.into()),
-            Err(error) => return stats.failed("dc_write_idle", error.into()),
+            Ok(Err(error)) => {
+                if let Some(counters) = &stats.counters {
+                    sample_fd_retrans(stats.upstream_fd, &mut prev_retrans, &counters.upstream_retrans_segs);
+                }
+                return stats.failed("dc_write_error", error.into());
+            }
+            Err(error) => {
+                if let Some(counters) = &stats.counters {
+                    sample_fd_retrans(stats.upstream_fd, &mut prev_retrans, &counters.upstream_retrans_segs);
+                }
+                return stats.failed("dc_write_idle", error.into());
+            }
+        }
+        if let Some(counters) = &stats.counters {
+            counters.upstream_tx_bytes.fetch_add(n as u64, Relaxed);
+            sample_fd_retrans(stats.upstream_fd, &mut prev_retrans, &counters.upstream_retrans_segs);
         }
         stats.uploaded.fetch_add(n as u64, Relaxed);
         stats.dc_writes.fetch_add(1, Relaxed);
@@ -1803,6 +2063,7 @@ async fn download<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let mut buf = [0u8; wire::MAX_RECORD];
     let mut prefix = [0u8; 28];
     let mut prefix_len = 0;
+    let mut prev_retrans = 0u32;
     loop {
         let n = match r.read(&mut buf).await {
             Ok(n) => n,
@@ -1811,11 +2072,18 @@ async fn download<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         if n == 0 {
             let _ = stats.first_eof.compare_exchange(0, 2, Relaxed, Relaxed);
             stats.timeline.close("dc_eof", "fin");
-            return match timeout(write_timeout.min(DC_EOF_SHUTDOWN_TIMEOUT), w.shutdown()).await {
+            let res = match timeout(write_timeout.min(DC_EOF_SHUTDOWN_TIMEOUT), w.shutdown()).await {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => stats.failed("client_write_error", error.into()),
                 Err(error) => stats.failed("client_write_idle", error.into()),
             };
+            if let Some(counters) = &stats.counters {
+                sample_fd_retrans(stats.client_fd, &mut prev_retrans, &counters.downstream_retrans_segs);
+            }
+            return res;
+        }
+        if let Some(counters) = &stats.counters {
+            counters.upstream_rx_bytes.fetch_add(n as u64, Relaxed);
         }
         stats.dc_reads.fetch_add(1, Relaxed);
         stats.record_activity();
@@ -1848,8 +2116,22 @@ async fn download<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         };
         match timeout(write_timeout, w.write_all(bytes)).await {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => return stats.failed("client_write_error", error.into()),
-            Err(error) => return stats.failed("client_write_idle", error.into()),
+            Ok(Err(error)) => {
+                if let Some(counters) = &stats.counters {
+                    sample_fd_retrans(stats.client_fd, &mut prev_retrans, &counters.downstream_retrans_segs);
+                }
+                return stats.failed("client_write_error", error.into());
+            }
+            Err(error) => {
+                if let Some(counters) = &stats.counters {
+                    sample_fd_retrans(stats.client_fd, &mut prev_retrans, &counters.downstream_retrans_segs);
+                }
+                return stats.failed("client_write_idle", error.into());
+            }
+        }
+        if let Some(counters) = &stats.counters {
+            counters.downstream_tx_bytes.fetch_add(bytes.len() as u64, Relaxed);
+            sample_fd_retrans(stats.client_fd, &mut prev_retrans, &counters.downstream_retrans_segs);
         }
         stats.downloaded.fetch_add(n as u64, Relaxed);
         stats.client_writes.fetch_add(1, Relaxed);
@@ -1870,6 +2152,33 @@ async fn plain_copy<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             return Ok(());
         }
         timeout(idle, w.write_all(&buf[..n])).await??;
+    }
+}
+async fn counted_copy<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    mut r: R,
+    mut w: W,
+    idle: Duration,
+    rx_counter: &std::sync::atomic::AtomicU64,
+    tx_counter: &std::sync::atomic::AtomicU64,
+    write_fd: Option<i32>,
+    retrans_counter: &std::sync::atomic::AtomicU64,
+) -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut buf = [0; wire::MAX_RECORD];
+    let mut prev_retrans = 0u32;
+    loop {
+        let n = timeout(idle, r.read(&mut buf)).await??;
+        if n == 0 {
+            let res = timeout(idle, w.shutdown()).await;
+            sample_fd_retrans(write_fd, &mut prev_retrans, retrans_counter);
+            res??;
+            return Ok(());
+        }
+        rx_counter.fetch_add(n as u64, Relaxed);
+        let res = timeout(idle, w.write_all(&buf[..n])).await;
+        sample_fd_retrans(write_fd, &mut prev_retrans, retrans_counter);
+        res??;
+        tx_counter.fetch_add(n as u64, Relaxed);
     }
 }
 async fn bounded_cover(
@@ -2054,6 +2363,7 @@ async fn connect_upstream(
     dc_id: i16,
     dc_header: &[u8; 64],
 ) -> Result<(TcpStream, &'static str)> {
+    use std::sync::atomic::Ordering::Relaxed;
     if state.egress_upstreams.is_empty() {
         let address = state.dcs.get(&dc_id.abs()).context("DC not configured")?;
         let mut upstream = timeout(state.handshake, TcpStream::connect(address))
@@ -2062,14 +2372,16 @@ async fn connect_upstream(
             .context("dc_connect_failed")?;
         configure_tcp_socket(&upstream)?;
         timeout(state.handshake, upstream.write_all(dc_header)).await??;
+        state
+            .counters
+            .upstream_tx_bytes
+            .fetch_add(dc_header.len() as u64, Relaxed);
         return Ok((upstream, "direct"));
     }
     let count = state.egress_upstreams.len();
     let start = match state.egress_strategy {
         EgressStrategy::Ordered => 0,
-        EgressStrategy::RoundRobin => state
-            .egress_rr
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        EgressStrategy::RoundRobin => state.egress_rr.fetch_add(1, Relaxed),
     };
     let per_try = (state.handshake / (count as u32).max(1))
         .max(Duration::from_millis(150))
@@ -2107,11 +2419,19 @@ async fn connect_upstream(
                     .write_all(&preface)
                     .await
                     .map_err(|e| AttemptErr::Node(e.into()))?;
+                state
+                    .counters
+                    .upstream_tx_bytes
+                    .fetch_add(preface.len() as u64, Relaxed);
                 let mut ack = [0u8; 1];
                 upstream
                     .read_exact(&mut ack)
                     .await
                     .map_err(|e| AttemptErr::Node(e.into()))?;
+                state
+                    .counters
+                    .upstream_rx_bytes
+                    .fetch_add(ack.len() as u64, Relaxed);
                 if ack[0] == EGRESS_ACK_OK {
                     Ok(upstream)
                 } else if ack[0] == EGRESS_ACK_ERR {
@@ -2189,7 +2509,7 @@ async fn serve_egress(
         tasks.spawn(async move {
             let _permit = permit;
             let mut session = telemetry::Session::new(&counters);
-            let res = egress_connection(&mut edge, &dcs, &egress_token, handshake, idle).await;
+            let res = egress_connection(&mut edge, &dcs, &egress_token, handshake, idle, &counters).await;
             session.finish(&res);
         });
     }
@@ -2211,35 +2531,66 @@ async fn egress_connection(
     expected_token: &[u8; 16],
     handshake: Duration,
     idle: Duration,
+    counters: &telemetry::Counters,
 ) -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
     configure_tcp_socket(edge)?;
     let mut hdr = [0u8; 24];
     timeout(handshake, edge.read_exact(&mut hdr))
         .await
         .context("egress_header_timeout")?
         .context("egress_header_eof")?;
+    counters
+        .downstream_rx_bytes
+        .fetch_add(hdr.len() as u64, Relaxed);
     ensure!(hdr[..4] == EGRESS_MAGIC, "invalid egress magic");
     let token: [u8; 16] = hdr[8..24].try_into()?;
     ensure!(ct_eq_16(&token, expected_token), "egress token mismatch");
     let dc_id = i16::from_le_bytes([hdr[4], hdr[5]]).abs();
     let Some(addr) = dcs.get(&dc_id) else {
-        let _ = edge.write_all(&[EGRESS_ACK_ERR]).await;
+        if edge.write_all(&[EGRESS_ACK_ERR]).await.is_ok() {
+            counters.downstream_tx_bytes.fetch_add(1, Relaxed);
+        }
         let _ = edge.shutdown().await;
         bail!("DC not configured on egress");
     };
     let mut dc = match timeout(handshake, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
         _ => {
-            let _ = edge.write_all(&[EGRESS_ACK_ERR]).await;
+            if edge.write_all(&[EGRESS_ACK_ERR]).await.is_ok() {
+                counters.downstream_tx_bytes.fetch_add(1, Relaxed);
+            }
             let _ = edge.shutdown().await;
             bail!("dc_connect_failed");
         }
     };
     configure_tcp_socket(&dc)?;
     timeout(handshake, edge.write_all(&[EGRESS_ACK_OK])).await??;
+    counters.downstream_tx_bytes.fetch_add(1, Relaxed);
+    let edge_fd = stream_raw_fd(edge);
+    let dc_fd = stream_raw_fd(&dc);
     let (er, ew) = edge.split();
     let (dr, dw) = dc.split();
-    tokio::try_join!(plain_copy(er, dw, idle), plain_copy(dr, ew, idle))?;
+    tokio::try_join!(
+        counted_copy(
+            er,
+            dw,
+            idle,
+            &counters.downstream_rx_bytes,
+            &counters.upstream_tx_bytes,
+            dc_fd,
+            &counters.upstream_retrans_segs,
+        ),
+        counted_copy(
+            dr,
+            ew,
+            idle,
+            &counters.upstream_rx_bytes,
+            &counters.downstream_tx_bytes,
+            edge_fd,
+            &counters.downstream_retrans_segs,
+        ),
+    )?;
     Ok(())
 }
 

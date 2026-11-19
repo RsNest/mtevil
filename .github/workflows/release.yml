@@ -166,6 +166,7 @@ jobs:
           sed "s/MTEVIL_PINNED_VERSION=\"__AUTO__\"/MTEVIL_PINNED_VERSION=\"${tag}\"/" deploy/install.sh > dist/install.sh
           grep -q "MTEVIL_PINNED_VERSION=\"${tag}\"" dist/install.sh
           cp deploy/setup.py dist/setup.py
+          cp deploy/mtevilctl dist/mtevilctl
 
           prerelease_flag=""
           if [[ "${tag}" == *-* ]]; then
@@ -181,11 +182,14 @@ jobs:
             if ! printf '%s\n' "$assets" | grep -qx "setup.py"; then
               gh release upload "${tag}" dist/setup.py
             fi
+            if ! printf '%s\n' "$assets" | grep -qx "mtevilctl"; then
+              gh release upload "${tag}" dist/mtevilctl
+            fi
             if [ "${is_draft}" = "true" ]; then
               gh release edit "${tag}" --draft=false ${prerelease_flag}
             fi
           else
-            gh release create "${tag}" dist/install.sh dist/setup.py \
+            gh release create "${tag}" dist/install.sh dist/setup.py dist/mtevilctl \
               --target "${GITHUB_SHA}" \
               --title "${tag}" \
               --generate-notes \
@@ -198,5 +202,7 @@ jobs:
           trap 'rm -rf "$dl_dir"' EXIT
           curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${tag}/install.sh" -o "${dl_dir}/install.sh"
           curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${tag}/setup.py" -o "${dl_dir}/setup.py"
+          curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${tag}/mtevilctl" -o "${dl_dir}/mtevilctl"
           grep -q "MTEVIL_PINNED_VERSION=\"${tag}\"" "${dl_dir}/install.sh"
           cmp -s dist/setup.py "${dl_dir}/setup.py"
+          cmp -s dist/mtevilctl "${dl_dir}/mtevilctl"

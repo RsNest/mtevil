@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Interactive Docker Compose setup wizard for mtevil (Direct, Egress, Edge)."""
 import argparse
+import datetime
 import errno
 import getpass
 import ipaddress
@@ -9,10 +10,12 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
 import time
+import urllib.request
 
 DEFAULT_IMAGE = "mtevil:local"
 SEMVER_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:-(alpha|beta|rc)\.(\d+))?$")
@@ -798,8 +801,766 @@ def load_existing_defaults(deploy_dir: Path) -> dict[str, object]:
     return defaults
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Interactive Docker Compose wizard for mtevil")
+def default_deploy_dir(repo_root: Path) -> Path:
+    env_dir = os.environ.get("MTEVIL_DIR") or os.environ.get("MTVEIL_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
+    script_dir = Path(__file__).resolve().parent
+    if (script_dir / "compose.yaml").is_file() and (script_dir / "config.json").is_file():
+        return script_dir
+    home = Path.home()
+    if (home / "mtevil" / "compose.yaml").is_file():
+        return (home / "mtevil").resolve()
+    if (home / "mtveil" / "compose.yaml").is_file():
+        return (home / "mtveil").resolve()
+    return (repo_root / "deploy" / "wizard").resolve()
+
+
+def inspect_image_metadata(image_ref: str) -> tuple[str | None, str | None, str | None]:
+    """Return (image_id, repo_digest, version_label_or_tag) for a local Docker image or container image ID."""
+    if not image_ref:
+        return None, None, None
+    proc = run(["docker", "image", "inspect", image_ref], check=False)
+    if proc.returncode != 0:
+        return None, None, None
+    try:
+        info = json.loads(proc.stdout)[0]
+    except Exception:
+        return None, None, None
+    image_id = str(info.get("Id") or "").strip() or None
+    digests = info.get("RepoDigests") or []
+    repo_digest = str(digests[0]).strip() if digests else None
+    labels = (info.get("Config") or {}).get("Labels") or {}
+    version = str(labels.get("org.opencontainers.image.version") or "").strip() or None
+    if not version and ":" in image_ref and "@sha256:" not in image_ref:
+        tail = image_ref.rsplit(":", 1)[-1]
+        if parse_semver_tag(tail) is not None:
+            version = tail
+    if not version:
+        for tag in info.get("RepoTags") or []:
+            if isinstance(tag, str) and ":" in tag:
+                cand = tag.rsplit(":", 1)[-1]
+                if parse_semver_tag(cand) is not None:
+                    version = cand
+                    break
+    return image_id, repo_digest, version
+
+
+def inspect_current_deployment(deploy_dir: Path, project: str, configured_image: str) -> tuple[str | None, str | None, str | None]:
+    """Inspect the running container first (if any), falling back to the configured image in .env."""
+    base = compose_cmd(deploy_dir, project)
+    cid_proc = run(base + ["ps", "-q", compose_service(base)], check=False)
+    cid = cid_proc.stdout.strip() if cid_proc.returncode == 0 else ""
+    if cid:
+        c_proc = run(["docker", "inspect", cid], check=False)
+        if c_proc.returncode == 0:
+            try:
+                c_info = json.loads(c_proc.stdout)[0]
+                c_image_id = str(c_info.get("Image") or "").strip()
+                if c_image_id:
+                    img_id, digest, ver = inspect_image_metadata(c_image_id)
+                    if not ver and ":" in configured_image:
+                        cand = configured_image.rsplit(":", 1)[-1]
+                        if parse_semver_tag(cand) is not None:
+                            ver = cand
+                    return img_id or c_image_id, digest, ver
+            except Exception:
+                pass
+    return inspect_image_metadata(configured_image)
+
+
+def fetch_json_url(url: str) -> object:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "mtevilctl",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def download_url_atomic(url: str, dest: Path, mode: int | None = None) -> None:
+    tmp = dest.with_name(f".{dest.name}.tmp.{os.getpid()}")
+    req = urllib.request.Request(url, headers={"User-Agent": "mtevilctl"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = resp.read()
+        tmp.write_bytes(data)
+        if mode is not None:
+            try:
+                os.chmod(tmp, mode)
+            except OSError:
+                pass
+        os.replace(tmp, dest)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def set_env_image(env_text: str, new_image: str) -> str:
+    lines: list[str] = []
+    replaced = False
+    for line in env_text.splitlines():
+        if line.startswith("MTEVIL_IMAGE=") or line.startswith("MTVEIL_IMAGE="):
+            lines.append(f"MTEVIL_IMAGE={new_image}")
+            replaced = True
+        else:
+            lines.append(line)
+    if not replaced:
+        lines.append(f"MTEVIL_IMAGE={new_image}")
+    return "\n".join(lines) + "\n"
+
+
+def save_rollback_snapshot(
+    deploy_dir: Path,
+    project: str,
+    prev_version: str | None,
+    prev_image_ref: str,
+    prev_image_id: str | None,
+    prev_digest: str | None,
+) -> str:
+    rollback_tag = f"mtevil:rollback-{project}"
+    source_ref = prev_image_id or prev_image_ref
+    tag_proc = run(["docker", "image", "tag", source_ref, rollback_tag], check=False)
+    if tag_proc.returncode != 0 and prev_image_ref and source_ref != prev_image_ref:
+        tag_proc = run(["docker", "image", "tag", prev_image_ref, rollback_tag], check=False)
+    if tag_proc.returncode != 0:
+        detail = (tag_proc.stderr or tag_proc.stdout or "").strip()
+        raise RuntimeError(f"Не удалось сохранить локальный тег образа для отката ({rollback_tag}): {detail}")
+
+    for name in ("compose.yaml", ".env", "config.json"):
+        src = deploy_dir / name
+        if src.is_file():
+            shutil.copyfile(src, deploy_dir / f"{name}.rollback")
+
+    # Ensure .env.rollback points directly to the local rollback tag so rollback needs no internet.
+    env_rb = deploy_dir / ".env.rollback"
+    if env_rb.is_file():
+        env_rb.write_text(
+            set_env_image(env_rb.read_text(encoding="utf-8", errors="ignore"), rollback_tag),
+            encoding="utf-8",
+        )
+
+    meta = {
+        "project": project,
+        "version": prev_version or prev_image_ref,
+        "image": prev_image_ref,
+        "image_id": prev_image_id,
+        "repo_digest": prev_digest,
+        "local_tag": rollback_tag,
+        "saved_at": int(time.time()),
+    }
+    (deploy_dir / "rollback.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    return rollback_tag
+
+
+def perform_rollback(deploy_dir: Path, *, auto_from_failed_update: bool = False) -> int:
+    rb_meta_file = deploy_dir / "rollback.json"
+    if not rb_meta_file.is_file():
+        print(err_text(f"Снимок для отката не найден в {deploy_dir} (нет rollback.json)."), file=sys.stderr)
+        print("Дальше: откат доступен после хотя бы одного обновления через mtevilctl update.", file=sys.stderr)
+        return 1
+
+    for name in ("compose.yaml", ".env", "config.json"):
+        if not (deploy_dir / f"{name}.rollback").is_file():
+            print(err_text(f"Не найден файл снимка {name}.rollback в {deploy_dir}."), file=sys.stderr)
+            return 1
+
+    try:
+        meta = json.loads(rb_meta_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(err_text(f"Не удалось прочитать rollback.json: {exc}"), file=sys.stderr)
+        return 1
+
+    saved = load_existing_defaults(deploy_dir)
+    saved_cfg = saved.get("config") if isinstance(saved.get("config"), dict) else {}
+    role = str(saved_cfg.get("role") or "direct")
+    project = str(meta.get("project") or saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
+    cur_image_cfg = str(saved.get("MTEVIL_IMAGE") or "")
+    _, _, cur_version = inspect_current_deployment(deploy_dir, project, cur_image_cfg)
+
+    target_version = str(meta.get("version") or meta.get("image") or "previous")
+    local_tag = str(meta.get("local_tag") or f"mtevil:rollback-{project}")
+    image_id = str(meta.get("image_id") or "").strip()
+
+    # Verify the rollback image exists locally without touching the network.
+    chosen_image = local_tag
+    if run(["docker", "image", "inspect", local_tag], check=False).returncode != 0:
+        if image_id and run(["docker", "image", "inspect", image_id], check=False).returncode == 0:
+            run(["docker", "image", "tag", image_id, local_tag], check=False)
+            chosen_image = local_tag
+        else:
+            orig_img = str(meta.get("image") or "").strip()
+            if orig_img and run(["docker", "image", "inspect", orig_img], check=False).returncode == 0:
+                chosen_image = orig_img
+            else:
+                print(err_text(f"Локальный образ для отката ({local_tag}) не найден в кэше Docker."), file=sys.stderr)
+                return 1
+
+    if not auto_from_failed_update:
+        from_label = cur_version or cur_image_cfg or "текущая версия"
+        print(heading(f"Откат mtevil: {from_label} -> {target_version}"))
+
+    for name in ("compose.yaml", ".env", "config.json"):
+        shutil.copyfile(deploy_dir / f"{name}.rollback", deploy_dir / name)
+
+    env_path = deploy_dir / ".env"
+    env_path.write_text(
+        set_env_image(env_path.read_text(encoding="utf-8", errors="ignore"), chosen_image),
+        encoding="utf-8",
+    )
+
+    base = compose_cmd(deploy_dir, project)
+    up_proc = run(base + ["up", "-d", "--no-build", "--force-recreate", compose_service(base)], check=False)
+    if up_proc.returncode != 0:
+        detail = (up_proc.stderr or up_proc.stdout or "").strip()
+        print(err_text(f"Не удалось запустить контейнер при откате: {detail}"), file=sys.stderr)
+        return 1
+
+    try:
+        wait_healthy(base)
+    except Exception as exc:
+        print(err_text(f"Контейнер запущен при откате, но не подтвердил статус healthy: {exc}"), file=sys.stderr)
+        return 1
+
+    print(ok_text(f"Откат выполнен: работает версия {target_version}."))
+    return 0
+
+
+def run_update_command(deploy_dir: Path, target_version_override: str | None = None) -> int:
+    check_prerequisites()
+    compose_file = deploy_dir / "compose.yaml"
+    env_file = deploy_dir / ".env"
+    cfg_file = deploy_dir / "config.json"
+    if not compose_file.is_file() or not env_file.is_file() or not cfg_file.is_file():
+        print(err_text(f"Существующая установка не найдена в {deploy_dir}."), file=sys.stderr)
+        print("Дальше: укажите каталог через MTEVIL_DIR или выполните первичную установку.", file=sys.stderr)
+        return 1
+
+    saved = load_existing_defaults(deploy_dir)
+    saved_cfg = saved.get("config") if isinstance(saved.get("config"), dict) else {}
+    role = str(saved_cfg.get("role") or "direct")
+    project = str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
+    cur_image_ref = str(saved.get("MTEVIL_IMAGE") or "")
+    cur_image_id, cur_digest, cur_version = inspect_current_deployment(deploy_dir, project, cur_image_ref)
+
+    repo = os.environ.get("MTEVIL_REPO") or os.environ.get("MTVEIL_REPO") or "RsNest/mtevil"
+    repo_lower = repo.lower()
+    api_url = os.environ.get("MTEVIL_RELEASES_API_URL") or f"https://api.github.com/repos/{repo}/releases?per_page=30"
+    release_base_url = os.environ.get("MTEVIL_RELEASE_BASE_URL") or f"https://github.com/{repo}/releases/download"
+
+    requested_version = (
+        target_version_override
+        or os.environ.get("MTEVIL_VERSION")
+        or os.environ.get("MTVEIL_VERSION")
+        or ""
+    ).strip()
+    explicit_image = (os.environ.get("MTEVIL_UPDATE_IMAGE") or "").strip()
+
+    if requested_version:
+        target_version = requested_version
+    else:
+        try:
+            releases_data = fetch_json_url(api_url)
+            if not isinstance(releases_data, list):
+                raise ValueError("Ответ GitHub API не является списком релизов.")
+            target_version = select_latest_release(releases_data)
+        except Exception as exc:
+            print(err_text(f"Не удалось определить свежий релиз из GitHub API ({api_url}): {exc}"), file=sys.stderr)
+            print("Дальше: проверьте доступ к api.github.com или задайте версию через MTEVIL_VERSION.", file=sys.stderr)
+            return 1
+
+    target_image = explicit_image or f"ghcr.io/{repo_lower}:{target_version}"
+
+    # Fast path if installed version already matches target_version (preserves existing rollback snapshot untouched).
+    if not explicit_image and cur_version == target_version:
+        print(ok_text(f"Уже установлена актуальная версия {target_version}. Перезапуск не требуется."))
+        return 0
+
+    from_label = cur_version or cur_image_ref or "unknown"
+    print(heading(f"Обновление mtevil: {from_label} -> {target_version}"))
+
+    print(f"Загрузка Docker-образа {target_image}...")
+    pull_proc = run(["docker", "pull", target_image], check=False)
+    if pull_proc.returncode != 0:
+        detail = (pull_proc.stderr or pull_proc.stdout or "").strip()
+        summary, action = diagnose_docker_error(detail, target_image)
+        print(f"{err_text(summary)}\nДальше: {action}", file=sys.stderr)
+        return 1
+
+    new_image_id, _, new_image_ver = inspect_image_metadata(target_image)
+    if cur_image_id and new_image_id and cur_image_id == new_image_id and (cur_version or new_image_ver) == target_version:
+        print(ok_text(f"Уже установлена актуальная версия {target_version}. Перезапуск не требуется."))
+        return 0
+
+    # Validate existing config.json against the newly pulled image before touching live files or stopping the container.
+    cfg_check = run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{str(cfg_file.resolve())}:/etc/mtevil/config.json:ro",
+            target_image,
+            "--config",
+            "/etc/mtevil/config.json",
+            "--check-config",
+        ],
+        check=False,
+    )
+    if cfg_check.returncode != 0:
+        detail = (cfg_check.stderr or cfg_check.stdout or "").strip()
+        print(err_text("Существующая конфигурация не прошла проверку на новом образе. Обновление отменено."), file=sys.stderr)
+        if detail:
+            print(detail, file=sys.stderr)
+        return 1
+
+    # Save rollback snapshot of the currently working version, image tag, and config before modifying anything.
+    try:
+        save_rollback_snapshot(
+            deploy_dir,
+            project,
+            cur_version,
+            cur_image_ref,
+            cur_image_id,
+            cur_digest,
+        )
+    except Exception as exc:
+        print(err_text(str(exc)), file=sys.stderr)
+        return 1
+
+    # Update helper scripts from the release if available (non-fatal if offline/custom image).
+    if os.environ.get("MTEVIL_SKIP_ASSET_DOWNLOAD") != "1":
+        for asset_name, mode in (("setup.py", 0o755), ("mtevilctl", 0o755)):
+            asset_url = f"{release_base_url}/{target_version}/{asset_name}"
+            try:
+                download_url_atomic(asset_url, deploy_dir / asset_name, mode=mode)
+            except Exception:
+                pass
+
+    orig_env_text = env_file.read_text(encoding="utf-8", errors="ignore")
+    env_file.write_text(set_env_image(orig_env_text, target_image), encoding="utf-8")
+
+    base = compose_cmd(deploy_dir, project)
+    up_proc = run(base + ["up", "-d", "--no-build", "--force-recreate", compose_service(base)], check=False)
+    if up_proc.returncode != 0:
+        detail = (up_proc.stderr or up_proc.stdout or "").strip()
+        print(err_text(f"Не удалось запустить новый контейнер ({target_version}): {detail}"), file=sys.stderr)
+        print(warn_text("Автоматический возврат предыдущей рабочей версии..."), file=sys.stderr)
+        perform_rollback(deploy_dir, auto_from_failed_update=True)
+        return 1
+
+    try:
+        wait_healthy(base)
+    except TimeoutError:
+        print(err_text(f"Новый контейнер ({target_version}) не перешёл в статус healthy за 45 секунд."), file=sys.stderr)
+        print(warn_text("Автоматический возврат предыдущей рабочей версии..."), file=sys.stderr)
+        perform_rollback(deploy_dir, auto_from_failed_update=True)
+        return 1
+
+    print(ok_text(f"Обновление завершено: работает версия {target_version} (контейнер исправен)."))
+    return 0
+
+
+def format_bytes_ru(num_bytes: int | float | None) -> str:
+    if num_bytes is None:
+        return "нет данных"
+    n = float(num_bytes)
+    if n < 1024:
+        return f"{int(n)} Б"
+    for unit in ("КиБ", "МиБ", "ГиБ", "ТиБ"):
+        n /= 1024.0
+        if n < 1024.0 or unit == "ТиБ":
+            return f"{n:.2f} {unit} ({int(num_bytes)} Б)"
+    return f"{int(num_bytes)} Б"
+
+
+def format_rate_ru(bytes_per_sec: float | None) -> str:
+    if bytes_per_sec is None:
+        return "нет данных"
+    n = float(bytes_per_sec)
+    if n < 1024:
+        return f"{n:.0f} Б/с"
+    for unit in ("КиБ/с", "МиБ/с", "ГиБ/с"):
+        n /= 1024.0
+        if n < 1024.0 or unit == "ГиБ/с":
+            return f"{n:.2f} {unit}"
+    return f"{bytes_per_sec:.0f} Б/с"
+
+
+def format_duration_ru(seconds: int | float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "нет данных"
+    sec = int(seconds)
+    days, rem = divmod(sec, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    parts: list[str] = []
+    if days > 0:
+        parts.append(f"{days} д")
+    if hours > 0 or days > 0:
+        parts.append(f"{hours} ч")
+    if mins > 0 or hours > 0 or days > 0:
+        parts.append(f"{mins} мин")
+    parts.append(f"{secs} с")
+    return " ".join(parts)
+
+
+def parse_iso_timestamp_to_epoch(iso_str: str) -> float | None:
+    s = (iso_str or "").strip()
+    if not s or s.startswith("0001-01-01"):
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?([+-]\d{2}:\d{2})?$", s)
+    if m:
+        frac = (m.group(2) or "")[:6].ljust(6, "0")
+        tz = m.group(3) or "+00:00"
+        s = f"{m.group(1)}.{frac}{tz}" if frac else f"{m.group(1)}{tz}"
+    try:
+        return datetime.datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return None
+
+
+def get_available_rollback_version(deploy_dir: Path, project: str) -> str:
+    rb_file = deploy_dir / "rollback.json"
+    if not rb_file.is_file():
+        return "нет данных (откат ещё не сохранён)"
+    try:
+        meta = json.loads(rb_file.read_text(encoding="utf-8"))
+    except Exception:
+        return "нет данных"
+    ver = str(meta.get("version") or meta.get("image") or "").strip()
+    local_tag = str(meta.get("local_tag") or f"mtevil:rollback-{project}").strip()
+    image_id = str(meta.get("image_id") or "").strip()
+    has_local = (
+        run(["docker", "image", "inspect", local_tag], check=False).returncode == 0
+        or (bool(image_id) and run(["docker", "image", "inspect", image_id], check=False).returncode == 0)
+    )
+    if not ver:
+        return "нет данных"
+    return f"{ver} (образ доступен локально)" if has_local else f"{ver} (локальный образ отсутствует)"
+
+
+def run_status_command(deploy_dir: Path) -> int:
+    check_prerequisites()
+    compose_file = deploy_dir / "compose.yaml"
+    env_file = deploy_dir / ".env"
+    cfg_file = deploy_dir / "config.json"
+    if not compose_file.is_file() or not env_file.is_file() or not cfg_file.is_file():
+        print(err_text(f"Существующая установка не найдена в {deploy_dir}."), file=sys.stderr)
+        return 1
+
+    saved = load_existing_defaults(deploy_dir)
+    saved_cfg = saved.get("config") if isinstance(saved.get("config"), dict) else {}
+    role = str(saved_cfg.get("role") or "direct")
+    if role == "direct" and saved_cfg.get("egress_upstreams"):
+        role = "edge"
+    project = str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
+    configured_image = str(saved.get("MTEVIL_IMAGE") or "")
+    base = compose_cmd(deploy_dir, project)
+    svc = compose_service(base)
+
+    cid_proc = run(base + ["ps", "-q", svc], check=False)
+    cid = cid_proc.stdout.strip() if cid_proc.returncode == 0 else ""
+    running = False
+    health_status = "остановлен"
+    uptime_str = "нет данных"
+    net_mode_label = "host (--network-host)" if "network_mode: host" in compose_file.read_text(encoding="utf-8", errors="ignore") else "bridge"
+
+    if cid:
+        c_proc = run(["docker", "inspect", cid], check=False)
+        if c_proc.returncode == 0:
+            try:
+                c_info = json.loads(c_proc.stdout)[0]
+                state = c_info.get("State") or {}
+                running = bool(state.get("Running"))
+                status_raw = str(state.get("Status") or "unknown")
+                health_raw = str((state.get("Health") or {}).get("Status") or "")
+                if running:
+                    health_status = f"{health_raw} (работает)" if health_raw else f"{status_raw} (работает)"
+                    started_epoch = parse_iso_timestamp_to_epoch(str(state.get("StartedAt") or ""))
+                    if started_epoch is not None:
+                        uptime_str = format_duration_ru(max(0.0, time.time() - started_epoch))
+                else:
+                    health_status = f"остановлен ({status_raw})"
+            except Exception:
+                pass
+
+    _, _, cur_version = inspect_current_deployment(deploy_dir, project, configured_image)
+    if not cur_version and running:
+        ver_proc = run(base + ["exec", "-T", svc, "mtevil", "--version"], check=False)
+        if ver_proc.returncode == 0 and ver_proc.stdout.strip():
+            parts = ver_proc.stdout.strip().split()
+            cur_version = parts[-1] if parts else ver_proc.stdout.strip()
+
+    role_names = {
+        "direct": "direct (один зарубежный сервер)",
+        "edge": "edge (входной сервер -> egress)",
+        "egress": "egress (зарубежный сервер выхода)",
+    }
+    rollback_ver = get_available_rollback_version(deploy_dir, project)
+    port_val = str(saved.get("MTEVIL_PORT") or "")
+    bind_val = str(saved.get("MTEVIL_BIND") or "")
+
+    print(heading("Статус mtevil"))
+    print(f"  Каталог установки: {deploy_dir}")
+    print(f"  Версия:            {cur_version or configured_image or 'нет данных'}")
+    print(f"  Роль:              {role_names.get(role, role)}")
+    if bind_val and port_val:
+        print(f"  Порт и сеть:       {bind_val}:{port_val} ({net_mode_label})")
+    print(f"  Состояние:         {health_status}")
+    print(f"  Время работы:      {uptime_str}")
+    print(f"  Версия для отката: {rollback_ver}")
+    return 0
+
+
+def read_container_runtime_stats(base: list[str], svc: str) -> dict[str, object] | None:
+    proc = run(
+        base + ["exec", "-T", svc, "/bin/cat", "/var/lib/mtevil/runtime-stats.json"],
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        data = json.loads(proc.stdout)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def direction_labels_for_role(role: str) -> tuple[str, str, str, str, str, str]:
+    """Return (scope_note, down_rx_label, down_tx_label, up_tx_label, up_rx_label, leg_pair_names)."""
+    if role == "edge":
+        return (
+            "только сокеты процесса mtevil (трафик других сервисов VPS исключён)",
+            "Принято на участке клиент -> edge (вход прокси)",
+            "Отправлено на участке edge -> клиент (ответ клиенту)",
+            "Отправлено на участке edge -> egress (туннель к выходу)",
+            "Принято на участке egress -> edge (ответ от выхода)",
+            "клиент <-> edge / edge <-> egress",
+        )
+    if role == "egress":
+        return (
+            "только сокеты процесса mtevil (трафик других сервисов VPS исключён)",
+            "Принято на участке edge -> egress (вход от edge)",
+            "Отправлено на участке egress -> edge (ответ к edge)",
+            "Отправлено на участке egress -> Telegram DC",
+            "Принято на участке Telegram DC -> egress",
+            "edge <-> egress / egress <-> Telegram DC",
+        )
+    return (
+        "только сокеты процесса mtevil (трафик других сервисов VPS исключён)",
+        "Принято на участке клиент -> прокси (загрузка от клиента)",
+        "Отправлено на участке прокси -> клиент (отдача клиенту)",
+        "Отправлено на участке прокси -> Telegram DC",
+        "Принято на участке Telegram DC -> прокси",
+        "клиент <-> прокси / прокси <-> Telegram DC",
+    )
+
+
+def format_period_covered(stats: dict[str, object] | None, container_started_epoch: float | None) -> str:
+    if stats and isinstance(stats.get("started_unix_ms"), (int, float)) and int(stats["started_unix_ms"]) > 0:
+        start_ts = float(stats["started_unix_ms"]) / 1000.0
+        now_ts = (
+            float(stats["ts_unix_ms"]) / 1000.0
+            if isinstance(stats.get("ts_unix_ms"), (int, float)) and int(stats["ts_unix_ms"]) > 0
+            else time.time()
+        )
+        dt_str = datetime.datetime.fromtimestamp(start_ts, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        return f"с запуска процесса mtevil ({dt_str}, длительность {format_duration_ru(max(0.0, now_ts - start_ts))})"
+    if container_started_epoch is not None:
+        dt_str = datetime.datetime.fromtimestamp(container_started_epoch, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        return f"с запуска контейнера ({dt_str}, длительность {format_duration_ru(max(0.0, time.time() - container_started_epoch))})"
+    return "нет данных"
+
+
+def format_retrans_count(val: object, supported: bool) -> str:
+    if not supported or not isinstance(val, (int, float)):
+        return "нет данных"
+    return f"{int(val)} сегм."
+
+
+def render_traffic_snapshot(
+    role: str,
+    stats: dict[str, object] | None,
+    container_started_epoch: float | None,
+) -> str:
+    scope_note, down_rx_lbl, down_tx_lbl, up_tx_lbl, up_rx_lbl, _ = direction_labels_for_role(role)
+    period_str = format_period_covered(stats, container_started_epoch)
+    lines: list[str] = [
+        heading(f"Трафик mtevil (роль: {role})"),
+        f"  Охват метрик:      {scope_note}",
+        f"  Период счётчиков:  {period_str}",
+    ]
+    if stats is None:
+        lines.extend([
+            "  Активные сессии:   нет данных",
+            "  Завершено сессий:  нет данных",
+            f"  {down_rx_lbl}: нет данных",
+            f"  {down_tx_lbl}: нет данных",
+            f"  {up_tx_lbl}: нет данных",
+            f"  {up_rx_lbl}: нет данных",
+            "  Ретрансмиссии TCP: нет данных",
+        ])
+        return "\n".join(lines)
+
+    active = stats.get("active_sessions")
+    completed = stats.get("completed_sessions")
+    failed = stats.get("failed_sessions")
+    down_rx = stats.get("downstream_rx_bytes")
+    down_tx = stats.get("downstream_tx_bytes")
+    up_tx = stats.get("upstream_tx_bytes")
+    up_rx = stats.get("upstream_rx_bytes")
+    retrans_ok = bool(stats.get("retrans_supported"))
+    down_retrans = stats.get("downstream_retrans_segs")
+    up_retrans = stats.get("upstream_retrans_segs")
+
+    active_str = str(int(active)) if isinstance(active, (int, float)) else "нет данных"
+    if isinstance(completed, (int, float)) and isinstance(failed, (int, float)):
+        total_closed = int(completed) + int(failed)
+        closed_str = f"{total_closed} (успешно: {int(completed)}, с ошибкой: {int(failed)})"
+    else:
+        closed_str = "нет данных"
+
+    down_leg_name = "edge -> клиент" if role == "edge" else ("egress -> edge" if role == "egress" else "прокси -> клиент")
+    up_leg_name = "edge -> egress" if role == "edge" else ("egress -> Telegram DC" if role == "egress" else "прокси -> Telegram DC")
+
+    lines.extend([
+        f"  Активные сессии:   {active_str}",
+        f"  Отключений всего:  {closed_str}",
+        f"  {down_rx_lbl}: {format_bytes_ru(down_rx if isinstance(down_rx, (int, float)) else None)}",
+        f"  {down_tx_lbl}: {format_bytes_ru(down_tx if isinstance(down_tx, (int, float)) else None)}",
+        f"  {up_tx_lbl}: {format_bytes_ru(up_tx if isinstance(up_tx, (int, float)) else None)}",
+        f"  {up_rx_lbl}: {format_bytes_ru(up_rx if isinstance(up_rx, (int, float)) else None)}",
+        f"  Ретрансмиссии TCP ({down_leg_name}): {format_retrans_count(down_retrans, retrans_ok)}",
+        f"  Ретрансмиссии TCP ({up_leg_name}): {format_retrans_count(up_retrans, retrans_ok)}",
+    ])
+    return "\n".join(lines)
+
+
+def run_traffic_command(deploy_dir: Path, *, live: bool = False, max_iterations: int | None = None) -> int:
+    check_prerequisites()
+    compose_file = deploy_dir / "compose.yaml"
+    env_file = deploy_dir / ".env"
+    cfg_file = deploy_dir / "config.json"
+    if not compose_file.is_file() or not env_file.is_file() or not cfg_file.is_file():
+        print(err_text(f"Существующая установка не найдена в {deploy_dir}."), file=sys.stderr)
+        return 1
+
+    saved = load_existing_defaults(deploy_dir)
+    saved_cfg = saved.get("config") if isinstance(saved.get("config"), dict) else {}
+    role = str(saved_cfg.get("role") or "direct")
+    if role == "direct" and saved_cfg.get("egress_upstreams"):
+        role = "edge"
+    project = str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
+    base = compose_cmd(deploy_dir, project)
+    svc = compose_service(base)
+
+    cid_proc = run(base + ["ps", "-q", svc], check=False)
+    cid = cid_proc.stdout.strip() if cid_proc.returncode == 0 else ""
+    if not cid:
+        print(err_text(f"Контейнер {svc} не запущен в {deploy_dir}."), file=sys.stderr)
+        return 1
+
+    container_started_epoch: float | None = None
+    c_proc = run(["docker", "inspect", cid], check=False)
+    if c_proc.returncode == 0:
+        try:
+            c_info = json.loads(c_proc.stdout)[0]
+            state = c_info.get("State") or {}
+            if not state.get("Running"):
+                print(err_text(f"Контейнер {svc} остановлен."), file=sys.stderr)
+                return 1
+            container_started_epoch = parse_iso_timestamp_to_epoch(str(state.get("StartedAt") or ""))
+        except Exception:
+            pass
+
+    if not live:
+        stats = read_container_runtime_stats(base, svc)
+        print(render_traffic_snapshot(role, stats, container_started_epoch))
+        return 0
+
+    prev_stats: dict[str, object] | None = None
+    prev_ts: float | None = None
+    iteration = 0
+    down_leg_name = "edge -> клиент" if role == "edge" else ("egress -> edge" if role == "egress" else "прокси -> клиент")
+    up_leg_name = "edge -> egress" if role == "edge" else ("egress -> Telegram DC" if role == "egress" else "прокси -> Telegram DC")
+    in_leg_name = "клиент -> edge" if role == "edge" else ("edge -> egress" if role == "egress" else "клиент -> прокси")
+    back_leg_name = "egress -> edge" if role == "edge" else ("Telegram DC -> egress" if role == "egress" else "Telegram DC -> прокси")
+
+    try:
+        while True:
+            now_wall = time.monotonic()
+            stats = read_container_runtime_stats(base, svc)
+            dt = (now_wall - prev_ts) if (prev_ts is not None and now_wall > prev_ts) else 1.0
+
+            def delta_metric(key: str) -> float | None:
+                if stats is None or prev_stats is None:
+                    return None
+                cur_v = stats.get(key)
+                old_v = prev_stats.get(key)
+                if not isinstance(cur_v, (int, float)) or not isinstance(old_v, (int, float)):
+                    return None
+                if cur_v < old_v:
+                    return None
+                return float(cur_v - old_v)
+
+            d_down_rx = delta_metric("downstream_rx_bytes")
+            d_down_tx = delta_metric("downstream_tx_bytes")
+            d_up_tx = delta_metric("upstream_tx_bytes")
+            d_up_rx = delta_metric("upstream_rx_bytes")
+            d_comp = delta_metric("completed_sessions")
+            d_fail = delta_metric("failed_sessions")
+            d_disc = (int(d_comp) + int(d_fail)) if (d_comp is not None and d_fail is not None) else None
+
+            retrans_ok = bool(stats and stats.get("retrans_supported"))
+            d_down_ret = delta_metric("downstream_retrans_segs") if retrans_ok else None
+            d_up_ret = delta_metric("upstream_retrans_segs") if retrans_ok else None
+
+            snap_text = render_traffic_snapshot(role, stats, container_started_epoch)
+            rate_lines = [
+                "",
+                heading("Динамика за последнюю секунду (--live, нажмите Ctrl+C для выхода)"),
+                f"  Скорость приёма ({in_leg_name}):   {format_rate_ru(d_down_rx / dt if d_down_rx is not None else None)}",
+                f"  Скорость отдачи ({down_leg_name}): {format_rate_ru(d_down_tx / dt if d_down_tx is not None else None)}",
+                f"  Скорость отправки ({up_leg_name}): {format_rate_ru(d_up_tx / dt if d_up_tx is not None else None)}",
+                f"  Скорость ответа ({back_leg_name}): {format_rate_ru(d_up_rx / dt if d_up_rx is not None else None)}",
+                f"  Отключения за 1 с:                 {f'{d_disc} сесс./с (всего завершено/ошибок)' if d_disc is not None else 'нет данных'}",
+                f"  Ретрансмиссии TCP за 1 с ({down_leg_name}): {f'{int(d_down_ret)} сегм./с' if d_down_ret is not None else 'нет данных'}",
+                f"  Ретрансмиссии TCP за 1 с ({up_leg_name}): {f'{int(d_up_ret)} сегм./с' if d_up_ret is not None else 'нет данных'}",
+            ]
+
+            if sys.stdout.isatty():
+                sys.stdout.write("\033[2J\033[H")
+            print(snap_text + "\n" + "\n".join(rate_lines), flush=True)
+
+            prev_stats = stats
+            prev_ts = now_wall
+            iteration += 1
+            if max_iterations is not None and iteration >= max_iterations:
+                break
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\nМониторинг трафика остановлен.")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Interactive Docker Compose wizard and lifecycle tool for mtevil")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=("wizard", "status", "update", "rollback", "traffic", "traf"),
+        default="wizard",
+        help="Action to perform: wizard (default), status, update, rollback, traffic (or traf)",
+    )
     parser.add_argument("--dir", type=Path, default=None, help="Target deployment directory (default: deploy/wizard)")
     parser.add_argument("--project", type=str, default=None, help="Docker Compose project name")
     parser.add_argument("--image", type=str, default=DEFAULT_IMAGE, help="Docker image tag")
@@ -810,9 +1571,22 @@ def main() -> int:
         action="store_true",
         help="Use Docker host networking (for Linux hosts with policy-routed mesh/VPN egress)",
     )
-    args = parser.parse_args()
+    parser.add_argument("--version", type=str, default=None, help="Target release version override for update")
+    parser.add_argument("--live", action="store_true", help="Refresh traffic statistics every second")
+    parser.add_argument("--iterations", type=int, default=None, help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
 
     repo_root = Path(__file__).resolve().parent.parent
+    if args.command in ("status", "update", "rollback", "traffic", "traf"):
+        deploy_dir = (args.dir or default_deploy_dir(repo_root)).resolve()
+        if args.command == "status":
+            return run_status_command(deploy_dir)
+        if args.command == "update":
+            return run_update_command(deploy_dir, target_version_override=args.version)
+        if args.command == "rollback":
+            return perform_rollback(deploy_dir)
+        return run_traffic_command(deploy_dir, live=args.live, max_iterations=args.iterations)
+
     deploy_dir = (args.dir or (repo_root / "deploy" / "wizard")).resolve()
 
     check_prerequisites()
@@ -1313,6 +2087,12 @@ def main() -> int:
         print(f"  Получить токен MTV2 безопасно: docker compose {compose_ref} exec -T {compose_service(base)} cat /var/lib/mtevil/egress-token")
 
     print("\nУправление и диагностика:")
+    ctl_path = deploy_dir / "mtevilctl"
+    ctl_cmd = "mtevilctl" if ctl_path.is_file() else f'python3 "{(deploy_dir / "setup.py").resolve()}"'
+    print(f"  {ctl_cmd} status")
+    print(f"  {ctl_cmd} traffic --live")
+    print(f"  {ctl_cmd} update")
+    print(f"  {ctl_cmd} rollback")
     print(f"  docker compose {compose_ref} ps")
     print(f"  docker compose {compose_ref} logs --tail=100 {compose_service(base)}")
     if role == "edge":
