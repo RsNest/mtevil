@@ -1,0 +1,135 @@
+# Топология стенда Phase 0 — docs/specs/phase-0.md §2.
+# Статус: infrastructure scaffold для smoke. Генератор/pcap/netem — НЕ реализованы
+# (этапы 3–4 §16), observer — минимальный (nstat + bpftrace), см. RUNTIME LABELS.
+#
+# Сети: client-net (клиент→DUT), front-net (DUT→cover), egress-net (DUT→upstream).
+# cover-net в scaffold не нужен: cover отдаёт локальную статику без внешнего egress.
+
+name: mtveil-stand
+
+networks:
+  client-net:
+    name: mtveil-client-net
+  front-net:
+    name: mtveil-front-net
+  egress-net:
+    name: mtveil-egress-net
+
+services:
+  # ---------------------------------------------------------------- DUT (pinned source)
+  # Сборка из pinned коммита telemt (versions.lock candidates.telemt).
+  # build_reproducible=false: байт-идентичность пересборки пока не доказана —
+  # бинарник фиксируется sha256 в env прогона после первой сборки.
+  dut-telemt:
+    build:
+      context: .
+      dockerfile: dut-telemt.Dockerfile
+      args:
+        TELEMT_REF: "dac7aeeeda55951cf03a229ee9357e2af558d45e"  # versions.lock, не редактировать здесь вручную
+    image: mtveil/dut-telemt:pinned-dac7aee
+    container_name: mtveil-dut-telemt
+    networks: [client-net, front-net, egress-net]
+    ports:
+      - "127.0.0.1:14430:443"   # host-проверка preflight (не для клиентов)
+    volumes:
+      - ./dut-telemt.toml:/etc/telemt/telemt.toml:ro
+    mem_limit: 256m             # DUT-профиль smoke (не бенчмарк-конфигурация)
+    labels:
+      mtveil.role: "dut"
+      mtveil.maturity: "scaffold-smoke"
+
+  # ---------------------------------------------------------------- cover (эталон)
+  cover:
+    image: nginx:stable
+    container_name: mtveil-cover
+    networks: [front-net]
+    ports:
+      - "127.0.0.1:18080:80"
+    volumes:
+      - ./cover/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./cover/www:/usr/share/nginx/html:ro
+    mem_limit: 128m
+    labels:
+      mtveil.role: "cover"
+      mtveil.maturity: "scaffold-smoke"
+
+  # ---------------------------------------------------------------- upstream-farm (STUB)
+  # ЗАГЛУШКА: реальный upstream-farm = fake-DC + socks5 (crates/harness bin) — этап 5 §16.
+  upstream-farm:
+    image: nginx:stable
+    container_name: mtveil-upstream-farm
+    networks: [egress-net]
+    volumes:
+      - ./upstream-farm/default.conf:/etc/nginx/conf.d/default.conf:ro
+    mem_limit: 64m
+    labels:
+      mtveil.role: "upstream-stub"
+      mtveil.maturity: "STUB-not-real-farm"
+
+  # ---------------------------------------------------------------- nstat-observer (минимальный)
+  # Собирает nstat из network namespace DUT (nsenter -t <pid> -n nstat).
+  # Полный observer (events.jsonl, cgroup, scrape) — этап 5 §16.
+  nstat-observer:
+    build:
+      context: .
+      dockerfile: observer.Dockerfile
+    image: mtveil/nstat-observer:scaffold
+    container_name: mtveil-nstat-observer
+    pid: "host"
+    privileged: true
+    networks: [client-net]
+    volumes:
+      - /proc:/proc:ro
+      - ../../../runs:/runs   # ../../ = crates/ (каталог compose-файла), нужен корень репо
+    environment:
+      - DUT_CONTAINER=mtveil-dut-telemt
+      - RUN_DIR=/runs/current
+    entrypoint: ["/bin/sh", "/observer/nstat-loop.sh"]
+    mem_limit: 64m
+    labels:
+      mtveil.role: "observer"
+      mtveil.maturity: "minimal-nstat-only"
+
+  # ---------------------------------------------------------------- reset-observer (минимальный eBPF)
+  # bpftrace на tracepoints tcp:tcp_send_reset / tcp:tcp_receive_reset.
+  # Socket cookie в scaffold НЕ извлекается (bpftrace-ограничение) —
+  # атрибуция по 4-tuple + netns inode; libbpf-обозреватель — этап 5 §16.
+  # Образ: официальные bpftrace/bpftrace недоступны (docker hub + ghcr denied, 2026-11-17),
+  # собираем из ubuntu:24.04 с пакетом bpftrace из репозитория Ubuntu.
+  rst-observer:
+    build:
+      context: .
+      dockerfile: rst-observer.Dockerfile
+    image: mtveil/rst-observer:scaffold
+    container_name: mtveil-rst-observer
+    privileged: true
+    pid: "host"
+    networks: []
+    volumes:
+      - /sys/kernel/tracing:/sys/kernel/tracing
+      - /sys/kernel/debug:/sys/kernel/debug
+      - /sys/kernel/btf:/sys/kernel/btf:ro          # BTF для curtask->nsproxy->net_ns->ns.inum
+      - /lib/modules:/lib/modules:ro
+      - ./rst-observer/reset.bt:/reset.bt:ro
+      - ../../../runs:/runs   # ../../ = crates/ (каталог compose-файла), нужен корень репо
+    # entrypoint из Dockerfile: /usr/bin/bpftrace /reset.bt (ubuntu:24.04 пакет bpftrace)
+    mem_limit: 128m
+    labels:
+      mtveil.role: "observer"
+      mtveil.maturity: "minimal-bpftrace-no-socket-cookie"
+
+  # ---------------------------------------------------------------- client-stub (STUB, on-demand)
+  # ЗАГЛУШКА генератора: python-пробы (контролируемый RST, мусорный HTTP).
+  # Реальный генератор — этап 4 §16; никакие нагрузочные профили не заявляются.
+  client-stub:
+    image: python:3.13-alpine
+    container_name: mtveil-client-stub
+    networks: [client-net]
+    volumes:
+      - ./client-stub/probe.py:/client/probe.py:ro
+    entrypoint: ["python3", "-c", "import time; time.sleep(86400)"]
+    mem_limit: 64m
+    profiles: ["tools"]
+    labels:
+      mtveil.role: "generator-stub"
+      mtveil.maturity: "STUB-not-load-generator"

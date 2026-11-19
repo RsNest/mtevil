@@ -1,0 +1,109 @@
+# versions.lock — pinning объектов сравнения Phase 0 (docs/specs/phase-0.md §1).
+#
+# ПРАВИЛА ЧЕСТНОСТИ:
+# 1. Immutable pinning = зафиксированное неизменяемое состояние (полный git sha,
+#    архив исходников + sha256, лицензия). Проверено на дату фиксации.
+# 2. Byte-for-byte reproducible build = пересборка даёт идентичный бинарник
+#    (sha256). Отдельное свойство; НЕ устанавливается фактом pinning'а.
+#    Пока build_reproducible = false, `harness stand build` проверяет только
+#    соответствие ref'а, не байт-идентичность.
+# 3. `harness stand build` обязан падать, если поля с статусом verified не сходятся.
+# 4. Неоднозначные репозитории не пинятся (ADR-000 §15): mtdd не найден публично,
+#    mtg-форк не идентифицирован — оба ожидают ввода владельца проекта.
+
+[meta]
+schema_version = 2
+pinned_utc = "2026-11-17T00:00:00Z"
+pinned_by = "phase-0 scaffold"
+verification_method = "GitHub API (api.github.com) + raw.githubusercontent.com, снято вручную"
+
+# ---------------------------------------------------------------- cover (эталон)
+[cover]
+image = "nginx"
+image_tag = "stable"
+image_digest = "sha256:42c68eab6f7e22611786a9fe1d1c019e275c50185bd54b8f75dc2b9184322703"   # RepoDigest, pull на VM 2026-11-17 (manifest digest; per-arch)
+config_bundle_sha256 = "dd50961a6a7fb4077add91c73230378a43afaf7aa55bebe926fcccc2ff7b4ad6"  # sha256(cover/default.conf + cover/www/index.html, конкатенация)
+notes = "Scaffold: статический эталон. Реальный сайт-профиль для family B/C — этап 3 §16"
+
+# ---------------------------------------------------------------- кандидат A: telemt
+# Идентификация однозначна: Rust+Tokio, dd/ee-режимы, FakeTLS+TLS-emulation,
+# middle-proxy, SNI-checker — соответствует описанию ADR-000 §15.
+[candidates.telemt]
+status = "pinned-immutable"
+vcs_url = "https://github.com/telemt/telemt"
+vcs_ref = "dac7aeeeda55951cf03a229ee9357e2af558d45e"   # main, 2026-11-15T10:31:31Z, merge PR #972
+version_field = "3.5.17"                                # Cargo.toml [package] version
+patches_dir = ""
+build_system = "cargo"                                  # edition 2024, rust-version >= 1.88
+build_flags = "--release"                               # фичи по умолчанию; флаг-матрица фиксируется при первых прогонах
+build_reproducible = false                              # НЕ установлен: ни разу не пересобран дважды с сверкой sha256
+image = "mtveil/dut-telemt:pinned-dac7aee"              # локальная сборка из pinned source (dut-telemt.Dockerfile); registry-образ не используется
+image_digest = "local-build"                            # registry digest отсутствует; идентичность фиксируется binary_sha256 + ref
+binary_sha256 = "f1a504152c7a4062ca555df1c95c06c37c8641507a55fa520e02c262dc84f6ad"  # сборка на VM (rust:1-bookworm), 2026-11-17
+startup_note = "telemt выполняет DC-connectivity init ~37 c до bind:443 (замер smoke 2026-11-17) — стенд обязан ждать bind"
+license_name = "TELEMT Public License 3.3"
+license_spdx = "NOASSERTION"                            # GitHub не распознаёт; текст в LICENSE репозитория
+license_checked = true
+license_summary = "permissive-стиль: использование/модификация/распространение разрешены при сохранении copyright+license; модификации обязаны помечаться; trademark 'Telemt' не granted; patent grant с defensive termination. НЕ MIT."
+run_as_blackbox = true                                  # бенчмарк чёрным ящиком разрешён лицензией
+
+# ---------------------------------------------------------------- кандидат B: mtg
+# ОСТОРОЖНО: baseline ADR-000 §15 говорит «mtg (форк)». Конкретный форк НЕ
+# идентифицирован. Запинен upstream как референс-кандидат; если имеется в виду
+# другой форк — заполнить этот блок его данными и снизить status до re-pin.
+[candidates.mtg]
+status = "pinned-upstream-reference-fork-unconfirmed"
+vcs_url = "https://github.com/9seconds/mtg"
+vcs_ref = "9a2e120618d0ec651e3fe7b34ac0e2d343ccddc6"    # master, 2026-11-03T06:41:07Z, merge PR #583
+patches_dir = ""
+build_system = "go"                                     # go.mod: module github.com/9seconds/mtg/v2, go 1.26
+build_flags = ""
+build_reproducible = false
+image = ""
+image_digest = ""
+binary_sha256 = ""
+license_name = "MIT"
+license_spdx = "MIT"
+license_checked = true
+license_summary = "MIT (GitHub API spdx_id=MIT)."
+single_secret_claim = "verified-primary: README раздел 'A single secret' — «I think that multiple secrets solve no problems and just complex...» (снято raw.githubusercontent.com 2026-11-17). Ограничение методики ADR-000 §11.5 подтверждено."
+
+# ---------------------------------------------------------------- кандидат C: mtdd
+# НЕ НАЙДЕН в публичных индексах (web-поиск 2026-11-17: «mtdd», «kFakeCertSize» —
+# 0 совпадений). Baseline §15 подтверждает доступ к исходникам ранее (kFakeCertSize=2878,
+# MIT) — вероятно приватный/удалённый репозиторий. НЕ угадываем.
+[candidates.mtdd]
+status = "TBD-blocked-source-unidentified"
+vcs_url = ""
+vcs_ref = ""
+license_checked = false
+license_note = "Утверждение 'MIT' из baseline §15 НЕ верифицировано: репозиторий не найден."
+blocked_on = "владелец проекта: точный URL/архив исходников mtdd"
+
+# ---------------------------------------------------------------- окружение стенда
+[runtime]
+compose_file = "crates/harness/stand/compose.yaml"
+sysctl_file = "crates/harness/stand/sysctl.conf"
+notes = "Стенд Phase 0 разворачивается на выделенной VM (Ubuntu 26.04, cgroup v2, kernel 7.0); eBPF observer требует root (unprivileged_bpf_disabled=2)"
+
+# Образы вспомогательных сервисов стенда (pull на VM 2026-11-17).
+[stand_images]
+python_client_stub = "python:3.13-alpine @ sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e"
+nstat_observer_base = "alpine:3.21 + iproute2/util-linux/curl/jq (observer.Dockerfile)"
+rst_observer_base = "ubuntu:26.04 + bpftrace из apt (rst-observer.Dockerfile); причина: bpftrace/bpftrace недоступен на docker hub и ghcr; 24.04 не знал BTF ядра 7.0"
+rst_observer_note = "bpftrace из ubuntu:26.04 совместим с tracepoint-формами ядра 7.0 стенда (attach проверен smoke 2026-11-17)"
+
+[netem.profiles.zero]
+rtt_ms = 0
+loss_pct = 0
+jitter_ms = 0
+
+[netem.profiles.e2e_default]
+rtt_ms = 50
+loss_pct = 0
+jitter_ms = 2
+
+[netem.profiles.e2e_lossy]
+rtt_ms = 100
+loss_pct = 1
+jitter_ms = 5

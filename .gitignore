@@ -1,0 +1,21 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Прогоны стенда: сырые данные публикуются отдельно, в репо не попадают
+runs/
+crates/harness/stand/state/
+
+# Захваты: приватность и объём — в репо не хранятся, в корпус попадают только нормализованные векторы
+*.pcap
+*.pcapng
+
+# Локальные среды
+.env
+deploy/wizard/
+*.bak
+*.candidate.json
+*.candidate.yaml
+.env.candidate
+__pycache__/
+*.pyc

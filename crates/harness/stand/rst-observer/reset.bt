@@ -1,0 +1,36 @@
+/* Минимальный reset-обозреватель (scaffold): tracepoints tcp_send_reset / tcp_receive_reset.
+ * Спека: phase-0.md §5. Форматы сняты с host-ядра 7.0.0-43 (2026-11-17):
+ *  - tcp_send_reset:   skbaddr, skaddr, state, reason(enum sk_rst_reason),
+ *                      saddr[28], daddr[28] — sockaddr-стиль (%pISpc), порт в байтах 2..3 BE.
+ *  - tcp_receive_reset: skaddr, sport, dport, family, saddr[4], daddr[4],
+ *                      saddr_v6[16], daddr_v6[16], sock_cookie(64) — cookie в самом трейсе.
+ *
+ * Корреляция (честно):
+ *  - sock_cookie в RECV_RESET идентифицирует КЕРНЕЛ-СОКЕТ получателя сброса
+ *    (DUT-сторона). Клиентский cookie (SO_COOKIE из client-stub) — другой сокет
+ *    и другой cookie; сопоставление сторон по 4-tuple + ts.
+ *  - SEND_RESET не содержит cookie: сокет-отправитель атрибутируется по 4-tuple;
+ *    skaddr==0x0 → сброс БЕЗ сокета (reason=NO_SOCKET=1) — socketless кейс.
+ *  - bpftrace не даёт bpf_get_socket_cookie из tracepoint — полный libbpf-обозреватель
+ *    (cookie и на SEND-стороне) — этап 5 §16.
+ *  - netns=curtask->nsproxy->net_ns->ns.inum — netns ЗАДАЧИ-ОБРАБОТЧИКА, не сокета
+ *    (на smoke 2026-11-17: одинаков во всех событиях — TCP softirq контекст).
+ *    Per-socket netns (sk->sk_net) и cookie на SEND-стороне — libbpf-обозреватель, этап 5 §16.
+ */
+
+tracepoint:tcp:tcp_send_reset
+{
+    printf("%llu SEND_RESET skaddr=0x%llx skbaddr=0x%llx state=%d reason=%d netns=%u saddr=%s daddr=%s\n",
+        nsecs, args->skaddr, args->skbaddr, args->state, args->reason,
+        curtask->nsproxy->net_ns->ns.inum,
+        buf(args->saddr, 28), buf(args->daddr, 28));
+}
+
+tracepoint:tcp:tcp_receive_reset
+{
+    printf("%llu RECV_RESET skaddr=0x%llx sport=%d dport=%d family=%d cookie=0x%llx netns=%u saddr=%s daddr=%s\n",
+        nsecs, args->skaddr, args->sport, args->dport, args->family,
+        args->sock_cookie,
+        curtask->nsproxy->net_ns->ns.inum,
+        ntop(args->saddr), ntop(args->daddr));
+}

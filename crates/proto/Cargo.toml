@@ -1,0 +1,20 @@
+[package]
+name = "mtveil-proto"
+version = "0.0.0"
+edition.workspace = true
+description = "Bounded FakeTLS/obfuscated2 codecs for the ADR-001 prototype"
+
+[dependencies]
+anyhow.workspace = true
+sha2.workspace = true
+hmac = "0.12"
+aes = "0.8"
+ctr = "0.9"
+rand = "0.8"
+subtle = "2"
+
+[dev-dependencies]
+hex.workspace = true
+
+[lints]
+workspace = true

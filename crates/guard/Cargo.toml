@@ -1,0 +1,8 @@
+[package]
+name = "mtveil-guard"
+version = "0.0.0"
+edition.workspace = true
+description = "Replay (tmpfs robust-mutex), suspects, canary. ПУСТО: spec-first, код после ADR-001"
+
+[lints]
+workspace = true

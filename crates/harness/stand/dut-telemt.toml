@@ -1,0 +1,29 @@
+# Конфиг DUT для infrastructure smoke (scaffold) — не бенчмарк-конфигурация.
+# Источник синтаксиса: telemt config.toml @ dac7aee (README/docs репозитория).
+
+[general]
+use_middle_proxy = false    # без ME-пула: Direct-семантика, ME-режимы — вне scaffold smoke
+log_level = "verbose"
+
+[general.modes]
+classic = false
+secure = false
+tls = true                  # FakeTLS (ee) — целевой режим ADR-000 §5.2
+
+[general.links]
+show = "*"
+
+[server]
+port = 443
+
+[[server.listeners]]
+ip = "0.0.0.0"
+
+[censorship]
+tls_domain = "petrovich.ru"   # нейтральный SNI для ee-секретов (как в примере upstream config.toml)
+mask = false                  # masking-forward в реальный веб выключен для smoke (детерминированность)
+tls_emulation = false         # тянет реальные cert-длины из сети — вне offline smoke
+
+[access.users]
+# format: "username" = "32_hex_chars_secret"
+smoke = "00112233445566778899aabbccddeeff"

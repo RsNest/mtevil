@@ -1,0 +1,15 @@
+**
+!Cargo.toml
+!Cargo.lock
+!crates/
+!crates/**
+!tests/
+!tests/vectors/
+!tests/vectors/prototype/
+!tests/vectors/prototype/**
+**/__pycache__
+**/*.pyc
+**/state
+**/target
+**/.env
+**/*secret*
