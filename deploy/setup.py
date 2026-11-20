@@ -122,7 +122,72 @@ def fail(msg: str) -> "NoReturn":
 
 
 def use_color() -> bool:
-    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    if not sys.stdout.isatty():
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("TERM", "").strip().lower() == "dumb":
+        return False
+    return True
+
+
+def supports_unicode() -> bool:
+    enc = (getattr(sys.stdout, "encoding", None) or "").lower()
+    if "utf" in enc:
+        return True
+    for var in ("LC_ALL", "LC_CTYPE", "LANG"):
+        if "utf" in os.environ.get(var, "").lower():
+            return True
+    return False
+
+
+def resolve_banner_version(image_ref: str) -> str:
+    env_ver = (os.environ.get("MTEVIL_SELECTED_VERSION") or "").strip()
+    if env_ver:
+        return env_ver
+    if image_ref and ":" in image_ref and "@sha256:" not in image_ref:
+        tail = image_ref.rsplit(":", 1)[-1].strip()
+        if tail and tail != "latest":
+            return tail
+    return "dev"
+
+
+def render_banner(
+    version: str,
+    *,
+    color: bool | None = None,
+    unicode_ok: bool | None = None,
+) -> str:
+    c = use_color() if color is None else color
+    u = supports_unicode() if unicode_ok is None else unicode_ok
+    g = "\033[1;32m" if c else ""
+    b = "\033[1m" if c else ""
+    d = "\033[2m" if c else ""
+    r = "\033[0m" if c else ""
+    if u:
+        lines = [
+            "",
+            f" {g}▄▄▄▄▄{r}   {b}mtevil{r} {d}{version}{r}",
+            f" {g}█ █ █{r}   {d}MTProto-прокси для Telegram{r}",
+            f" {g}▀ ▀ ▀{r}",
+            "",
+        ]
+    else:
+        lines = [
+            "",
+            f" {g}__ __{r}   {b}mtevil{r} {d}{version}{r}",
+            f" {g}| | |{r}   {d}MTProto-proxy for Telegram{r}",
+            f" {g}' ' '{r}",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+def print_wizard_banner(image_ref: str) -> None:
+    if not sys.stdout.isatty() or os.environ.get("MTEVIL_BANNER_SHOWN") == "1":
+        return
+    print(render_banner(resolve_banner_version(image_ref)))
+    os.environ["MTEVIL_BANNER_SHOWN"] = "1"
 
 
 def style(text: str, code: str) -> str:
@@ -780,30 +845,96 @@ def wait_healthy(base: list[str], timeout_s: int = 45) -> None:
     raise TimeoutError("mtevil container did not become healthy within 45s")
 
 
-def configure_role() -> str:
+def choose_wizard_mode(default: str = "simple") -> str:
+    default_num = "2" if default == "advanced" else "1"
     print()
-    print(heading("Настройка прокси для Telegram"))
-    print("\nКак вы хотите подключаться?")
-    print("  1. Через один зарубежный сервер — подойдёт для первой установки")
-    print("  2. Через несколько серверов — отдельный вход и зарубежный выход")
+    print(heading("Выберите режим установки"))
+    print("  1. Простая установка · один VPS [по умолчанию]")
+    print("  2. Расширенная настройка · ручные параметры и несколько серверов")
     print()
-    choice = ask("Ваш выбор", "1").lower()
-    while choice not in ("1", "2", "direct", "egress", "edge"):
-        choice = ask("Введите 1 или 2", "1").lower()
-    if choice in ("1", "direct"):
-        return "direct"
-    if choice in ("egress", "edge"):
-        return choice
+    while True:
+        choice = ask("Ваш выбор", default_num).lower()
+        if choice in ("1", "simple", "s", "простая"):
+            return "simple"
+        if choice in ("2", "advanced", "a", "adv", "расширенная"):
+            return "advanced"
+        print("Некорректный выбор: введите 1 (простая установка) или 2 (расширенная настройка).")
 
-    print("\nЧто вы настраиваете на этом сервере?")
-    print("  1. Зарубежный сервер выхода (egress) — принимает трафик от входного сервера и отправляет в Telegram. Настраивается первым.")
-    print("  2. Входной сервер (edge) — принимает подключения Telegram и передаёт их на один или несколько egress.")
+
+def ask_simple_confirm() -> str:
+    while True:
+        raw = input("Продолжить? [Enter — установить / a — расширенная настройка / n — отмена] [Y/a/n]: ").strip().lower()
+        if raw in ("", "y", "yes", "д", "да", "у"):
+            return "install"
+        if raw in ("a", "adv", "advanced", "2", "р"):
+            return "advanced"
+        if raw in ("n", "no", "н", "нет"):
+            return "cancel"
+        print("Некорректный выбор: введите y (установить), a (расширенная настройка) или n (отмена).")
+
+
+def choose_advanced_role(default_role: str = "direct") -> str:
+    default_map = {"direct": "1", "edge": "2", "egress": "3"}
+    default_num = default_map.get(default_role, "1")
     print()
-    sub = ask("Ваш выбор", "1").lower()
-    mapping = {"1": "egress", "egress": "egress", "2": "edge", "edge": "edge"}
-    while sub not in mapping:
-        sub = ask("Введите 1 (egress) или 2 (edge)", "1").lower()
-    return mapping[sub]
+    print(heading("Шаг 1. Роль сервера"))
+    print("  1. direct — один зарубежный VPS")
+    print("  2. edge   — входной сервер (принимает Telegram и передаёт на egress)")
+    print("  3. egress — зарубежный сервер выхода (настраивается до edge)")
+    print()
+    mapping = {
+        "1": "direct",
+        "direct": "direct",
+        "2": "edge",
+        "edge": "edge",
+        "3": "egress",
+        "egress": "egress",
+    }
+    while True:
+        choice = ask("Роль", default_num).lower()
+        if choice in mapping:
+            return mapping[choice]
+        print("Некорректный выбор: введите 1 (direct), 2 (edge) или 3 (egress).")
+
+
+def ask_egress_upstreams(default_upstreams: str | None) -> list[str]:
+    while True:
+        raw_list = ask("Основной (или список через запятую) адрес egress (IP:port)", default_upstreams)
+        try:
+            upstreams = [validate_endpoint(item) for item in raw_list.split(",") if item.strip()]
+            if not upstreams:
+                raise ValueError("укажите хотя бы один адрес IP:port")
+            return upstreams
+        except ValueError as exc:
+            print(f"Некорректный адрес egress: {exc}. Формат: IP:PORT (например, 10.203.0.9:29443).")
+
+
+def choose_egress_strategy(default_strategy: str = "ordered") -> str:
+    print("\nСтратегия распределения новых подключений между узлами egress:")
+    print("  1. ordered     — сначала основной egress; при сбое — резервные по порядку")
+    print("  2. round-robin — равномерно по кругу между всеми egress")
+    default_strat = "2" if default_strategy == "round-robin" else "1"
+    mapping = {"1": "ordered", "ordered": "ordered", "2": "round-robin", "round-robin": "round-robin"}
+    while True:
+        strat_choice = ask("Стратегия [1/2]", default_strat).lower()
+        if strat_choice in mapping:
+            return mapping[strat_choice]
+        print("Некорректный выбор: введите 1 (ordered) или 2 (round-robin).")
+
+
+def format_status_command(deploy_dir: Path) -> str:
+    ctl_path = deploy_dir / "mtevilctl"
+    resolved = deploy_dir.resolve()
+    home = Path.home()
+    if ctl_path.is_file():
+        if resolved in ((home / "mtevil").resolve(), (home / "mtveil").resolve()):
+            return "mtevilctl status"
+        return f'MTEVIL_DIR="{resolved}" "{ctl_path.resolve()}" status'
+    return f'python3 "{(deploy_dir / "setup.py").resolve()}" status --dir "{resolved}"'
+
+
+def configure_role() -> str:
+    return choose_advanced_role("direct")
 
 
 def load_existing_defaults(deploy_dir: Path) -> dict[str, object]:
@@ -820,6 +951,13 @@ def load_existing_defaults(deploy_dir: Path) -> dict[str, object]:
             cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
             if isinstance(cfg, dict):
                 defaults["config"] = cfg
+        except Exception:
+            pass
+    compose_file = deploy_dir / "compose.yaml"
+    if compose_file.is_file():
+        try:
+            compose_txt = compose_file.read_text(encoding="utf-8", errors="ignore")
+            defaults["network_host"] = "network_mode: host" in compose_txt
         except Exception:
             pass
     return defaults
@@ -1804,6 +1942,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", type=str, default=None, help="Docker Compose project name")
     parser.add_argument("--image", type=str, default=DEFAULT_IMAGE, help="Docker image tag")
     parser.add_argument("--no-build", action="store_true", help="Skip docker compose build")
+    parser.add_argument(
+        "--mode",
+        choices=("simple", "advanced"),
+        default=None,
+        help="Wizard mode: simple (single VPS direct) or advanced (manual settings & edge/egress)",
+    )
     parser.add_argument("--role", choices=("direct", "egress", "edge"), default=None, help="Deployment role (non-interactive override)")
     parser.add_argument(
         "--network-host",
@@ -1833,6 +1977,25 @@ def main(argv: list[str] | None = None) -> int:
             return perform_rollback(deploy_dir)
         return run_traffic_command(deploy_dir, live=args.live, max_iterations=args.iterations)
 
+    # Resolve conflicting CLI flags explicitly before prompting.
+    if args.mode == "simple" and args.role in ("edge", "egress"):
+        print(
+            err_text(
+                f"Конфликт параметров: --mode simple поддерживает только роль direct (указана --role {args.role}). "
+                f"Для {args.role} используйте --mode advanced --role {args.role}."
+            ),
+            file=sys.stderr,
+        )
+        return 1
+    if args.mode == "simple" and args.network_host:
+        print(
+            err_text("Конфликт параметров: флаг --network-host доступен только в расширенном режиме (--mode advanced)."),
+            file=sys.stderr,
+        )
+        return 1
+
+    print_wizard_banner(args.image)
+
     deploy_dir = (args.dir or (repo_root / "deploy" / "wizard")).resolve()
 
     check_prerequisites()
@@ -1840,167 +2003,260 @@ def main(argv: list[str] | None = None) -> int:
     saved = load_existing_defaults(deploy_dir)
     saved_cfg = saved.get("config") if isinstance(saved.get("config"), dict) else {}
     existing_cfg = deploy_dir / "config.json"
+    existing_role = str(saved_cfg.get("role") or "")
+    if existing_role == "direct" and saved_cfg.get("egress_upstreams"):
+        existing_role = "edge"
+    existing_network_host = bool(saved.get("network_host", False))
+
     if existing_cfg.exists():
         print(f"\nНайдена существующая конфигурация в {deploy_dir}")
-        if not ask_yes_no("Перенастроить её с сохранением текущих секретов/токенов?", default=False):
+        if existing_role:
+            cur_port = str(saved.get("MTEVIL_PORT") or "")
+            cur_host = str(saved.get("MTEVIL_PUBLIC_HOST") or saved.get("MTEVIL_BIND") or "")
+            cur_net = "host" if existing_network_host else "bridge"
+            addr_part = f", {cur_host}:{cur_port}" if (cur_host and cur_port) else ""
+            print(f"  Текущая установка: роль {existing_role}{addr_part}, сеть {cur_net}")
+        if not ask_yes_no("Перенастроить её с сохранением текущих секретов, пользователей и токенов?", default=False):
             print("Отменено без изменений.")
             return 0
+        if args.mode == "simple" and existing_role in ("edge", "egress") and args.role != "direct":
+            print(
+                err_text(
+                    f"Текущая установка имеет роль {existing_role}. Для её перенастройки используйте --mode advanced "
+                    "(или укажите --role direct для явной смены роли)."
+                ),
+                file=sys.stderr,
+            )
+            return 1
 
-    role = args.role or configure_role()
-    project = args.project or str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
+    if args.mode is not None:
+        mode = args.mode
+    elif args.role in ("edge", "egress") or args.network_host:
+        mode = "advanced"
+    elif args.role == "direct":
+        mode = "simple"
+    elif existing_cfg.exists() and existing_role in ("edge", "egress"):
+        mode = "advanced"
+    else:
+        mode = choose_wizard_mode(default="simple")
 
     default_bind = str(saved.get("MTEVIL_BIND") or "0.0.0.0")
     default_sni = str(saved_cfg.get("sni") or "example.com")
     default_cover = str(saved_cfg.get("cover") or f"{default_sni}:443")
+    use_network_host = True if args.network_host else existing_network_host
     advanced_changed: list[str] = []
+    carry_host: str | None = None
+    carry_port: int | None = None
+    dns_records: dict[str, list[str]] | None = None
 
-    if role == "direct":
-        default_port = str(saved.get("MTEVIL_PORT") or "443")
-        default_host = str(saved.get("MTEVIL_PUBLIC_HOST") or "") or detect_local_global_ipv4()
-        public_host, dns_records = prompt_client_address(default_host)
-        print(f"\nНа каком TCP-порту принимать подключения?")
-        print(f"Нажмите Enter, чтобы использовать {default_port}.")
-        pub_port = ask_validated("Порт", validate_port, default_port)
+    if mode == "simple":
+        role = "direct"
+        project = args.project or str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
         bind_ip = default_bind
         sni = default_sni
         cover = default_cover
-        print("\nРасширенные настройки (по умолчанию):")
-        print(f"  IP прослушивания: {bind_ip}")
-        print(f"  Маскировка (HTTPS-cover): {cover} (SNI: {sni})")
-        if ask_yes_no("Изменить расширенные настройки?", default=False):
-            bind_ip = ask_validated("IP интерфейса для привязки на хосте", validate_ip, default_bind)
-            sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, default_sni)
-            cover = ask("Адрес HTTPS-cover (host:port)", f"{sni}:443")
-            if dns_records is not None:
-                check_domain_expected_ips(dns_records)
-            if bind_ip != default_bind:
-                advanced_changed.append(f"IP привязки: {bind_ip}")
-            if sni != default_sni or cover != default_cover:
-                advanced_changed.append(f"HTTPS-cover: {cover} (SNI: {sni})")
-        pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=True)
-        config_data = {
-            "role": "direct",
-            "listen": "0.0.0.0:24443",
-            "secret_file": "/var/lib/mtevil/proxy-secret",
-            "users_file": "/var/lib/mtevil/users.json",
-            "replay_file": "/var/lib/mtevil/replay.bin",
-            "sni": sni,
-            "cover": cover,
-            "dc": DEFAULT_DCS,
-            "max_connections": 256,
-            "client_hello_timeout_secs": 5,
-            "handshake_timeout_secs": 10,
-            "idle_timeout_secs": 300,
-            "drain_timeout_secs": 5,
-            "fake_tls_cert_bytes": 2878,
-            "fake_tls_cert_jitter": 256,
-            "flight_shaping": True,
-            "client_mss": 100,
-            "client_mss_bulk": 1380,
-        }
-    elif role == "egress":
-        default_egress_port = str(saved.get("MTEVIL_PORT") or "29443")
-        default_egress_bind = str(saved.get("MTEVIL_BIND") or "")
-        print("\nУкажите приватный IP этого сервера, по которому до него сможет дотянуться входной сервер (edge).")
-        print("(Например, адрес интерфейса WireGuard, AmneziaWG или SharX; 0.0.0.0 запрещён.)")
-        bind_ip = ask_validated("Локальный IP туннеля", validate_egress_ip, default_egress_bind or None)
-        pub_port = ask_validated("TCP-порт egress", validate_port, default_egress_port)
-        pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=False)
-        public_host = bind_ip
-        config_data = {
-            "role": "egress",
-            "listen": "0.0.0.0:29443",
-            "egress_token_file": "/var/lib/mtevil/egress-token",
-            "dc": DEFAULT_DCS,
-            "max_connections": 512,
-            "handshake_timeout_secs": 10,
-            "idle_timeout_secs": 300,
-            "drain_timeout_secs": 5,
-        }
-    else:  # edge
-        default_port = str(saved.get("MTEVIL_PORT") or "443")
-        default_host = str(saved.get("MTEVIL_PUBLIC_HOST") or "") or detect_local_global_ipv4()
-        public_host, dns_records = prompt_client_address(default_host)
-        print(f"\nНа каком TCP-порту принимать подключения?")
-        print(f"Нажмите Enter, чтобы использовать {default_port}.")
-        pub_port = ask_validated("Порт", validate_port, default_port)
-        bind_ip = default_bind
-        sni = default_sni
-        cover = default_cover
-        print("\nРасширенные настройки (по умолчанию):")
-        print(f"  IP прослушивания: {bind_ip}")
-        print(f"  Маскировка (HTTPS-cover): {cover} (SNI: {sni})")
-        if ask_yes_no("Изменить расширенные настройки?", default=False):
-            bind_ip = ask_validated("IP интерфейса для привязки на хосте", validate_ip, default_bind)
-            sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, default_sni)
-            cover = ask("Адрес HTTPS-cover (host:port)", f"{sni}:443")
-            if dns_records is not None:
-                check_domain_expected_ips(dns_records)
-            if bind_ip != default_bind:
-                advanced_changed.append(f"IP привязки: {bind_ip}")
-            if sni != default_sni or cover != default_cover:
-                advanced_changed.append(f"HTTPS-cover: {cover} (SNI: {sni})")
-        pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=True)
-        print("\nУкажите один или несколько адресов egress (IP:port) в порядке приоритета (через запятую или по одному).")
-        saved_upstreams = saved_cfg.get("egress_upstreams") if isinstance(saved_cfg.get("egress_upstreams"), list) else []
-        default_upstreams = ",".join(str(x) for x in saved_upstreams) if saved_upstreams else None
-        upstreams: list[str] = []
-        raw_list = ask("Основной (или список через запятую) адрес egress (IP:port)", default_upstreams)
-        for item in raw_list.split(","):
-            upstreams.append(validate_endpoint(item))
-        while ask_yes_no("Добавить резервный egress?", default=False):
-            upstreams.append(ask_validated("Резервный адрес egress (IP:port)", validate_endpoint))
-        print("\nКак распределять новые подключения между узлами egress:")
-        print("  1. ordered     — новые подключения идут на основной egress; при его сбое — на резервные по порядку")
-        print("  2. round-robin — новые подключения распределяются по кругу между всеми egress")
-        default_strat = "2" if saved_cfg.get("egress_strategy") == "round-robin" else "1"
-        strat_choice = ask("Стратегия [1/2]", default_strat).lower()
-        strategy = "ordered" if strat_choice in ("1", "ordered") else "round-robin"
-        config_data = {
-            "role": "edge",
-            "listen": "0.0.0.0:24443",
-            "secret_file": "/var/lib/mtevil/proxy-secret",
-            "users_file": "/var/lib/mtevil/users.json",
-            "replay_file": "/var/lib/mtevil/replay.bin",
-            "sni": sni,
-            "cover": cover,
-            "egress_upstreams": upstreams,
-            "egress_strategy": strategy,
-            "egress_token_file": "/var/lib/mtevil/egress-token",
-            "max_connections": 256,
-            "client_hello_timeout_secs": 5,
-            "handshake_timeout_secs": 10,
-            "idle_timeout_secs": 300,
-            "drain_timeout_secs": 5,
-            "fake_tls_cert_bytes": 2878,
-            "fake_tls_cert_jitter": 256,
-            "flight_shaping": True,
-            "client_mss": 100,
-            "client_mss_bulk": 1380,
-        }
+        default_port = int(saved.get("MTEVIL_PORT") or 443)
 
-    print()
-    print(heading("Параметры установки"))
-    role_names = {
-        "direct": "Один зарубежный сервер (direct)",
-        "egress": "Зарубежный сервер выхода (egress)",
-        "edge": "Входной сервер (edge)",
-    }
-    print(f"  Режим: {role_names[role]}")
-    if role in ("direct", "edge"):
-        print(f"  Адрес для Telegram: {public_host}:{pub_port}")
-    else:
-        print(f"  Адрес выхода: {bind_ip}:{pub_port}")
-    if role == "edge":
-        print(f"  Узлы egress: {', '.join(upstreams)} ({strategy})")
-    if advanced_changed:
-        for item in advanced_changed:
-            print(f"  {item}")
-    elif role in ("direct", "edge"):
-        print("  Расширенные настройки: по умолчанию")
+        saved_host = str(saved.get("MTEVIL_PUBLIC_HOST") or "").strip()
+        if saved_host:
+            public_host = saved_host
+            host_source = "из текущей конфигурации"
+        else:
+            detected_ip = detect_local_global_ipv4()
+            if detected_ip:
+                public_host = detected_ip
+                host_source = "определён автоматически"
+            else:
+                print("\nНе удалось автоматически определить публичный IPv4-адрес этого сервера.")
+                public_host, dns_records = prompt_client_address(None)
+                host_source = "указан вручную"
+
+        if deployment_owns_port(deploy_dir, project, bind_ip, default_port) or is_port_available(bind_ip, default_port):
+            pub_port = default_port
+        else:
+            pub_port = ensure_available_port(deploy_dir, project, bind_ip, default_port, show_link_note=True)
+
+        print()
+        print(heading("Параметры простой установки (direct)"))
+        print(f"  Публичный адрес:  {public_host} ({host_source})")
+        print(f"  Порт:             {pub_port} (свободен)")
+        print(f"  Каталог:          {deploy_dir}")
+        print()
+        action = ask_simple_confirm()
+        if action == "cancel":
+            print("Отменено без изменений.")
+            return 0
+        if action == "advanced":
+            mode = "advanced"
+            carry_host = public_host
+            carry_port = pub_port
+        else:
+            config_data = {
+                "role": "direct",
+                "listen": "0.0.0.0:24443",
+                "secret_file": "/var/lib/mtevil/proxy-secret",
+                "users_file": "/var/lib/mtevil/users.json",
+                "replay_file": "/var/lib/mtevil/replay.bin",
+                "sni": sni,
+                "cover": cover,
+                "dc": DEFAULT_DCS,
+                "max_connections": 256,
+                "client_hello_timeout_secs": 5,
+                "handshake_timeout_secs": 10,
+                "idle_timeout_secs": 300,
+                "drain_timeout_secs": 5,
+                "fake_tls_cert_bytes": 2878,
+                "fake_tls_cert_jitter": 256,
+                "flight_shaping": True,
+                "client_mss": 100,
+                "client_mss_bulk": 1380,
+            }
+
+    if mode == "advanced":
+        default_role = existing_role if existing_role in ("direct", "edge", "egress") else "direct"
+        role = args.role or choose_advanced_role(default_role)
+        project = args.project or str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
+
+        if role == "direct":
+            print("\n" + heading("Шаг 2. Сеть и адрес"))
+            default_host = carry_host or str(saved.get("MTEVIL_PUBLIC_HOST") or "") or detect_local_global_ipv4()
+            public_host, dns_records = prompt_client_address(default_host)
+            default_port_str = str(carry_port or saved.get("MTEVIL_PORT") or "443")
+            pub_port = ask_validated("Публичный TCP-порт", validate_port, default_port_str)
+            bind_ip = ask_validated("IP интерфейса для привязки на хосте", validate_ip, default_bind)
+            if not args.network_host:
+                use_network_host = ask_yes_no("Использовать сетевой режим host (--network-host)?", default=existing_network_host)
+            pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=True)
+
+            print("\n" + heading("Шаг 3. Маскировка (HTTPS-cover)"))
+            sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, default_sni)
+            cover_default = default_cover if sni == default_sni else f"{sni}:443"
+            cover = ask("Адрес HTTPS-cover (host:port)", cover_default)
+            if dns_records is not None:
+                check_domain_expected_ips(dns_records)
+            if bind_ip != "0.0.0.0":
+                advanced_changed.append(f"IP привязки: {bind_ip}")
+            if sni != "example.com" or cover != "example.com:443":
+                advanced_changed.append(f"HTTPS-cover: {cover} (SNI: {sni})")
+            config_data = {
+                "role": "direct",
+                "listen": "0.0.0.0:24443",
+                "secret_file": "/var/lib/mtevil/proxy-secret",
+                "users_file": "/var/lib/mtevil/users.json",
+                "replay_file": "/var/lib/mtevil/replay.bin",
+                "sni": sni,
+                "cover": cover,
+                "dc": DEFAULT_DCS,
+                "max_connections": 256,
+                "client_hello_timeout_secs": 5,
+                "handshake_timeout_secs": 10,
+                "idle_timeout_secs": 300,
+                "drain_timeout_secs": 5,
+                "fake_tls_cert_bytes": 2878,
+                "fake_tls_cert_jitter": 256,
+                "flight_shaping": True,
+                "client_mss": 100,
+                "client_mss_bulk": 1380,
+            }
+        elif role == "egress":
+            print("\n" + heading("Шаг 2. Сеть и адрес выхода"))
+            default_egress_port = str(saved.get("MTEVIL_PORT") or "29443")
+            default_egress_bind = str(saved.get("MTEVIL_BIND") or "")
+            print("Укажите приватный IP этого сервера, по которому до него дотянется edge (0.0.0.0 запрещён).")
+            bind_ip = ask_validated("Локальный IP туннеля", validate_egress_ip, default_egress_bind or None)
+            pub_port = ask_validated("TCP-порт egress", validate_port, default_egress_port)
+            if not args.network_host:
+                use_network_host = ask_yes_no("Использовать сетевой режим host (--network-host)?", default=existing_network_host)
+            pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=False)
+            public_host = bind_ip
+            config_data = {
+                "role": "egress",
+                "listen": "0.0.0.0:29443",
+                "egress_token_file": "/var/lib/mtevil/egress-token",
+                "dc": DEFAULT_DCS,
+                "max_connections": 512,
+                "handshake_timeout_secs": 10,
+                "idle_timeout_secs": 300,
+                "drain_timeout_secs": 5,
+            }
+        else:  # edge
+            print("\n" + heading("Шаг 2. Сеть и адрес"))
+            default_host = carry_host or str(saved.get("MTEVIL_PUBLIC_HOST") or "") or detect_local_global_ipv4()
+            public_host, dns_records = prompt_client_address(default_host)
+            default_port_str = str(carry_port or saved.get("MTEVIL_PORT") or "443")
+            pub_port = ask_validated("Публичный TCP-порт", validate_port, default_port_str)
+            bind_ip = ask_validated("IP интерфейса для привязки на хосте", validate_ip, default_bind)
+            if not args.network_host:
+                use_network_host = ask_yes_no("Использовать сетевой режим host (--network-host)?", default=existing_network_host)
+            pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=True)
+
+            print("\n" + heading("Шаг 3. Маскировка (HTTPS-cover)"))
+            sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, default_sni)
+            cover_default = default_cover if sni == default_sni else f"{sni}:443"
+            cover = ask("Адрес HTTPS-cover (host:port)", cover_default)
+            if dns_records is not None:
+                check_domain_expected_ips(dns_records)
+            if bind_ip != "0.0.0.0":
+                advanced_changed.append(f"IP привязки: {bind_ip}")
+            if sni != "example.com" or cover != "example.com:443":
+                advanced_changed.append(f"HTTPS-cover: {cover} (SNI: {sni})")
+
+            print("\n" + heading("Шаг 4. Узлы egress и отказоустойчивость"))
+            saved_upstreams = saved_cfg.get("egress_upstreams") if isinstance(saved_cfg.get("egress_upstreams"), list) else []
+            default_upstreams = ",".join(str(x) for x in saved_upstreams) if saved_upstreams else None
+            upstreams = ask_egress_upstreams(default_upstreams)
+            while ask_yes_no("Добавить резервный egress?", default=False):
+                upstreams.append(ask_validated("Резервный адрес egress (IP:port)", validate_endpoint))
+            default_strat = "round-robin" if saved_cfg.get("egress_strategy") == "round-robin" else "ordered"
+            strategy = choose_egress_strategy(default_strat)
+            config_data = {
+                "role": "edge",
+                "listen": "0.0.0.0:24443",
+                "secret_file": "/var/lib/mtevil/proxy-secret",
+                "users_file": "/var/lib/mtevil/users.json",
+                "replay_file": "/var/lib/mtevil/replay.bin",
+                "sni": sni,
+                "cover": cover,
+                "egress_upstreams": upstreams,
+                "egress_strategy": strategy,
+                "egress_token_file": "/var/lib/mtevil/egress-token",
+                "max_connections": 256,
+                "client_hello_timeout_secs": 5,
+                "handshake_timeout_secs": 10,
+                "idle_timeout_secs": 300,
+                "drain_timeout_secs": 5,
+                "fake_tls_cert_bytes": 2878,
+                "fake_tls_cert_jitter": 256,
+                "flight_shaping": True,
+                "client_mss": 100,
+                "client_mss_bulk": 1380,
+            }
+
+        print()
+        print(heading("Параметры установки"))
+        role_names = {
+            "direct": "Один зарубежный сервер (direct)",
+            "egress": "Зарубежный сервер выхода (egress)",
+            "edge": "Входной сервер (edge)",
+        }
+        print(f"  Роль:              {role_names[role]}")
+        if role in ("direct", "edge"):
+            print(f"  Адрес для Telegram: {public_host}:{pub_port}")
+            print(f"  IP привязки:       {bind_ip}")
+            print(f"  HTTPS-cover:       {cover} (SNI: {sni})")
+        else:
+            print(f"  Адрес выхода:      {bind_ip}:{pub_port}")
+        print(f"  Сетевой режим:     {'host' if use_network_host else 'bridge'}")
+        if role == "edge":
+            print(f"  Узлы egress:       {', '.join(upstreams)} ({strategy})")
+        print(f"  Каталог:           {deploy_dir}")
+        print()
+        if not ask_yes_no("Применить конфигурацию и запустить контейнер?", default=True):
+            print("Отменено без изменений.")
+            return 0
 
     deploy_dir.mkdir(parents=True, exist_ok=True)
-    if args.network_host:
+    if use_network_host:
         if bind_ip == "::":
             config_data["listen"] = f"[::]:{pub_port}"
             health_host = "::1"
@@ -2043,7 +2299,7 @@ def main(argv: list[str] | None = None) -> int:
                 deploy_dir,
                 role,
                 "config.candidate.json",
-                network_host=args.network_host,
+                network_host=use_network_host,
                 health_host=health_host,
                 health_port=pub_port,
                 include_build=include_build,
@@ -2148,7 +2404,7 @@ def main(argv: list[str] | None = None) -> int:
             if check_proc.returncode != 0:
                 if check_proc.stderr.strip():
                     print(check_proc.stderr.strip(), file=sys.stderr)
-                if "tcp_connect_timeout" in check_proc.stdout and not args.network_host:
+                if "tcp_connect_timeout" in check_proc.stdout and not use_network_host:
                     print(
                         "Подсказка: если egress доступен с хоста по приватному маршруту/туннелю, "
                         "но не отвечает из Docker bridge, перезапустите мастер с флагом --network-host.",
@@ -2165,7 +2421,7 @@ def main(argv: list[str] | None = None) -> int:
             deploy_dir,
             role,
             "config.json",
-            network_host=args.network_host,
+            network_host=use_network_host,
             health_host=health_host,
             health_port=pub_port,
             include_build=include_build,
@@ -2253,7 +2509,7 @@ def main(argv: list[str] | None = None) -> int:
                 + (f"MTEVIL_PUBLIC_HOST={public_host}\n" if role in ("direct", "edge") else ""),
                 encoding="utf-8",
             )
-            if args.network_host:
+            if use_network_host:
                 listen_addr, health_host = compute_listen_and_health(bind_ip, pub_port, True)
                 config_data["listen"] = listen_addr
                 (deploy_dir / "config.json").write_text(json.dumps(config_data, indent=2) + "\n", encoding="utf-8")
@@ -2301,7 +2557,8 @@ def main(argv: list[str] | None = None) -> int:
                     rb_err = (rb_up.stderr or rb_up.stdout or "").strip()
                     print(err_text(f"Не удалось перезапустить прежний контейнер после отката: {rb_err}"), file=sys.stderr)
 
-    print(ok_text("Контейнер исправен"))
+    print(ok_text("Контейнер исправен (Docker healthcheck: локальный порт отвечает; сквозная связь с Telegram проверяется при подключении клиента)"))
+    status_cmd = format_status_command(deploy_dir)
 
     if role in ("direct", "edge"):
         link = run(
@@ -2321,28 +2578,26 @@ def main(argv: list[str] | None = None) -> int:
             ]
         ).stdout.strip()
         print("\n" + heading("Ссылка для подключения в Telegram"))
-        print(f"  {link}\n")
-        print("Дальше:")
-        print("  1. Откройте ссылку на телефоне или компьютере и нажмите «Подключить прокси».")
-        print("  2. Ссылка даёт доступ к прокси — передавайте её только тем, кому доверяете.")
-        print("  3. Для проверки откройте любой чат и загрузите фото или видео (включая мобильную сеть).")
+        print(link)
+        print()
+        print(f"Каталог установки: {deploy_dir}")
+        print(f"Проверка статуса:  {status_cmd}")
+        if mode == "simple":
+            print("\nОткройте ссылку в Telegram, нажмите «Подключить прокси» и проверьте отправку сообщения.")
+            print("Справочник по диагностике, обновлению и откату: deploy/README.md")
+        else:
+            print("\nДальше:")
+            print("  1. Откройте ссылку в Telegram и нажмите «Подключить прокси» (сквозная связь проверяется клиентом).")
+            print("  2. Ссылка даёт доступ к прокси — передавайте её только тем, кому доверяете.")
+            print("  3. Дополнительная диагностика и команды управления описаны в deploy/README.md.")
     else:
         print("\n" + heading("Что указать на входном сервере (edge)"))
         print(f"  Адрес выхода: {bind_ip}:{pub_port}")
-        print(f"  Режим в мастере на edge: 2 (несколько серверов) -> 2 (Входной сервер (edge))")
+        print("  Режим в мастере на edge: 2 (Расширенная настройка) -> 2 (edge)")
         print(f"  Получить токен MTV2 безопасно: docker compose {compose_ref} exec -T {compose_service(base)} cat /var/lib/mtevil/egress-token")
-
-    print("\nУправление и диагностика:")
-    ctl_path = deploy_dir / "mtevilctl"
-    ctl_cmd = "mtevilctl" if ctl_path.is_file() else f'python3 "{(deploy_dir / "setup.py").resolve()}"'
-    print(f"  {ctl_cmd} status")
-    print(f"  {ctl_cmd} traffic --live")
-    print(f"  {ctl_cmd} update")
-    print(f"  {ctl_cmd} rollback")
-    print(f"  docker compose {compose_ref} ps")
-    print(f"  docker compose {compose_ref} logs --tail=100 {compose_service(base)}")
-    if role == "edge":
-        print(f"  docker compose {compose_ref} exec {compose_service(base)} mtevil check-egress --config /etc/mtevil/config.json --dc 2")
+        print()
+        print(f"Каталог установки: {deploy_dir}")
+        print(f"Проверка статуса:  {status_cmd}")
 
     return 0
 

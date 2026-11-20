@@ -16,7 +16,41 @@ for arg in "$@"; do
     FORWARD_ARGS+=("$arg")
   fi
 done
-set -- "${FORWARD_ARGS[@]}"
+set -- ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+
+print_banner() {
+  local ver="$1"
+  if [ ! -t 1 ] || [ "${MTEVIL_BANNER_SHOWN:-0}" = "1" ]; then
+    return 0
+  fi
+  local use_color=1
+  if [ -n "${NO_COLOR:-}" ] || [ "${TERM:-}" = "dumb" ]; then
+    use_color=0
+  fi
+  local use_utf8=0
+  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *UTF-8*|*utf-8*|*UTF8*|*utf8*) use_utf8=1 ;;
+  esac
+  local g="" b="" d="" r=""
+  if [ "$use_color" -eq 1 ]; then
+    g=$'\033[1;32m'
+    b=$'\033[1m'
+    d=$'\033[2m'
+    r=$'\033[0m'
+  fi
+  if [ "$use_utf8" -eq 1 ]; then
+    printf '\n'
+    printf ' %s▄▄▄▄▄%s   %smtevil%s %s%s%s\n' "$g" "$r" "$b" "$r" "$d" "$ver" "$r"
+    printf ' %s█ █ █%s   %sMTProto-прокси для Telegram%s\n' "$g" "$r" "$d" "$r"
+    printf ' %s▀ ▀ ▀%s\n\n' "$g" "$r"
+  else
+    printf '\n'
+    printf ' %s__ __%s   %smtevil%s %s%s%s\n' "$g" "$r" "$b" "$r" "$d" "$ver" "$r"
+    printf ' %s| | |%s   %sMTProto-proxy for Telegram%s\n' "$g" "$r" "$d" "$r"
+    printf " %s' ' '%s\n\n" "$g" "$r"
+  fi
+  export MTEVIL_BANNER_SHOWN=1
+}
 
 MTEVIL_CHANNEL_NORM="$(printf '%s' "$MTEVIL_CHANNEL" | tr '[:upper:]' '[:lower:]')"
 case "$MTEVIL_CHANNEL_NORM" in
@@ -158,6 +192,9 @@ PY
   fi
   exec bash "$PINNED_INSTALL" "$@"
 fi
+
+print_banner "$MTEVIL_VERSION"
+export MTEVIL_SELECTED_VERSION="$MTEVIL_VERSION"
 
 if ! docker_err="$(docker info 2>&1 >/dev/null)"; then
   echo "Docker не отвечает: не удалось подключиться к Docker Engine." >&2

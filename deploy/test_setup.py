@@ -154,7 +154,10 @@ class SetupValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             project = f"mtevil-short-test-{free_port}"
-            stdin_data = f"1\n127.0.0.1\n{free_port}\nn\n"
+            # Fresh Simple mode when public IPv4 is detected and default port (443) is free:
+            # ONLY 2 prompts (mode selection + final confirmation)!
+            # Here we test free port via is_port_available mock for 443 OR fallback to free_port.
+            stdin_data = f"1\n{free_port}\ny\n"
             out_buf = io.StringIO()
             err_buf = io.StringIO()
             try:
@@ -163,6 +166,8 @@ class SetupValidationTests(unittest.TestCase):
                     mock.patch.object(sys, "stdin", io.StringIO(stdin_data)),
                     mock.patch.object(sys, "stdout", out_buf),
                     mock.patch.object(sys, "stderr", err_buf),
+                    mock.patch.object(setup, "detect_local_global_ipv4", return_value="127.0.0.1"),
+                    mock.patch.object(setup, "is_port_available", side_effect=lambda _ip, port: port != 443),
                 ):
                     rc = setup.main()
                 out = out_buf.getvalue()
@@ -172,7 +177,12 @@ class SetupValidationTests(unittest.TestCase):
                 self.assertIn("HTTPS-сайт для маскировки доступен", out)
                 self.assertIn("Контейнер запущен", out)
                 self.assertIn("Контейнер исправен", out)
-                self.assertIn(f"https://t.me/proxy?server=127.0.0.1&port={free_port}&secret=", out)
+                self.assertIn("Docker healthcheck", out)
+                self.assertIn(f"Каталог установки: {d.resolve()}", out)
+                self.assertIn("Проверка статуса:", out)
+                # Telegram link must appear on its own line.
+                link_lines = [ln for ln in out.splitlines() if ln.startswith(f"https://t.me/proxy?server=127.0.0.1&port={free_port}&secret=")]
+                self.assertEqual(len(link_lines), 1, out)
             finally:
                 base = setup.compose_cmd(d, project)
                 if (d / "compose.yaml").exists():
@@ -186,7 +196,8 @@ class SetupValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             project = f"mtevil-port-test-{free_port}"
-            stdin_data = f"1\n127.0.0.1\n443\nn\n{free_port}\n"
+            # Simple mode: 1 -> IP detected -> 443 busy -> enter free_port -> confirm y
+            stdin_data = f"1\n{free_port}\ny\n"
             out_buf = io.StringIO()
             err_buf = io.StringIO()
             try:
@@ -195,6 +206,7 @@ class SetupValidationTests(unittest.TestCase):
                     mock.patch.object(sys, "stdin", io.StringIO(stdin_data)),
                     mock.patch.object(sys, "stdout", out_buf),
                     mock.patch.object(sys, "stderr", err_buf),
+                    mock.patch.object(setup, "detect_local_global_ipv4", return_value="127.0.0.1"),
                     mock.patch.object(setup, "is_port_available", side_effect=lambda _ip, port: port != 443),
                 ):
                     rc = setup.main()
@@ -228,7 +240,9 @@ class SetupValidationTests(unittest.TestCase):
                     return subprocess.CompletedProcess(argv, 0, stdout="https://t.me/proxy?server=127.0.0.1&port=25443&secret=ee00\n", stderr="")
                 return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-            stdin_data = "y\n1\n127.0.0.1\n25443\ny\n127.0.0.1\nexample.com\nexample.com:443\n"
+            # Existing config confirm y -> mode 2 (advanced) -> role 1 (direct) -> host 127.0.0.1 ->
+            # port 25443 -> bind 127.0.0.1 -> network-host n -> sni example.com -> cover example.com:443 -> apply y
+            stdin_data = "y\n2\n1\n127.0.0.1\n25443\n127.0.0.1\nn\nexample.com\nexample.com:443\ny\n"
             out_buf = io.StringIO()
             err_buf = io.StringIO()
             with (
@@ -247,7 +261,7 @@ class SetupValidationTests(unittest.TestCase):
             out = out_buf.getvalue()
             err = err_buf.getvalue()
             self.assertEqual(rc, 1)
-            self.assertIn("IP привязки: 127.0.0.1", out)
+            self.assertIn("IP привязки:       127.0.0.1", out)
             self.assertNotIn("Выбрать другой порт", out)
             self.assertIn("docker.sock", err)
             self.assertIn("Прежние файлы конфигурации восстановлены.", err)
@@ -292,10 +306,12 @@ class SetupValidationTests(unittest.TestCase):
                     return subprocess.CompletedProcess(argv, 1, stdout='[{"status":"fail"}]', stderr="")
                 return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-            # Role 2 (edge) -> 2, address 203.0.113.10, port 443, adv n, upstream 10.203.0.9:29443,
-            # backup n, strategy 1, reuse existing token n, enter new token, confirm abort n.
+            # Existing edge config auto-enters advanced mode:
+            # confirm y -> role 2 (edge) -> host 203.0.113.10 -> port 443 -> bind default ->
+            # network-host n -> sni default -> cover default -> upstream 10.203.0.9:29443 ->
+            # backup n -> strategy 1 -> apply y -> reuse token n -> enter new token -> abort after check-egress fail n
             stdin_data = (
-                "y\n2\n2\n203.0.113.10\n443\nn\n10.203.0.9:29443\nn\n1\nn\n"
+                "y\n2\n203.0.113.10\n443\n\nn\n\n\n10.203.0.9:29443\nn\n1\ny\nn\n"
                 + ("a" * 32)
                 + "\nn\n"
             )
@@ -326,10 +342,11 @@ class SetupValidationTests(unittest.TestCase):
             err2 = io.StringIO()
             with (
                 mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d2), "--project", "mtevil-hc-test", "--image", "mtevil:test", "--no-build"]),
-                mock.patch.object(sys, "stdin", io.StringIO("1\n203.0.113.10\n25443\nn\n")),
+                mock.patch.object(sys, "stdin", io.StringIO("1\ny\n")),
                 mock.patch.object(sys, "stdout", out2),
                 mock.patch.object(sys, "stderr", err2),
                 mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "detect_local_global_ipv4", return_value="203.0.113.10"),
                 mock.patch.object(setup, "is_port_available", return_value=True),
                 mock.patch.object(setup, "deployment_owns_port", return_value=False),
                 mock.patch.object(setup, "volume_file_exists", return_value=True),
@@ -374,7 +391,7 @@ class SetupValidationTests(unittest.TestCase):
                     return subprocess.CompletedProcess(argv, 0, stdout='[{"status":"ok"}]', stderr="")
                 return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-            stdin_data = f"y\n2\n2\n203.0.113.10\n443\nn\n10.203.0.9:29443\nn\n1\nn\n{new_tok}\n"
+            stdin_data = f"y\n2\n203.0.113.10\n443\n\nn\n\n\n10.203.0.9:29443\nn\n1\ny\nn\n{new_tok}\n"
             with (
                 mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d), "--project", "mtevil-edge-rb", "--image", "mtevil:test", "--no-build"]),
                 mock.patch.object(sys, "stdin", io.StringIO(stdin_data)),
@@ -419,8 +436,8 @@ class SetupValidationTests(unittest.TestCase):
             p_eg2 = f"mtevil-eg2-{eg2_port}"
             p_edge = f"mtevil-edge-{edge_port}"
             try:
-                # 1. Start real Egress 1 with old_tok (--network-host on 127.0.0.1:eg1_port).
-                stdin_eg1 = f"2\n1\n127.0.0.1\n{eg1_port}\nn\n{old_tok}\n"
+                # 1. Start real Egress 1 with old_tok (--network-host implies advanced mode; role 3 = egress).
+                stdin_eg1 = f"3\n127.0.0.1\n{eg1_port}\ny\nn\n{old_tok}\n"
                 with (
                     mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d_eg1), "--project", p_eg1, "--image", image, "--no-build", "--network-host"]),
                     mock.patch.object(sys, "stdin", io.StringIO(stdin_eg1)),
@@ -429,8 +446,8 @@ class SetupValidationTests(unittest.TestCase):
                 ):
                     self.assertEqual(setup.main(), 0)
 
-                # 2. Start real Egress 2 with new_tok (--network-host on 127.0.0.1:eg2_port).
-                stdin_eg2 = f"2\n1\n127.0.0.1\n{eg2_port}\nn\n{new_tok}\n"
+                # 2. Start real Egress 2 with new_tok (--network-host implies advanced mode; role 3 = egress).
+                stdin_eg2 = f"3\n127.0.0.1\n{eg2_port}\ny\nn\n{new_tok}\n"
                 with (
                     mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d_eg2), "--project", p_eg2, "--image", image, "--no-build", "--network-host"]),
                     mock.patch.object(sys, "stdin", io.StringIO(stdin_eg2)),
@@ -439,8 +456,8 @@ class SetupValidationTests(unittest.TestCase):
                 ):
                     self.assertEqual(setup.main(), 0)
 
-                # 3. Start real Edge connected to Egress 1 with old_tok.
-                stdin_edge1 = f"2\n2\n127.0.0.1\n{edge_port}\nn\n127.0.0.1:{eg1_port}\nn\n1\n{old_tok}\n"
+                # 3. Start real Edge connected to Egress 1 with old_tok (role 2 = edge).
+                stdin_edge1 = f"2\n127.0.0.1\n{edge_port}\n\n\n\n127.0.0.1:{eg1_port}\nn\n1\ny\n{old_tok}\n"
                 with (
                     mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d_edge), "--project", p_edge, "--image", image, "--no-build", "--network-host"]),
                     mock.patch.object(sys, "stdin", io.StringIO(stdin_edge1)),
@@ -474,7 +491,7 @@ class SetupValidationTests(unittest.TestCase):
                         raise TimeoutError("simulated health timeout on rotated container")
                     return orig_wait_healthy(base, timeout_s)
 
-                stdin_edge2 = f"y\n2\n2\n127.0.0.1\n{edge_port}\nn\n127.0.0.1:{eg2_port}\nn\n1\nn\n{new_tok}\n"
+                stdin_edge2 = f"y\n2\n127.0.0.1\n{edge_port}\n\n\n\n127.0.0.1:{eg2_port}\nn\n1\ny\nn\n{new_tok}\n"
                 with (
                     mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d_edge), "--project", p_edge, "--image", image, "--no-build", "--network-host"]),
                     mock.patch.object(sys, "stdin", io.StringIO(stdin_edge2)),
@@ -1190,6 +1207,335 @@ class SetupValidationTests(unittest.TestCase):
                 self.assertEqual(p3.returncode, 0, p3.stdout + p3.stderr)
                 self.assertIn("SELECTED_TAG=v0.1.0-alpha.11", p3.stdout)
                 self.assertEqual(pulled_file.read_text(encoding="utf-8").strip(), "ghcr.io/rsnest/mtevil:v0.1.0-alpha.11")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_simple_fresh_install_two_prompts_and_output_contract(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            prompts_seen: list[str] = []
+            answers = iter(["", ""])  # Prompt 1: Enter (Simple [1]), Prompt 2: Enter (Confirm [Y/a/n])
+
+            def fake_input(prompt=""):
+                prompts_seen.append(prompt)
+                return next(answers)
+
+            def fake_run(argv, **_kwargs):
+                cmd = " ".join(argv)
+                if "link" in cmd:
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        stdout="https://t.me/proxy?server=203.0.113.10&port=443&secret=ee11223344556677889900aabbccddeeff6578616d706c652e636f6d\n",
+                        stderr="",
+                    )
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            out_buf = io.StringIO()
+            err_buf = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d), "--project", "mtevil-simple-2p", "--image", "mtevil:v0.1.0", "--no-build"]),
+                mock.patch("builtins.input", side_effect=fake_input),
+                mock.patch.object(sys, "stdout", out_buf),
+                mock.patch.object(sys, "stderr", err_buf),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "detect_local_global_ipv4", return_value="203.0.113.10"),
+                mock.patch.object(setup, "is_port_available", return_value=True),
+                mock.patch.object(setup, "deployment_owns_port", return_value=False),
+                mock.patch.object(setup, "ensure_generated_secret", return_value=True),
+                mock.patch.object(setup, "volume_file_exists", return_value=True),
+                mock.patch.object(setup, "check_cover_from_container", return_value=(True, "")),
+                mock.patch.object(setup, "wait_healthy", return_value=None),
+                mock.patch.object(setup, "run", side_effect=fake_run),
+            ):
+                rc = setup.main()
+            out = out_buf.getvalue()
+            self.assertEqual(rc, 0, out + err_buf.getvalue())
+            # Fresh simple install with detected IPv4 and free port 443 uses strictly 2 prompts!
+            self.assertEqual(len(prompts_seen), 2, prompts_seen)
+            self.assertNotIn("IP интерфейса", out)
+            self.assertNotIn("HTTPS-cover", out)
+            self.assertNotIn("network-host", out)
+            self.assertIn("203.0.113.10 (определён автоматически)", out)
+            self.assertIn("443 (свободен)", out)
+            self.assertIn("Docker healthcheck", out)
+            self.assertIn(f"Каталог установки: {d.resolve()}", out)
+            self.assertIn("Проверка статуса:", out)
+            self.assertIn(
+                "https://t.me/proxy?server=203.0.113.10&port=443&secret=ee11223344556677889900aabbccddeeff6578616d706c652e636f6d",
+                out.splitlines(),
+            )
+
+    def test_simple_missing_ip_occupied_port_invalid_input_switch_and_cancel(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            # 1. Invalid mode choice -> 1 (simple) -> missing IPv4 -> enter 198.51.100.5 ->
+            #    port 443 busy -> accept suggested 25443 -> invalid confirm 'zzz' -> cancel 'n'.
+            stdin_cancel = "99\n1\n198.51.100.5\n25443\nzzz\nn\n"
+            out_buf = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d), "--image", "mtevil:v0.1.0", "--no-build"]),
+                mock.patch.object(sys, "stdin", io.StringIO(stdin_cancel)),
+                mock.patch.object(sys, "stdout", out_buf),
+                mock.patch.object(sys, "stderr", io.StringIO()),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "detect_local_global_ipv4", return_value=None),
+                mock.patch.object(setup, "is_port_available", side_effect=lambda _ip, port: port != 443),
+                mock.patch.object(setup, "deployment_owns_port", return_value=False),
+            ):
+                rc = setup.main()
+            out = out_buf.getvalue()
+            self.assertEqual(rc, 0)
+            self.assertIn("Некорректный выбор: введите 1", out)
+            self.assertIn("Не удалось автоматически определить публичный IPv4", out)
+            self.assertIn("Порт 443 уже занят на этом сервере.", out)
+            self.assertIn("Некорректный выбор: введите y", out)
+            self.assertIn("Отменено без изменений.", out)
+            self.assertFalse((d / "config.json").exists())
+
+            # 2. Switch from Simple confirmation ('a') to Advanced, verify detected IP/port carried over, then cancel at final confirm.
+            # Mode 1 -> Simple confirm 'a' -> Advanced role 1 -> accept host/port/bind -> net-host n -> accept sni/cover -> cancel n.
+            stdin_switch = "1\na\n1\n\n\n\nn\n\n\nn\n"
+            out_sw = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d), "--image", "mtevil:v0.1.0", "--no-build"]),
+                mock.patch.object(sys, "stdin", io.StringIO(stdin_switch)),
+                mock.patch.object(sys, "stdout", out_sw),
+                mock.patch.object(sys, "stderr", io.StringIO()),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "detect_local_global_ipv4", return_value="203.0.113.20"),
+                mock.patch.object(setup, "is_port_available", return_value=True),
+                mock.patch.object(setup, "deployment_owns_port", return_value=False),
+            ):
+                rc_sw = setup.main()
+            self.assertEqual(rc_sw, 0)
+            self.assertIn("Шаг 1. Роль сервера", out_sw.getvalue())
+            self.assertIn("203.0.113.20:443", out_sw.getvalue())
+            self.assertFalse((d / "config.json").exists())
+
+    def test_advanced_edge_egress_rerun_preservation_and_flag_conflicts(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            # 1. Conflicting --mode simple with --role edge or --network-host fails explicitly.
+            err1 = io.StringIO()
+            with mock.patch.object(sys, "stderr", err1):
+                rc1 = setup.main(["--dir", str(d), "--mode", "simple", "--role", "edge"])
+            self.assertEqual(rc1, 1)
+            self.assertIn("Конфликт параметров", err1.getvalue())
+
+            err2 = io.StringIO()
+            with mock.patch.object(sys, "stderr", err2):
+                rc2 = setup.main(["--dir", str(d), "--mode", "simple", "--network-host"])
+            self.assertEqual(rc2, 1)
+            self.assertIn("Конфликт параметров", err2.getvalue())
+
+            # 2. Existing installation with network_mode: host + custom SNI/cover/bind:
+            #    declining reconfigure leaves everything intact; accepting in Simple mode preserves all existing settings!
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    network_mode: host\n", encoding="utf-8")
+            (d / ".env").write_text(
+                "MTEVIL_PROJECT=mtevil-keep\nMTEVIL_IMAGE=mtevil:v0.1.0\nMTEVIL_BIND=10.0.0.5\nMTEVIL_PORT=8443\nMTEVIL_PUBLIC_HOST=198.51.100.77\n",
+                encoding="utf-8",
+            )
+            (d / "config.json").write_text(
+                setup.json.dumps({"role": "direct", "sni": "cdn.example.org", "cover": "cdn.example.org:443"}) + "\n",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d), "--image", "mtevil:v0.1.0", "--no-build"]),
+                mock.patch.object(sys, "stdin", io.StringIO("n\n")),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+                mock.patch.object(setup, "check_prerequisites"),
+            ):
+                self.assertEqual(setup.main(), 0)
+
+            def fake_run_ok(argv, **_kwargs):
+                if "link" in " ".join(argv):
+                    return subprocess.CompletedProcess(argv, 0, stdout="https://t.me/proxy?server=198.51.100.77&port=8443&secret=ee00\n", stderr="")
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            # Confirm reconfigure (y) -> mode 1 (simple) -> confirm (y): preserves host networking, bind, SNI, cover, port, public host!
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d), "--image", "mtevil:v0.1.0", "--no-build"]),
+                mock.patch.object(sys, "stdin", io.StringIO("y\n1\ny\n")),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+                mock.patch.object(sys, "stderr", io.StringIO()),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "is_port_available", return_value=True),
+                mock.patch.object(setup, "deployment_owns_port", return_value=True),
+                mock.patch.object(setup, "ensure_generated_secret", return_value=False),
+                mock.patch.object(setup, "volume_file_exists", return_value=True),
+                mock.patch.object(setup, "check_cover_from_container", return_value=(True, "")),
+                mock.patch.object(setup, "wait_healthy", return_value=None),
+                mock.patch.object(setup, "run", side_effect=fake_run_ok),
+            ):
+                self.assertEqual(setup.main(), 0)
+            self.assertIn("network_mode: host", (d / "compose.yaml").read_text(encoding="utf-8"))
+            new_cfg = setup.json.loads((d / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(new_cfg["sni"], "cdn.example.org")
+            self.assertEqual(new_cfg["listen"], "10.0.0.5:8443")
+
+            # 3. Legacy --role egress skips mode & role prompts and validates invalid inputs with retry.
+            d_eg = Path(td) / "egress"
+            # invalid IP 0.0.0.0 -> valid 10.203.0.5 -> port 29443 -> net-host n -> confirm n (cancel cleanly)
+            stdin_eg = "0.0.0.0\n10.203.0.5\n29443\nn\nn\n"
+            out_eg = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d_eg), "--role", "egress", "--image", "mtevil:v0.1.0", "--no-build"]),
+                mock.patch.object(sys, "stdin", io.StringIO(stdin_eg)),
+                mock.patch.object(sys, "stdout", out_eg),
+                mock.patch.object(sys, "stderr", io.StringIO()),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "is_port_available", return_value=True),
+                mock.patch.object(setup, "deployment_owns_port", return_value=False),
+            ):
+                self.assertEqual(setup.main(), 0)
+            self.assertIn("Шаг 2. Сеть и адрес выхода", out_eg.getvalue())
+            self.assertIn("10.203.0.5:29443", out_eg.getvalue())
+
+    def test_banner_tty_no_color_dumb_ascii_and_install_sh_bootstrap_once(self):
+        # Unit checks for banner formatting, NO_COLOR, TERM=dumb, ASCII fallback, and non-TTY silence.
+        b_color = setup.render_banner("v0.1.0", color=True, unicode_ok=True)
+        self.assertIn("\033[1;32m", b_color)
+        self.assertIn("mtevil", b_color)
+        self.assertIn("v0.1.0", b_color)
+
+        b_ascii = setup.render_banner("v0.1.0", color=False, unicode_ok=False)
+        self.assertNotIn("\x1b[", b_ascii)
+        self.assertTrue(b_ascii.isascii())
+        self.assertIn("mtevil v0.1.0", b_ascii)
+
+        non_tty_buf = io.StringIO()
+        with mock.patch.object(sys, "stdout", non_tty_buf), mock.patch.dict(setup.os.environ, {}, clear=False):
+            setup.os.environ.pop("MTEVIL_BANNER_SHOWN", None)
+            setup.print_wizard_banner("ghcr.io/rsnest/mtevil:v0.1.0")
+        self.assertEqual(non_tty_buf.getvalue(), "")
+
+        class FakeTTY(io.StringIO):
+            def isatty(self):
+                return True
+
+        with mock.patch.object(sys, "stdout", FakeTTY()), mock.patch.dict(setup.os.environ, {"NO_COLOR": "1"}):
+            self.assertFalse(setup.use_color())
+        with mock.patch.object(sys, "stdout", FakeTTY()), mock.patch.dict(setup.os.environ, {"TERM": "dumb"}):
+            setup.os.environ.pop("NO_COLOR", None)
+            self.assertFalse(setup.use_color())
+
+        # On Linux with /bin/bash and pty: verify banner prints ONCE across bootstrap -> pinned install.sh -> setup.py,
+        # --mode simple is forwarded, NO_COLOR omits ANSI, and non-TTY omits banner.
+        bash_bin = "/bin/bash" if Path("/bin/bash").is_file() else None
+        if bash_bin is None:
+            return
+
+        import http.server
+        import pty
+        import select
+        import threading
+
+        install_text = (Path(__file__).resolve().parent / "install.sh").read_text(encoding="utf-8")
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/releases":
+                    body = setup.json.dumps([{
+                        "tag_name": "v0.1.0",
+                        "draft": False,
+                        "prerelease": False,
+                        "assets": [
+                            {"name": "install.sh", "state": "uploaded", "browser_download_url": "http://127.0.0.1/v0.1.0/install.sh"},
+                            {"name": "setup.py", "state": "uploaded", "browser_download_url": "http://127.0.0.1/v0.1.0/setup.py"},
+                        ],
+                    }]).encode("utf-8")
+                elif self.path == "/download/v0.1.0/install.sh":
+                    body = install_text.replace(
+                        'MTEVIL_PINNED_VERSION="__AUTO__"',
+                        'MTEVIL_PINNED_VERSION="v0.1.0"',
+                        1,
+                    ).encode("utf-8")
+                elif self.path == "/download/v0.1.0/setup.py":
+                    body = (
+                        "import os, sys\n"
+                        "print('BANNER_SHOWN=' + os.environ.get('MTEVIL_BANNER_SHOWN', ''))\n"
+                        "print('SETUP_ARGS=' + ' '.join(sys.argv[1:]))\n"
+                    ).encode("utf-8")
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = srv.server_port
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                d = Path(td)
+                inst = d / "install.sh"
+                inst.write_text(install_text, encoding="utf-8", newline="\n")
+                fake_bin = d / "bin"
+                fake_bin.mkdir()
+                fake_docker = fake_bin / "docker"
+                fake_docker.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8", newline="\n")
+                setup.os.chmod(fake_docker, 0o755)
+
+                base_env = dict(setup.os.environ)
+                base_env["PATH"] = f"{fake_bin}:{base_env.get('PATH', '')}"
+                base_env["MTEVIL_DIR"] = str(d / "inst_dir")
+                base_env["MTEVIL_RELEASES_API_URL"] = f"http://127.0.0.1:{port}/releases"
+                base_env["MTEVIL_RELEASE_BASE_URL"] = f"http://127.0.0.1:{port}/download"
+                for k in ("MTEVIL_VERSION", "MTVEIL_VERSION", "MTEVIL_CHANNEL", "MTVEIL_CHANNEL", "MTEVIL_BANNER_SHOWN", "NO_COLOR"):
+                    base_env.pop(k, None)
+
+                def run_in_pty(extra_env: dict[str, str], extra_args: list[str]) -> str:
+                    master_fd, slave_fd = pty.openpty()
+                    env = dict(base_env, **extra_env)
+                    proc = subprocess.Popen(
+                        [bash_bin, str(inst)] + extra_args,
+                        env=env,
+                        stdin=slave_fd,
+                        stdout=slave_fd,
+                        stderr=slave_fd,
+                        close_fds=True,
+                    )
+                    setup.os.close(slave_fd)
+                    chunks: list[bytes] = []
+                    try:
+                        while True:
+                            r, _, _ = select.select([master_fd], [], [], 0.2)
+                            if r:
+                                try:
+                                    data = setup.os.read(master_fd, 4096)
+                                    if not data:
+                                        break
+                                    chunks.append(data)
+                                except OSError:
+                                    break
+                            elif proc.poll() is not None:
+                                break
+                    finally:
+                        setup.os.close(master_fd)
+                    proc.wait(timeout=10)
+                    self.assertEqual(proc.returncode, 0, b"".join(chunks).decode("utf-8", errors="ignore"))
+                    return b"".join(chunks).decode("utf-8", errors="ignore")
+
+                # 1. Interactive TTY with NO_COLOR=1 across bootstrap -> pinned exec: banner printed ONCE, zero ANSI, --mode forwarded.
+                out_nc = run_in_pty({"NO_COLOR": "1", "LANG": "C.UTF-8"}, ["--mode", "simple"])
+                self.assertEqual(out_nc.count("mtevil v0.1.0"), 1, out_nc)
+                self.assertNotIn("\x1b[", out_nc)
+                self.assertIn("BANNER_SHOWN=1", out_nc)
+                self.assertIn("--mode simple", out_nc)
+
+                # 2. Non-TTY call omits decorative banner completely.
+                p_nontty = subprocess.run([bash_bin, str(inst), "--mode", "advanced"], env=base_env, capture_output=True, text=True)
+                self.assertEqual(p_nontty.returncode, 0, p_nontty.stdout + p_nontty.stderr)
+                self.assertNotIn("▄▄▄▄▄", p_nontty.stdout)
+                self.assertNotIn("__ __", p_nontty.stdout)
+                self.assertIn("--mode advanced", p_nontty.stdout)
         finally:
             srv.shutdown()
             srv.server_close()
