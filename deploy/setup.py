@@ -847,6 +847,84 @@ def wait_healthy(base: list[str], timeout_s: int = 45) -> None:
     raise TimeoutError("mtevil container did not become healthy within 45s")
 
 
+def print_failed_container_logs(base: list[str]) -> None:
+    try:
+        result = run(base + ["logs", "--no-color", "--tail=30", compose_service(base)], check=False)
+    except Exception as exc:
+        print(f"Не удалось прочитать логи нового контейнера: {exc}", file=sys.stderr)
+        return
+    detail = (result.stdout or result.stderr or "").strip()
+    if detail:
+        print("Последние логи нового контейнера перед откатом:", file=sys.stderr)
+        print(detail, file=sys.stderr)
+
+
+def read_unprivileged_port_start() -> int | None:
+    try:
+        raw = Path("/proc/sys/net/ipv4/ip_unprivileged_port_start").read_text(encoding="utf-8").strip()
+        return int(raw)
+    except (OSError, ValueError):
+        return None
+
+
+def resolve_network_host_port(
+    deploy_dir: Path,
+    project: str,
+    bind_ip: str,
+    pub_port: int,
+    use_network_host: bool,
+    *,
+    explicit_network_host: bool = False,
+    show_link_note: bool = True,
+) -> tuple[int, bool]:
+    if not use_network_host:
+        return pub_port, False
+    port_start = read_unprivileged_port_start()
+    if port_start is None:
+        print(
+            warn_text(
+                "Не удалось проверить порог непривилегированных портов (/proc/sys/net/ipv4/ip_unprivileged_port_start)."
+            )
+        )
+        if pub_port < 1024:
+            print(f"  Примечание: в режиме host порт {pub_port} (< 1024) может не открыться без привилегий.")
+        return pub_port, True
+    if pub_port >= port_start:
+        return pub_port, True
+
+    min_port = max(1024, port_start)
+    print(
+        warn_text(
+            f"\nПорт {pub_port} ниже порога непривилегированных портов на этом сервере "
+            f"(ip_unprivileged_port_start = {port_start})."
+        )
+    )
+    print(f"В режиме host контейнер запускается без привилегий и не сможет открыть порт {pub_port}.")
+    print(f"  1. Оставить порт {pub_port} и перейти в сетевой режим bridge")
+    print(f"  2. Остаться в режиме host и выбрать другой порт (>= {min_port})")
+    while True:
+        choice = ask("Ваш выбор [1/2]", "1").strip().lower()
+        if choice in ("1", "bridge"):
+            if explicit_network_host:
+                if not ask_yes_no("Флаг --network-host задан явно. Перейти в режим bridge?", default=False):
+                    print("Выберите вариант 2 для указания порта в режиме host.")
+                    continue
+            return pub_port, False
+        if choice in ("2", "host"):
+            def validate_unpriv_port(val: str) -> int:
+                p = validate_port(val)
+                if p < min_port:
+                    raise ValueError(f"для режима host требуется порт >= {min_port}")
+                return p
+
+            alt = find_free_port(bind_ip, pub_port)
+            default_alt = str(alt) if (alt is not None and alt >= min_port) else (str(min_port) if is_port_available(bind_ip, min_port) else None)
+            new_port = ask_validated(f"Другой порт (>= {min_port})", validate_unpriv_port, default_alt)
+            new_port = ensure_available_port(deploy_dir, project, bind_ip, new_port, show_link_note=show_link_note)
+            return new_port, True
+        print("Некорректный выбор: введите 1 (bridge) или 2 (host).")
+
+
 def print_step(index: int, total: int, title: str) -> None:
     print("\n" + heading(f"[{index}/{total}] {title}"))
 
@@ -1602,6 +1680,7 @@ def run_update_command(
         wait_healthy(base)
     except TimeoutError:
         print(err_text(f"Новый контейнер ({target_version}) не перешёл в статус healthy за 45 секунд."), file=sys.stderr)
+        print_failed_container_logs(base)
         print(warn_text("Автоматический возврат предыдущей рабочей версии..."), file=sys.stderr)
         perform_rollback(deploy_dir, auto_from_failed_update=True, verify_e2e=True, probe_image_hint=target_image)
         return 1
@@ -2221,6 +2300,15 @@ def main(argv: list[str] | None = None) -> int:
             if not args.network_host:
                 use_network_host = ask_yes_no("Использовать сетевой режим host (--network-host)?", default=existing_network_host)
             pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=True)
+            pub_port, use_network_host = resolve_network_host_port(
+                deploy_dir,
+                project,
+                bind_ip,
+                pub_port,
+                use_network_host,
+                explicit_network_host=args.network_host,
+                show_link_note=True,
+            )
 
             print("\n" + heading("Шаг 3. Маскировка (HTTPS-cover)"))
             sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, default_sni)
@@ -2262,6 +2350,15 @@ def main(argv: list[str] | None = None) -> int:
             if not args.network_host:
                 use_network_host = ask_yes_no("Использовать сетевой режим host (--network-host)?", default=existing_network_host)
             pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=False)
+            pub_port, use_network_host = resolve_network_host_port(
+                deploy_dir,
+                project,
+                bind_ip,
+                pub_port,
+                use_network_host,
+                explicit_network_host=args.network_host,
+                show_link_note=False,
+            )
             public_host = bind_ip
             config_data = {
                 "role": "egress",
@@ -2283,6 +2380,15 @@ def main(argv: list[str] | None = None) -> int:
             if not args.network_host:
                 use_network_host = ask_yes_no("Использовать сетевой режим host (--network-host)?", default=existing_network_host)
             pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=True)
+            pub_port, use_network_host = resolve_network_host_port(
+                deploy_dir,
+                project,
+                bind_ip,
+                pub_port,
+                use_network_host,
+                explicit_network_host=args.network_host,
+                show_link_note=True,
+            )
 
             print("\n" + heading("Шаг 3. Маскировка (HTTPS-cover)"))
             sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, default_sni)
@@ -2629,6 +2735,7 @@ def main(argv: list[str] | None = None) -> int:
             wait_healthy(base)
         except TimeoutError:
             print(err_text("Контейнер не перешёл в статус healthy за 45 секунд."), file=sys.stderr)
+            print_failed_container_logs(base)
             print(f"Проверьте логи этой установки: docker compose {compose_ref} logs --tail=100 {compose_service(base)}", file=sys.stderr)
             return 1
         deployment_committed = True

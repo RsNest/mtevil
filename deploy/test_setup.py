@@ -1648,6 +1648,65 @@ class SetupValidationTests(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_network_host_unprivileged_port_check_and_failed_logs_before_rollback(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            # 1. Missing / unreadable ip_unprivileged_port_start: warns cleanly and keeps host mode.
+            out_none = io.StringIO()
+            with (
+                contextlib.redirect_stdout(out_none),
+                mock.patch.object(setup, "read_unprivileged_port_start", return_value=None),
+            ):
+                p, nh = setup.resolve_network_host_port(d, "mtevil-direct", "0.0.0.0", 443, True)
+            self.assertEqual((p, nh), (443, True))
+            self.assertIn("ip_unprivileged_port_start", out_none.getvalue())
+
+            # 2. Port 443 < 1024 without --network-host: choice 1 switches to bridge keeping port 443.
+            out_br = io.StringIO()
+            with (
+                contextlib.redirect_stdout(out_br),
+                mock.patch.object(sys, "stdin", io.StringIO("1\n")),
+                mock.patch.object(setup, "read_unprivileged_port_start", return_value=1024),
+            ):
+                p, nh = setup.resolve_network_host_port(d, "mtevil-direct", "0.0.0.0", 443, True, explicit_network_host=False)
+            self.assertEqual((p, nh), (443, False))
+            self.assertIn("ip_unprivileged_port_start = 1024", out_br.getvalue())
+
+            # 3. Explicit --network-host: declining bridge confirmation, then choice 2 rejects 80 (< 1024) and accepts 25443.
+            out_exp = io.StringIO()
+            with (
+                contextlib.redirect_stdout(out_exp),
+                mock.patch.object(sys, "stdin", io.StringIO("1\nn\n2\n80\n25443\n")),
+                mock.patch.object(setup, "read_unprivileged_port_start", return_value=1024),
+                mock.patch.object(setup, "is_port_available", return_value=True),
+                mock.patch.object(setup, "deployment_owns_port", return_value=False),
+            ):
+                p, nh = setup.resolve_network_host_port(d, "mtevil-direct", "0.0.0.0", 443, True, explicit_network_host=True)
+            self.assertEqual((p, nh), (25443, True))
+            self.assertIn("Флаг --network-host задан явно", out_exp.getvalue())
+            self.assertIn("для режима host требуется порт >= 1024", out_exp.getvalue())
+
+            # 4. print_failed_container_logs handles OSError cleanly without blocking rollback,
+            #    and prints tail=30 logs when available.
+            err_os = io.StringIO()
+            with (
+                contextlib.redirect_stderr(err_os),
+                mock.patch.object(setup, "run", side_effect=OSError("docker unavailable")),
+            ):
+                setup.print_failed_container_logs(["docker", "compose", "-f", str(d / "compose.yaml")])
+            self.assertIn("Не удалось прочитать логи нового контейнера", err_os.getvalue())
+
+            err_ok = io.StringIO()
+            with (
+                contextlib.redirect_stderr(err_ok),
+                mock.patch.object(setup, "run", return_value=subprocess.CompletedProcess([], 0, stdout="bind 0.0.0.0:443 permission denied\n", stderr="")) as mock_run,
+            ):
+                setup.print_failed_container_logs(["docker", "compose", "-f", str(d / "compose.yaml")])
+            self.assertIn("bind 0.0.0.0:443 permission denied", err_ok.getvalue())
+            called_argv = mock_run.call_args.args[0]
+            self.assertIn("--no-color", called_argv)
+            self.assertIn("--tail=30", called_argv)
+
 
 if __name__ == "__main__":
     prog = unittest.main(verbosity=2, exit=False)
