@@ -965,6 +965,97 @@ class SetupValidationTests(unittest.TestCase):
                 self.assertEqual(current_img["version"], "v0.1.0-alpha.5")
                 self.assertEqual(probe_calls, ["v0.1.0-alpha.7", "v0.1.0-alpha.7", "v0.1.0-alpha.7", "v0.1.0-alpha.5"])
 
+    def test_update_reexec_passes_version_and_aborts_safely_on_launch_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            orig_env = (
+                "MTEVIL_PROJECT=mtevil-direct\n"
+                "MTEVIL_IMAGE=ghcr.io/rsnest/mtevil:v0.1.0-alpha.9\n"
+                "MTEVIL_BIND=0.0.0.0\n"
+                "MTEVIL_PORT=24443\n"
+            )
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: ${MTEVIL_IMAGE}\n", encoding="utf-8")
+            (d / ".env").write_text(orig_env, encoding="utf-8")
+            (d / "config.json").write_text(setup.json.dumps({"role": "direct"}) + "\n", encoding="utf-8")
+
+            up_called = {"n": 0}
+            exec_calls: list[tuple[str, list[str]]] = []
+
+            def fake_run(argv, **kwargs):
+                cmd = " ".join(argv)
+                if "docker info" in cmd or "docker compose version" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, "ok", "")
+                if "ps -q" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, "cid123\n", "")
+                if argv[:2] == ["docker", "inspect"] and argv[2] == "cid123":
+                    info = [{"Image": "sha256:9999", "State": {"Running": True, "Health": {"Status": "healthy"}}}]
+                    return subprocess.CompletedProcess(argv, 0, setup.json.dumps(info), "")
+                if argv[:3] == ["docker", "image", "inspect"]:
+                    info = [{
+                        "Id": "sha256:9999",
+                        "RepoDigests": ["ghcr.io/rsnest/mtevil@sha256:9999"],
+                        "Config": {"Labels": {"org.opencontainers.image.version": "v0.1.0-alpha.9"}},
+                    }]
+                    return subprocess.CompletedProcess(argv, 0, setup.json.dumps(info), "")
+                if "py_compile" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                if "up -d" in cmd:
+                    up_called["n"] += 1
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            fake_releases = [
+                {
+                    "tag_name": "v0.1.0-alpha.11",
+                    "draft": False,
+                    "assets": [
+                        {"name": "install.sh", "state": "uploaded", "browser_download_url": "https://example.invalid/install.sh"},
+                        {"name": "setup.py", "state": "uploaded", "browser_download_url": "https://example.invalid/setup.py"},
+                    ],
+                }
+            ]
+
+            def fake_download(url, dest, mode=None):
+                dest.write_text("#!/usr/bin/env python3\nprint('new setup')\n", encoding="utf-8")
+
+            def fake_execv_fail(executable, argv):
+                exec_calls.append((executable, list(argv)))
+                raise OSError("exec failed")
+
+            err = io.StringIO()
+            with (
+                mock.patch.object(setup, "run", side_effect=fake_run),
+                mock.patch.object(setup, "fetch_json_url", return_value=fake_releases),
+                mock.patch.object(setup, "download_url_atomic", side_effect=fake_download),
+                mock.patch.object(setup.os, "execv", side_effect=fake_execv_fail),
+                contextlib.redirect_stderr(err),
+            ):
+                rc = setup.main(["update", "--dir", str(d)])
+
+            # 1. Must abort with rc=1, pass --version v0.1.0-alpha.11 and --reexec,
+            #    and leave .env and running container completely untouched!
+            self.assertEqual(rc, 1)
+            self.assertEqual(len(exec_calls), 1)
+            _, passed_argv = exec_calls[0]
+            self.assertIn("--version", passed_argv)
+            self.assertIn("v0.1.0-alpha.11", passed_argv)
+            self.assertIn("--reexec", passed_argv)
+            self.assertEqual(up_called["n"], 0)
+            self.assertEqual((d / ".env").read_text(encoding="utf-8"), orig_env)
+            self.assertIn("Текущий контейнер не затронут", err.getvalue())
+
+            # 2. If --reexec is already set, it must NOT call os.execv again (no loop).
+            exec_calls.clear()
+            with (
+                mock.patch.object(setup, "run", side_effect=fake_run),
+                mock.patch.object(setup, "download_url_atomic", side_effect=AssertionError("must not download again on --reexec")),
+                mock.patch.object(setup.os, "execv", side_effect=AssertionError("must not execv again on --reexec")),
+                mock.patch.object(setup, "verify_telegram_e2e", return_value=(True, "ok")),
+                mock.patch.object(setup, "wait_healthy", return_value=None),
+            ):
+                rc2 = setup.main(["update", "--dir", str(d), "--version", "v0.1.0-alpha.11", "--reexec"])
+            self.assertEqual(rc2, 0)
+            self.assertEqual(up_called["n"], 1)
+
 
 if __name__ == "__main__":
     prog = unittest.main(verbosity=2, exit=False)

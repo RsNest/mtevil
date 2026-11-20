@@ -1156,7 +1156,12 @@ def perform_rollback(
     return 0
 
 
-def run_update_command(deploy_dir: Path, target_version_override: str | None = None) -> int:
+def run_update_command(
+    deploy_dir: Path,
+    target_version_override: str | None = None,
+    *,
+    reexec: bool = False,
+) -> int:
     check_prerequisites()
     compose_file = deploy_dir / "compose.yaml"
     env_file = deploy_dir / ".env"
@@ -1205,6 +1210,58 @@ def run_update_command(deploy_dir: Path, target_version_override: str | None = N
     if not explicit_image and cur_version == target_version:
         print(ok_text(f"Уже установлена актуальная версия {target_version}. Перезапуск не требуется."))
         return 0
+
+    # Download helper scripts from the target release and hand off execution (re-exec)
+    # BEFORE mutating .env or recreating the container, so the target release's own update
+    # and E2E verification logic runs for this very update.
+    if not reexec and os.environ.get("MTEVIL_SKIP_ASSET_DOWNLOAD") != "1":
+        new_setup = deploy_dir / "setup.py"
+        new_ctl = deploy_dir / "mtevilctl"
+        setup_downloaded = False
+        try:
+            download_url_atomic(f"{release_base_url}/{target_version}/setup.py", new_setup, mode=0o755)
+            setup_downloaded = True
+        except Exception:
+            pass
+        try:
+            download_url_atomic(f"{release_base_url}/{target_version}/mtevilctl", new_ctl, mode=0o755)
+        except Exception:
+            pass
+        if setup_downloaded and new_setup.is_file():
+            reexec_argv = [
+                sys.executable,
+                str(new_setup),
+                "update",
+                "--dir",
+                str(deploy_dir),
+                "--version",
+                target_version,
+                "--reexec",
+            ]
+            # Validate the newly downloaded script before replacing the current process:
+            # if syntax/launch fails, abort cleanly while the running container stays untouched.
+            syntax_check = run([sys.executable, "-m", "py_compile", str(new_setup)], check=False)
+            if syntax_check.returncode != 0:
+                detail = (syntax_check.stderr or syntax_check.stdout or "").strip()
+                print(
+                    err_text(
+                        f"Скачанный setup.py для версии {target_version} повреждён; обновление отменено, текущий контейнер не затронут."
+                    ),
+                    file=sys.stderr,
+                )
+                if detail:
+                    print(detail, file=sys.stderr)
+                return 1
+            try:
+                os.execv(sys.executable, reexec_argv)
+            except OSError as exc:
+                print(
+                    err_text(
+                        f"Не удалось запустить обновлённый setup.py ({target_version}): {exc}. Текущий контейнер не затронут."
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
 
     from_label = cur_version or cur_image_ref or "unknown"
     print(heading(f"Обновление mtevil: {from_label} -> {target_version}"))
@@ -1258,15 +1315,6 @@ def run_update_command(deploy_dir: Path, target_version_override: str | None = N
     except Exception as exc:
         print(err_text(str(exc)), file=sys.stderr)
         return 1
-
-    # Update helper scripts from the release if available (non-fatal if offline/custom image).
-    if os.environ.get("MTEVIL_SKIP_ASSET_DOWNLOAD") != "1":
-        for asset_name, mode in (("setup.py", 0o755), ("mtevilctl", 0o755)):
-            asset_url = f"{release_base_url}/{target_version}/{asset_name}"
-            try:
-                download_url_atomic(asset_url, deploy_dir / asset_name, mode=mode)
-            except Exception:
-                pass
 
     orig_env_text = env_file.read_text(encoding="utf-8", errors="ignore")
     env_file.write_text(set_env_image(orig_env_text, target_image), encoding="utf-8")
@@ -1725,6 +1773,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Use Docker host networking (for Linux hosts with policy-routed mesh/VPN egress)",
     )
     parser.add_argument("--version", type=str, default=None, help="Target release version override for update")
+    parser.add_argument("--reexec", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--live", action="store_true", help="Refresh traffic statistics every second")
     parser.add_argument("--iterations", type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -1735,7 +1784,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             return run_status_command(deploy_dir)
         if args.command == "update":
-            return run_update_command(deploy_dir, target_version_override=args.version)
+            return run_update_command(deploy_dir, target_version_override=args.version, reexec=args.reexec)
         if args.command == "rollback":
             return perform_rollback(deploy_dir)
         return run_traffic_command(deploy_dir, live=args.live, max_iterations=args.iterations)
