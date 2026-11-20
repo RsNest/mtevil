@@ -79,6 +79,8 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         client_mss_bulk: None,
         replay: Mutex::new(ReplayCache::new(65536, Duration::from_secs(300))),
         counters: Arc::new(telemetry::Counters::default()),
+        alert_webhook_url: None,
+        alerts_file: None,
     })
 }
 
@@ -1239,6 +1241,7 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         flight_shaping: false,
         client_mss: None,
         client_mss_bulk: None,
+        alert_webhook_url: None,
     };
 
     let mut proxy_state = state(cover.addr, dc_addr);
@@ -1566,5 +1569,185 @@ async fn runtime_stats_file_tracks_edge_and_egress_byte_counters() -> Result<()>
     let _ = std::fs::remove_dir_all(&dir);
     let _ = shutdown_tx.send(());
     timeout(Duration::from_secs(2), egress_task).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn probe_telegram_e2e_verifies_handshake_and_res_pq_reply() -> Result<()> {
+    let cover = cover_mock().await?;
+    let dc = TcpListener::bind("127.0.0.1:0").await?;
+    let dc_addr = dc.local_addr()?;
+
+    // Mock Telegram DC responding to req_pq_multi#be7e8ef1 with resPQ#05162463 echoing nonce.
+    let dc_task = tokio::spawn(async move {
+        let (mut peer, _) = dc.accept().await?;
+        let mut header = [0u8; 64];
+        peer.read_exact(&mut header).await?;
+        let mut decode = AesCtr::new_from_slices(&header[8..40], &header[40..56])?;
+        let mut plain = header;
+        wire::crypt(&mut decode, &mut plain);
+        let mut len_buf = [0u8; 4];
+        peer.read_exact(&mut len_buf).await?;
+        wire::crypt(&mut decode, &mut len_buf);
+        let req_len = (u32::from_le_bytes(len_buf) & 0x7fff_ffff) as usize;
+        assert_eq!(req_len, 40);
+        let mut req_payload = vec![0u8; req_len];
+        peer.read_exact(&mut req_payload).await?;
+        wire::crypt(&mut decode, &mut req_payload);
+        assert_eq!(&req_payload[20..24], &[0xf1, 0x8e, 0x7e, 0xbe]);
+        let nonce: [u8; 16] = req_payload[24..40].try_into()?;
+
+        let reversed: Vec<_> = header[8..56].iter().rev().copied().collect();
+        let mut encode = AesCtr::new_from_slices(&reversed[..32], &reversed[32..])?;
+        let mut resp = Vec::with_capacity(44);
+        resp.extend_from_slice(&40u32.to_le_bytes());
+        resp.extend_from_slice(&0u64.to_le_bytes()); // auth_key_id = 0
+        resp.extend_from_slice(&1u64.to_le_bytes()); // msg_id
+        resp.extend_from_slice(&20u32.to_le_bytes()); // msg_len
+        resp.extend_from_slice(&[0x63, 0x24, 0x16, 0x05]); // resPQ#05162463
+        resp.extend_from_slice(&nonce);
+        wire::crypt(&mut encode, &mut resp);
+        peer.write_all(&resp).await?;
+        peer.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let proxy_state = state(cover.addr, dc_addr);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_addr = listener.local_addr()?;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let srv_task = tokio::spawn(serve(listener, proxy_state, 8, async move {
+        let _ = stop_rx.await;
+    }));
+
+    let dir = std::env::temp_dir().join(format!(
+        "mtevil-probe-e2e-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    ));
+    std::fs::create_dir_all(&dir)?;
+    let sec_path = dir.join("proxy-secret");
+    std::fs::write(&sec_path, format!("{}\n", hex::encode(secret())))?;
+
+    let cfg = Config {
+        role: Role::Direct,
+        listen: proxy_addr,
+        secret_file: Some(sec_path),
+        users_file: None,
+        replay_file: None,
+        sni: "example.com".into(),
+        cover: cover.addr.to_string(),
+        enable_dd: false,
+        proxy_protocol: false,
+        dc: vec![format!("2={dc_addr}")],
+        egress_upstreams: Vec::new(),
+        egress_strategy: EgressStrategy::RoundRobin,
+        egress_token_file: None,
+        max_connections: 16,
+        client_hello_timeout_secs: 2,
+        handshake_timeout_secs: 2,
+        idle_timeout_secs: 5,
+        drain_timeout_secs: 1,
+        fake_tls_cert_bytes: wire::DEFAULT_CERT_BYTES,
+        fake_tls_cert_jitter: 0,
+        flight_shaping: false,
+        client_mss: None,
+        client_mss_bulk: None,
+        alert_webhook_url: None,
+    };
+
+    let rtt_ms = probe_telegram_e2e(&cfg, proxy_addr, 2, Duration::from_secs(3)).await?;
+    assert!(rtt_ms < 3000);
+
+    let _ = stop_tx.send(());
+    timeout(Duration::from_secs(2), srv_task).await???;
+    timeout(Duration::from_secs(2), dc_task).await???;
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[tokio::test]
+async fn edge_route_alerts_emit_once_per_state_transition() -> Result<()> {
+    let cover = cover_mock().await?;
+    let token = [0x99u8; 16];
+
+    let primary_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let backup_up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    let make_egress = |flag: Arc<std::sync::atomic::AtomicBool>| async move {
+        let l = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = l.local_addr()?;
+        let task = tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                if !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = s.shutdown().await;
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 88];
+                    if s.read_exact(&mut buf).await.is_ok() {
+                        let _ = s.write_all(&[EGRESS_ACK_OK]).await;
+                    }
+                });
+            }
+        });
+        Ok::<_, anyhow::Error>((addr, task))
+    };
+
+    let (primary_addr, p_task) = make_egress(primary_up.clone()).await?;
+    let (backup_addr, b_task) = make_egress(backup_up.clone()).await?;
+
+    let dir = std::env::temp_dir().join(format!(
+        "mtevil-edge-alerts-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    ));
+    std::fs::create_dir_all(&dir)?;
+    let alerts_path = dir.join("edge-alerts.jsonl");
+
+    let mut cfg = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut cfg).context("unique state")?;
+        sm.dcs.clear();
+        sm.egress_upstreams = vec![primary_addr, backup_addr];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_token = token;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+        sm.egress_cooldown = Duration::from_millis(200);
+        sm.handshake = Duration::from_secs(2);
+        sm.alerts_file = Some(alerts_path.clone());
+    }
+
+    let hdr = [0u8; 64];
+    // 1. Primary down, backup up -> 3 consecutive connections must emit ONLY ONE failover_backup alert.
+    for _ in 0..3 {
+        let (_s, _) = connect_upstream(&cfg, 2, &hdr).await?;
+    }
+    // 2. Both down -> 2 consecutive failures must emit ONLY ONE all_down alert.
+    backup_up.store(false, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..2 {
+        assert!(connect_upstream(&cfg, 2, &hdr).await.is_err());
+    }
+    // 3. Wait for cooldown, primary recovers -> 2 consecutive connections must emit ONLY ONE primary_ok alert.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    primary_up.store(true, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..2 {
+        let (_s, _) = connect_upstream(&cfg, 2, &hdr).await?;
+    }
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&alerts_path)?
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let states: Vec<&str> = lines
+        .iter()
+        .filter_map(|v| v["state"].as_str())
+        .collect();
+    assert_eq!(states, vec!["failover_backup", "all_down", "primary_ok"]);
+
+    p_task.abort();
+    b_task.abort();
+    let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }

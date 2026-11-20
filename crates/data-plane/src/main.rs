@@ -149,6 +149,17 @@ enum Action {
         #[arg(long, default_value = RUNTIME_STATS_DEFAULT_PATH)]
         stats_file: PathBuf,
     },
+    /// End-to-end Telegram probe through the local proxy (FakeTLS/MTV2 handshake + req_pq_multi -> resPQ).
+    ProbeTelegram {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        address: Option<SocketAddr>,
+        #[arg(long, default_value_t = 2)]
+        dc: i16,
+        #[arg(long, default_value_t = 8)]
+        timeout_secs: u64,
+    },
 }
 
 impl Args {
@@ -183,6 +194,7 @@ impl Args {
             flight_shaping: self.flight_shaping,
             client_mss: self.client_mss,
             client_mss_bulk: self.client_mss_bulk,
+            alert_webhook_url: None,
         };
         config.validate()?;
         Ok(config)
@@ -195,10 +207,74 @@ struct CooldownSlot {
     probing: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum EdgeRouteState {
+    #[default]
+    PrimaryOk,
+    FailoverBackup(usize),
+    AllDown,
+}
+
+impl EdgeRouteState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            EdgeRouteState::PrimaryOk => "primary_ok",
+            EdgeRouteState::FailoverBackup(_) => "failover_backup",
+            EdgeRouteState::AllDown => "all_down",
+        }
+    }
+}
+
 #[derive(Default)]
 struct EgressHealth {
     nodes: Vec<CooldownSlot>,
     dc_slots: HashMap<(usize, i16), CooldownSlot>,
+    route_state: EdgeRouteState,
+}
+
+struct EdgeAlertEvent {
+    prev: EdgeRouteState,
+    next: EdgeRouteState,
+    primary: SocketAddr,
+    active: Option<SocketAddr>,
+    reason: String,
+}
+
+impl EgressHealth {
+    fn new(node_count: usize) -> Self {
+        Self {
+            nodes: vec![CooldownSlot::default(); node_count],
+            dc_slots: HashMap::new(),
+            route_state: EdgeRouteState::PrimaryOk,
+        }
+    }
+
+    fn transition_route_state(
+        health: &std::sync::Mutex<EgressHealth>,
+        next: EdgeRouteState,
+        upstreams: &[SocketAddr],
+        reason: String,
+    ) -> Option<EdgeAlertEvent> {
+        let primary = *upstreams.first()?;
+        let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
+        if h.route_state == next {
+            return None;
+        }
+        let prev = h.route_state;
+        h.route_state = next;
+        let active = match next {
+            EdgeRouteState::PrimaryOk => Some(primary),
+            EdgeRouteState::FailoverBackup(idx) => upstreams.get(idx).copied(),
+            EdgeRouteState::AllDown => None,
+        };
+        Some(EdgeAlertEvent {
+            prev,
+            next,
+            primary,
+            active,
+            reason,
+        })
+    }
 }
 
 struct EgressAttemptClaim<'a> {
@@ -230,13 +306,6 @@ impl<'a> Drop for EgressAttemptClaim<'a> {
 }
 
 impl EgressHealth {
-    fn new(node_count: usize) -> Self {
-        Self {
-            nodes: vec![CooldownSlot::default(); node_count],
-            dc_slots: HashMap::new(),
-        }
-    }
-
     fn try_claim<'a>(
         health: &'a std::sync::Mutex<EgressHealth>,
         idx: usize,
@@ -350,6 +419,96 @@ struct State {
     client_mss_bulk: Option<u16>,
     replay: Mutex<ReplayCache>,
     counters: Arc<telemetry::Counters>,
+    alert_webhook_url: Option<String>,
+    alerts_file: Option<PathBuf>,
+}
+
+fn format_edge_alert_message(ev: &EdgeAlertEvent) -> String {
+    match ev.next {
+        EdgeRouteState::FailoverBackup(_) => format!(
+            "Основной egress ({}) недоступен — трафик переключён на резервный egress ({}).",
+            ev.primary,
+            ev.active.map(|a| a.to_string()).unwrap_or_else(|| "unknown".into())
+        ),
+        EdgeRouteState::AllDown => format!(
+            "Все узлы egress недоступны (основной: {}). Причина: {}",
+            ev.primary, ev.reason
+        ),
+        EdgeRouteState::PrimaryOk => format!(
+            "Основной egress ({}) восстановился — трафик вернулся на основной выход.",
+            ev.primary
+        ),
+    }
+}
+
+fn send_http_alert_webhook(url: &str, payload: &str) {
+    // Minimal stdlib-only HTTP POST for http://host[:port]/path webhooks (no extra crate deps).
+    let Some(rest) = url.strip_prefix("http://") else {
+        return;
+    };
+    let (host_port, path) = match rest.find('/') {
+        Some(pos) => (&rest[..pos], &rest[pos..]),
+        None => (rest, "/"),
+    };
+    let addr = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:80")
+    };
+    let body = payload.as_bytes();
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        use std::io::Write;
+        let _ = stream.write_all(req.as_bytes());
+        let _ = stream.write_all(body);
+    }
+}
+
+fn emit_edge_route_alert(state: &State, ev: EdgeAlertEvent) {
+    let ts_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let message = format_edge_alert_message(&ev);
+    let payload = json!({
+        "ts_unix_ms": ts_unix_ms,
+        "event": "edge_route_alert",
+        "prev_state": ev.prev.as_str(),
+        "state": ev.next.as_str(),
+        "primary": ev.primary.to_string(),
+        "active": ev.active.map(|a| a.to_string()),
+        "reason": ev.reason,
+        "message": message,
+    });
+    telemetry::event("edge_route_alert", 0, payload.clone());
+
+    if let Some(alerts_path) = &state.alerts_file {
+        if let Some(parent) = alerts_path.parent() {
+            if parent.exists() {
+                let line = format!("{payload}\n");
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(alerts_path)
+                {
+                    use std::io::Write;
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
+        }
+    }
+
+    if let Some(url) = state.alert_webhook_url.clone() {
+        let body = payload.to_string();
+        std::thread::spawn(move || {
+            send_http_alert_webhook(&url, &body);
+        });
+    }
 }
 
 impl State {
@@ -832,6 +991,44 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&val)?);
                 return Ok(());
             }
+            Action::ProbeTelegram {
+                config,
+                address,
+                dc,
+                timeout_secs,
+            } => {
+                ensure!((1..=5).contains(&dc), "DC id must be 1..5");
+                let cfg = Config::load(&config)?;
+                let target_addr = address.unwrap_or_else(|| {
+                    let ip = if cfg.listen.ip().is_unspecified() {
+                        if cfg.listen.is_ipv6() {
+                            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                        } else {
+                            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                        }
+                    } else {
+                        cfg.listen.ip()
+                    };
+                    SocketAddr::new(ip, cfg.listen.port())
+                });
+                let limit = Duration::from_secs(timeout_secs.clamp(1, 30));
+                let rtt_ms = probe_telegram_e2e(&cfg, target_addr, dc, limit).await?;
+                println!(
+                    "{}",
+                    json!({
+                        "status": "ok",
+                        "role": match cfg.role {
+                            Role::Direct => if cfg.egress_upstreams.is_empty() { "direct" } else { "edge" },
+                            Role::Edge => "edge",
+                            Role::Egress => "egress",
+                        },
+                        "address": target_addr.to_string(),
+                        "dc": dc,
+                        "rtt_ms": rtt_ms,
+                    })
+                );
+                return Ok(());
+            }
         }
     }
     let check_config = args.check_config;
@@ -921,6 +1118,9 @@ async fn main() -> Result<()> {
     let egress_count = config.egress_upstreams.len();
     let counters = Arc::new(telemetry::Counters::default());
     counters.ensure_started();
+    let alerts_file = std::env::var_os("MTEVIL_ALERTS_FILE")
+        .map(PathBuf::from)
+        .or_else(|| stats_path.parent().map(|dir| dir.join("edge-alerts.jsonl")));
     let state = Arc::new(State {
         secrets: std::sync::RwLock::new(Arc::new(secrets)),
         sni: config.sni,
@@ -947,6 +1147,8 @@ async fn main() -> Result<()> {
         client_mss_bulk: config.client_mss_bulk,
         replay: Mutex::new(replay),
         counters,
+        alert_webhook_url: config.alert_webhook_url,
+        alerts_file,
     });
     let role_str: &'static str = if state.egress_upstreams.is_empty() {
         "direct"
@@ -2358,6 +2560,156 @@ async fn probe_egress_endpoint(
     }
 }
 
+fn build_req_pq_multi_frame(nonce: &[u8; 16]) -> Vec<u8> {
+    // MTProto unencrypted message: auth_key_id(8=0) + msg_id(8, unix<<32) + msg_len(4=20) +
+    // req_pq_multi#be7e8ef1 (4) + nonce(16) = 40 bytes payload.
+    // Wrapped in padded-intermediate frame: len(4 LE = 40) + payload(40) = 44 bytes.
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1_700_000_000);
+    let msg_id = (now_secs << 32) & !3u64;
+    let mut frame = Vec::with_capacity(44);
+    frame.extend_from_slice(&40u32.to_le_bytes());
+    frame.extend_from_slice(&0u64.to_le_bytes());
+    frame.extend_from_slice(&msg_id.to_le_bytes());
+    frame.extend_from_slice(&20u32.to_le_bytes());
+    frame.extend_from_slice(&[0xf1, 0x8e, 0x7e, 0xbe]); // req_pq_multi#be7e8ef1
+    frame.extend_from_slice(nonce);
+    frame
+}
+
+fn validate_res_pq_payload(payload: &[u8], expected_nonce: &[u8; 16]) -> Result<()> {
+    // Unencrypted MTProto response: auth_key_id(8=0) + msg_id(8) + msg_len(4) + resPQ#05162463(4) + nonce(16) + ...
+    ensure!(
+        payload.len() >= 40,
+        "Telegram DC reply too short ({} bytes)",
+        payload.len()
+    );
+    ensure!(payload[0..8] == [0u8; 8], "unexpected non-zero auth_key_id in resPQ");
+    ensure!(
+        payload[20..24] == [0x63, 0x24, 0x16, 0x05],
+        "unexpected MTProto constructor (expected resPQ#05162463)"
+    );
+    ensure!(
+        &payload[24..40] == expected_nonce,
+        "resPQ nonce mismatch"
+    );
+    Ok(())
+}
+
+async fn read_tls_record_raw(stream: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
+    let mut hdr = [0u8; 5];
+    stream.read_exact(&mut hdr).await.context("reading TLS record header")?;
+    let n = usize::from(u16::from_be_bytes([hdr[3], hdr[4]]));
+    ensure!(n <= wire::MAX_RECORD, "TLS record exceeds bound");
+    let mut body = vec![0u8; n];
+    stream.read_exact(&mut body).await.context("reading TLS record body")?;
+    let mut raw = Vec::with_capacity(5 + n);
+    raw.extend_from_slice(&hdr);
+    raw.extend_from_slice(&body);
+    Ok((hdr[0], raw))
+}
+
+async fn probe_telegram_e2e(
+    cfg: &Config,
+    addr: SocketAddr,
+    dc_id: i16,
+    limit: Duration,
+) -> Result<u64> {
+    use rand::RngCore;
+    let started = Instant::now();
+    timeout(limit, async {
+        let mut nonce = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let mut req_frame = build_req_pq_multi_frame(&nonce);
+
+        if cfg.role == Role::Egress {
+            let token = cfg.egress_token()?;
+            let mut dc = wire::dc_transport()?;
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .with_context(|| format!("connecting to egress {addr}"))?;
+            let mut preface = [0u8; 88];
+            preface[..4].copy_from_slice(&EGRESS_MAGIC);
+            preface[4..6].copy_from_slice(&dc_id.to_le_bytes());
+            preface[8..24].copy_from_slice(&token);
+            preface[24..88].copy_from_slice(&dc.header);
+            stream.write_all(&preface).await.context("writing MTV2 preface")?;
+            let mut ack = [0u8; 1];
+            stream.read_exact(&mut ack).await.context("reading MTV2 ACK")?;
+            ensure!(ack[0] == EGRESS_ACK_OK, "egress returned negative ACK for DC {dc_id}");
+            wire::crypt(&mut dc.encrypt, &mut req_frame);
+            stream.write_all(&req_frame).await.context("sending req_pq_multi")?;
+
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await.context("reading DC frame length")?;
+            wire::crypt(&mut dc.decrypt, &mut len_buf);
+            let frame_len = (u32::from_le_bytes(len_buf) & 0x7fff_ffff) as usize;
+            ensure!((40..=4096).contains(&frame_len), "unexpected DC frame length {frame_len}");
+            let mut payload = vec![0u8; frame_len];
+            stream.read_exact(&mut payload).await.context("reading DC resPQ payload")?;
+            wire::crypt(&mut dc.decrypt, &mut payload);
+            validate_res_pq_payload(&payload, &nonce)?;
+            return Ok(started.elapsed().as_millis() as u64);
+        }
+
+        let secrets = cfg.secrets()?;
+        let secret = &secrets[0].key;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let (hello_rec, client_random, client_session) =
+            wire::build_client_hello(secret, &cfg.sni, now, &mut rand::rngs::OsRng)?;
+
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .with_context(|| format!("connecting to proxy {addr}"))?;
+        stream.write_all(&hello_rec).await.context("writing FakeTLS ClientHello")?;
+
+        let mut flight = Vec::new();
+        for expected_kind in [0x16u8, 0x14u8, 0x17u8] {
+            let (kind, raw) = read_tls_record_raw(&mut stream).await?;
+            ensure!(
+                kind == expected_kind,
+                "unexpected ServerHello flight record kind 0x{kind:02x} (expected 0x{expected_kind:02x})"
+            );
+            flight.extend_from_slice(&raw);
+        }
+        wire::verify_server_flight(secret, &client_random, &client_session, &flight)?;
+
+        let (init_hdr, mut encrypt, mut decrypt) = wire::build_client_init(secret, dc_id)?;
+        wire::crypt(&mut encrypt, &mut req_frame);
+        let mut combined = Vec::with_capacity(init_hdr.len() + req_frame.len());
+        combined.extend_from_slice(&init_hdr);
+        combined.extend_from_slice(&req_frame);
+        let app_rec = wire::record(0x17, &combined)?;
+        stream.write_all(&app_rec).await.context("writing obfuscated2 init + req_pq_multi")?;
+
+        let mut tls_reader = TlsReader::default();
+        let mut len_buf = [0u8; 4];
+        let mut off = 0;
+        while off < 4 {
+            let n = tls_reader.read_into(&mut stream, &mut len_buf[off..]).await?;
+            ensure!(n > 0, "EOF before Telegram DC reply length");
+            off += n;
+        }
+        wire::crypt(&mut decrypt, &mut len_buf);
+        let frame_len = (u32::from_le_bytes(len_buf) & 0x7fff_ffff) as usize;
+        ensure!((40..=4096).contains(&frame_len), "unexpected Telegram reply frame length {frame_len}");
+        let mut payload = vec![0u8; frame_len];
+        let mut p_off = 0;
+        while p_off < frame_len {
+            let n = tls_reader.read_into(&mut stream, &mut payload[p_off..]).await?;
+            ensure!(n > 0, "EOF before Telegram resPQ payload");
+            p_off += n;
+        }
+        wire::crypt(&mut decrypt, &mut payload);
+        validate_res_pq_payload(&payload, &nonce)?;
+        Ok(started.elapsed().as_millis() as u64)
+    })
+    .await
+    .context("probe_telegram_timeout")?
+}
+
 async fn connect_upstream(
     state: &State,
     dc_id: i16,
@@ -2450,6 +2802,27 @@ async fn connect_upstream(
                     if let Some(c) = claim {
                         c.record_success();
                     }
+                    let next_state = if idx == 0 {
+                        EdgeRouteState::PrimaryOk
+                    } else {
+                        EdgeRouteState::FailoverBackup(idx)
+                    };
+                    let reason = if idx == 0 {
+                        "primary_recovered".to_string()
+                    } else {
+                        last_err
+                            .as_ref()
+                            .map(|e| format!("{e:#}"))
+                            .unwrap_or_else(|| "primary_in_cooldown".to_string())
+                    };
+                    if let Some(ev) = EgressHealth::transition_route_state(
+                        &state.egress_health,
+                        next_state,
+                        &state.egress_upstreams,
+                        reason,
+                    ) {
+                        emit_edge_route_alert(state, ev);
+                    }
                     return Ok((upstream, "egress"));
                 }
                 Ok(Err(AttemptErr::Dc(err))) => {
@@ -2472,8 +2845,17 @@ async fn connect_upstream(
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all egress upstreams in cooldown or unavailable")))
-            .context("egress_connect_failed")
+        let err = last_err
+            .unwrap_or_else(|| anyhow::anyhow!("all egress upstreams in cooldown or unavailable"));
+        if let Some(ev) = EgressHealth::transition_route_state(
+            &state.egress_health,
+            EdgeRouteState::AllDown,
+            &state.egress_upstreams,
+            format!("{err:#}"),
+        ) {
+            emit_edge_route_alert(state, ev);
+        }
+        Err(err).context("egress_connect_failed")
     })
     .await
     .context("egress_budget_timeout")?

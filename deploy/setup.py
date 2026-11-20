@@ -959,7 +959,118 @@ def save_rollback_snapshot(
     return rollback_tag
 
 
-def perform_rollback(deploy_dir: Path, *, auto_from_failed_update: bool = False) -> int:
+def verify_telegram_e2e(
+    base: list[str],
+    *,
+    attempts: int = 3,
+    delay_s: float = 2.0,
+    dc: int = 2,
+    timeout_s: int = 8,
+    fallback_probe_image: str | None = None,
+) -> tuple[bool, str]:
+    """Run an end-to-end Telegram probe (FakeTLS/MTV2 handshake + req_pq_multi -> resPQ) through the running proxy."""
+    svc = compose_service(base)
+    last_err = ""
+    for idx in range(1, attempts + 1):
+        proc = run(
+            base
+            + [
+                "exec",
+                "-T",
+                svc,
+                "mtevil",
+                "probe-telegram",
+                "--config",
+                "/etc/mtevil/config.json",
+                "--dc",
+                str(dc),
+                "--timeout-secs",
+                str(timeout_s),
+            ],
+            check=False,
+        )
+        if proc.returncode == 0:
+            detail = (proc.stdout or "").strip()
+            try:
+                info = json.loads(detail)
+                rtt = info.get("rtt_ms")
+                if rtt is not None:
+                    return True, f"ответ Telegram DC {dc} получен за {rtt} мс"
+            except Exception:
+                pass
+            return True, f"ответ Telegram DC {dc} получен"
+
+        err_out = (proc.stderr or proc.stdout or "").strip()
+        # If rolling back to an older image that does not yet have `probe-telegram`,
+        # run the probe binary from `fallback_probe_image` inside the running container's network namespace.
+        if (
+            fallback_probe_image
+            and ("unrecognized subcommand" in err_out.lower() or "unexpected argument" in err_out.lower())
+        ):
+            cid_proc = run(base + ["ps", "-q", svc], check=False)
+            cid = cid_proc.stdout.strip() if cid_proc.returncode == 0 else ""
+            if cid:
+                deploy_dir = Path(base[-1]).parent.resolve()
+                cfg_host = str((deploy_dir / "config.json").resolve())
+                # Inspect the mounted state volume source from the running container so probe-telegram can read proxy-secret / egress-token.
+                vol_args: list[str] = []
+                insp = run(["docker", "inspect", cid], check=False)
+                if insp.returncode == 0:
+                    try:
+                        mounts = json.loads(insp.stdout)[0].get("Mounts") or []
+                        for m in mounts:
+                            if m.get("Destination") in ("/var/lib/mtevil", "/var/lib/mtveil"):
+                                src = m.get("Name") or m.get("Source")
+                                if src:
+                                    vol_args = ["-v", f"{src}:{m['Destination']}:ro"]
+                                break
+                    except Exception:
+                        pass
+                fb_proc = run(
+                    [
+                        "docker",
+                        "run",
+                        "--rm",
+                        f"--network=container:{cid}",
+                        "-v",
+                        f"{cfg_host}:/etc/mtevil/config.json:ro",
+                        *vol_args,
+                        fallback_probe_image,
+                        "probe-telegram",
+                        "--config",
+                        "/etc/mtevil/config.json",
+                        "--dc",
+                        str(dc),
+                        "--timeout-secs",
+                        str(timeout_s),
+                    ],
+                    check=False,
+                )
+                if fb_proc.returncode == 0:
+                    detail = (fb_proc.stdout or "").strip()
+                    try:
+                        info = json.loads(detail)
+                        rtt = info.get("rtt_ms")
+                        if rtt is not None:
+                            return True, f"ответ Telegram DC {dc} получен за {rtt} мс"
+                    except Exception:
+                        pass
+                    return True, f"ответ Telegram DC {dc} получен"
+                err_out = (fb_proc.stderr or fb_proc.stdout or "").strip()
+
+        last_err = err_out or f"код возврата {proc.returncode}"
+        if idx < attempts:
+            time.sleep(delay_s)
+    return False, last_err
+
+
+def perform_rollback(
+    deploy_dir: Path,
+    *,
+    auto_from_failed_update: bool = False,
+    verify_e2e: bool = True,
+    probe_image_hint: str | None = None,
+) -> int:
     rb_meta_file = deploy_dir / "rollback.json"
     if not rb_meta_file.is_file():
         print(err_text(f"Снимок для отката не найден в {deploy_dir} (нет rollback.json)."), file=sys.stderr)
@@ -1027,6 +1138,19 @@ def perform_rollback(deploy_dir: Path, *, auto_from_failed_update: bool = False)
     except Exception as exc:
         print(err_text(f"Контейнер запущен при откате, но не подтвердил статус healthy: {exc}"), file=sys.stderr)
         return 1
+
+    if verify_e2e and os.environ.get("MTEVIL_SKIP_E2E_PROBE") != "1":
+        print("Сквозная проверка Telegram после отката...")
+        e2e_ok, e2e_detail = verify_telegram_e2e(
+            base,
+            attempts=3,
+            delay_s=2.0,
+            fallback_probe_image=probe_image_hint or cur_image_cfg or None,
+        )
+        if not e2e_ok:
+            print(err_text(f"Откат запущен (healthy), но сквозная проверка Telegram не прошла: {e2e_detail}"), file=sys.stderr)
+            return 1
+        print(ok_text(f"Сквозная проверка Telegram после отката пройдена ({e2e_detail})."))
 
     print(ok_text(f"Откат выполнен: работает версия {target_version}."))
     return 0
@@ -1153,7 +1277,7 @@ def run_update_command(deploy_dir: Path, target_version_override: str | None = N
         detail = (up_proc.stderr or up_proc.stdout or "").strip()
         print(err_text(f"Не удалось запустить новый контейнер ({target_version}): {detail}"), file=sys.stderr)
         print(warn_text("Автоматический возврат предыдущей рабочей версии..."), file=sys.stderr)
-        perform_rollback(deploy_dir, auto_from_failed_update=True)
+        perform_rollback(deploy_dir, auto_from_failed_update=True, verify_e2e=True, probe_image_hint=target_image)
         return 1
 
     try:
@@ -1161,8 +1285,21 @@ def run_update_command(deploy_dir: Path, target_version_override: str | None = N
     except TimeoutError:
         print(err_text(f"Новый контейнер ({target_version}) не перешёл в статус healthy за 45 секунд."), file=sys.stderr)
         print(warn_text("Автоматический возврат предыдущей рабочей версии..."), file=sys.stderr)
-        perform_rollback(deploy_dir, auto_from_failed_update=True)
+        perform_rollback(deploy_dir, auto_from_failed_update=True, verify_e2e=True, probe_image_hint=target_image)
         return 1
+
+    if os.environ.get("MTEVIL_SKIP_E2E_PROBE") != "1":
+        print("Сквозная проверка прохождения запроса к Telegram через обновлённый прокси...")
+        e2e_ok, e2e_detail = verify_telegram_e2e(base, attempts=3, delay_s=2.0, fallback_probe_image=target_image)
+        if not e2e_ok:
+            print(
+                err_text(f"Сквозная проверка Telegram не прошла 3 раза подряд ({target_version}): {e2e_detail}"),
+                file=sys.stderr,
+            )
+            print(warn_text("Автоматический возврат предыдущей рабочей версии..."), file=sys.stderr)
+            perform_rollback(deploy_dir, auto_from_failed_update=True, verify_e2e=True, probe_image_hint=target_image)
+            return 1
+        print(ok_text(f"Сквозная проверка Telegram пройдена ({e2e_detail})."))
 
     print(ok_text(f"Обновление завершено: работает версия {target_version} (контейнер исправен)."))
     return 0
@@ -1319,6 +1456,21 @@ def run_status_command(deploy_dir: Path) -> int:
     print(f"  Состояние:         {health_status}")
     print(f"  Время работы:      {uptime_str}")
     print(f"  Версия для отката: {rollback_ver}")
+    if role == "edge" and running:
+        alerts_proc = run(
+            base + ["exec", "-T", svc, "/bin/cat", "/var/lib/mtevil/edge-alerts.jsonl"],
+            check=False,
+        )
+        if alerts_proc.returncode == 0 and alerts_proc.stdout.strip():
+            lines = [ln.strip() for ln in alerts_proc.stdout.splitlines() if ln.strip()]
+            if lines:
+                try:
+                    last_ev = json.loads(lines[-1])
+                    msg = str(last_ev.get("message") or last_ev.get("state") or "").strip()
+                    if msg:
+                        print(f"  Оповещение edge:   {msg}")
+                except Exception:
+                    pass
     return 0
 
 

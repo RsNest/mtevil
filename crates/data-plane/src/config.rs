@@ -85,6 +85,10 @@ pub struct Config {
     /// Optional bulk-phase TCP MSS applied on the client socket after ServerHello completes.
     #[serde(default)]
     pub client_mss_bulk: Option<u16>,
+    /// Optional webhook URL on edge to receive one alert per egress state transition
+    /// (primary_ok, failover_backup, all_down).
+    #[serde(default)]
+    pub alert_webhook_url: Option<String>,
 }
 fn default_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 24443))

@@ -745,10 +745,11 @@ class SetupValidationTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            current_img = {"version": "v0.1.0-alpha.5", "id": "sha256:aaaa5555", "fail_healthy": False}
+            current_img = {"version": "v0.1.0-alpha.5", "id": "sha256:aaaa5555", "fail_healthy": False, "fail_e2e": False}
             pulled_images: list[str] = []
             tagged_images: list[tuple[str, str]] = []
             recreated_count = {"n": 0}
+            probe_calls: list[str] = []
 
             def fake_run(argv, **kwargs):
                 cmd = " ".join(argv)
@@ -816,7 +817,13 @@ class SetupValidationTests(unittest.TestCase):
                         current_img["version"] = "v0.1.0-alpha.5"
                         current_img["id"] = "sha256:aaaa5555"
                         current_img["fail_healthy"] = False
+                        current_img["fail_e2e"] = False
                     return subprocess.CompletedProcess(argv, 0, "", "")
+                if "probe-telegram" in cmd:
+                    probe_calls.append(current_img["version"])
+                    if current_img["fail_e2e"]:
+                        return subprocess.CompletedProcess(argv, 1, "", "probe_telegram_timeout")
+                    return subprocess.CompletedProcess(argv, 0, '{"status":"ok","dc":2,"rtt_ms":42}\n', "")
                 if "/var/lib/mtevil/runtime-stats.json" in cmd:
                     stats_json = setup.json.dumps({
                         "role": "direct",
@@ -925,11 +932,38 @@ class SetupValidationTests(unittest.TestCase):
                     contextlib.redirect_stdout(buf_fail),
                     contextlib.redirect_stderr(err_fail),
                     mock.patch.object(setup, "wait_healthy", side_effect=fail_wait_healthy),
+                    mock.patch.object(setup.time, "sleep", return_value=None),
                 ):
                     rc_fail = setup.main(["update", "--version", "v0.1.0-alpha.7", "--dir", str(d)])
                 self.assertEqual(rc_fail, 1)
                 self.assertIn("Автоматический возврат предыдущей рабочей версии", err_fail.getvalue())
                 self.assertEqual(current_img["version"], "v0.1.0-alpha.5")
+
+                # 7. Healthy container that fails end-to-end Telegram probe 3 times triggers rollback and verifies restored container via E2E probe!
+                current_img["fail_healthy"] = False
+                probe_calls.clear()
+
+                def up_with_e2e_failure(argv, **kwargs):
+                    res = fake_run(argv, **kwargs)
+                    if "up -d" in " ".join(argv) and current_img["version"] == "v0.1.0-alpha.7":
+                        current_img["fail_healthy"] = False
+                        current_img["fail_e2e"] = True
+                    return res
+
+                buf_e2e = io.StringIO()
+                err_e2e = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(buf_e2e),
+                    contextlib.redirect_stderr(err_e2e),
+                    mock.patch.object(setup, "run", side_effect=up_with_e2e_failure),
+                    mock.patch.object(setup.time, "sleep", return_value=None),
+                ):
+                    rc_e2e = setup.main(["update", "--version", "v0.1.0-alpha.7", "--dir", str(d)])
+                self.assertEqual(rc_e2e, 1)
+                self.assertIn("Сквозная проверка Telegram не прошла 3 раза подряд", err_e2e.getvalue())
+                self.assertIn("Сквозная проверка Telegram после отката пройдена", buf_e2e.getvalue())
+                self.assertEqual(current_img["version"], "v0.1.0-alpha.5")
+                self.assertEqual(probe_calls, ["v0.1.0-alpha.7", "v0.1.0-alpha.7", "v0.1.0-alpha.7", "v0.1.0-alpha.5"])
 
 
 if __name__ == "__main__":

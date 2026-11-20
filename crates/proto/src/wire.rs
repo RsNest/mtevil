@@ -662,6 +662,132 @@ pub fn crypt(cipher: &mut AesCtr, bytes: &mut [u8]) {
     cipher.apply_keystream(bytes);
 }
 
+/// Build an authenticated FakeTLS ClientHello record for `sni` signed with `secret` at `now`.
+pub fn build_client_hello(
+    secret: &[u8; 16],
+    sni: &str,
+    now: u64,
+    rng: &mut impl RngCore,
+) -> Result<(Vec<u8>, [u8; 32], [u8; 32])> {
+    let mut session = [0u8; 32];
+    rng.fill_bytes(&mut session);
+
+    // Extensions: SNI (0x0000), supported_versions (0x002b = TLS 1.3), key_share (0x0033 = X25519).
+    let mut extensions = Vec::new();
+    let sni_bytes = sni.as_bytes();
+    ensure!(
+        !sni_bytes.is_empty() && sni_bytes.len() <= 253,
+        "invalid SNI length"
+    );
+    let sni_list_len = 1 + 2 + sni_bytes.len();
+    extensions.extend_from_slice(&0u16.to_be_bytes());
+    extensions.extend_from_slice(&((2 + sni_list_len) as u16).to_be_bytes());
+    extensions.extend_from_slice(&(sni_list_len as u16).to_be_bytes());
+    extensions.push(0); // host_name
+    extensions.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(sni_bytes);
+
+    // supported_versions: TLS 1.3 (0x0304)
+    extensions.extend_from_slice(&[0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04]);
+    // key_share: X25519 valid point from KEY_SHARE_POOL
+    let key_share = KEY_SHARE_POOL[(rng.next_u32() % KEY_SHARE_POOL.len() as u32) as usize];
+    extensions.extend_from_slice(&[0x00, 0x33, 0x00, 38, 0x00, 36, 0x00, 0x1d, 0x00, 32]);
+    extensions.extend_from_slice(&key_share);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&[3, 3]); // legacy_version TLS 1.2
+    body.extend_from_slice(&[0u8; 32]); // random placeholder for HMAC
+    body.push(32);
+    body.extend_from_slice(&session);
+    // cipher_suites: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384
+    body.extend_from_slice(&[0x00, 0x04, 0x13, 0x01, 0x13, 0x02]);
+    body.extend_from_slice(&[0x01, 0x00]); // compression_methods: null
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+
+    let mut handshake = Vec::with_capacity(4 + body.len());
+    handshake.push(1); // ClientHello
+    let blen = body.len();
+    handshake.push(((blen >> 16) & 0xff) as u8);
+    handshake.push(((blen >> 8) & 0xff) as u8);
+    handshake.push((blen & 0xff) as u8);
+    handshake.extend_from_slice(&body);
+
+    let mut rec = Vec::with_capacity(5 + handshake.len());
+    rec.extend_from_slice(&[0x16, 3, 1]);
+    rec.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    rec.extend_from_slice(&handshake);
+
+    let mut digest = mac(secret, &rec)?;
+    let ts = (now as u32).to_le_bytes();
+    for i in 0..4 {
+        digest[28 + i] ^= ts[i];
+    }
+    rec[11..43].copy_from_slice(&digest);
+    Ok((rec, digest, session))
+}
+
+/// Verify the proxy's FakeTLS ServerHello flight (3 records: Handshake, CCS, AppData).
+pub fn verify_server_flight(
+    secret: &[u8; 16],
+    client_random: &[u8; 32],
+    client_session: &[u8; 32],
+    flight: &[u8],
+) -> Result<()> {
+    ensure!(flight.len() >= 138, "server flight too short");
+    ensure!(flight[0] == 0x16, "first server record is not Handshake");
+    ensure!(&flight[44..76] == client_session, "server session id mismatch");
+    let received: [u8; 32] = flight[11..43].try_into()?;
+    let mut zeroed = flight.to_vec();
+    zeroed[11..43].fill(0);
+    let mut authenticated = Vec::with_capacity(32 + zeroed.len());
+    authenticated.extend_from_slice(client_random);
+    authenticated.extend_from_slice(&zeroed);
+    let expected = mac(secret, &authenticated)?;
+    ensure!(
+        bool::from(received.ct_eq(&expected)),
+        "server flight HMAC mismatch"
+    );
+    Ok(())
+}
+
+/// Build the 64-byte obfuscated2 client init header for padded-intermediate mode (`0xdddddddd`)
+/// targeting `dc` and return `(wire_header, encrypt_cipher, decrypt_cipher)`.
+pub fn build_client_init(secret: &[u8; 16], dc: i16) -> Result<([u8; 64], AesCtr, AesCtr)> {
+    ensure!(
+        (1..=5).contains(&dc.checked_abs().unwrap_or(0)),
+        "invalid DC"
+    );
+    let mut plain = [0u8; 64];
+    loop {
+        OsRng.fill_bytes(&mut plain);
+        let forbidden: [&[u8]; 7] = [
+            b"HEAD",
+            b"POST",
+            b"GET ",
+            b"PVrG",
+            &[0xee; 4],
+            &[0xdd; 4],
+            &[0x16, 3, 1, 2],
+        ];
+        if plain[0] != 0xef
+            && plain[4..8] != [0; 4]
+            && !forbidden.iter().any(|v| plain[..4] == **v)
+        {
+            break;
+        }
+    }
+    plain[56..60].fill(0xdd);
+    plain[60..62].copy_from_slice(&dc.to_le_bytes());
+    let mut encrypt = cipher(&plain[8..40], &plain[40..56], secret)?;
+    let reversed: Vec<_> = plain[8..56].iter().rev().copied().collect();
+    let decrypt = cipher(&reversed[..32], &reversed[32..], secret)?;
+    let mut header = plain;
+    encrypt.apply_keystream(&mut header);
+    header[..56].copy_from_slice(&plain[..56]);
+    Ok((header, encrypt, decrypt))
+}
+
 pub const PROXY_V2_HEADER_LEN: usize = 16;
 pub const MAX_PROXY_V2_PAYLOAD: usize = 1024;
 const PROXY_V2_SIG: [u8; 12] = [
