@@ -6,7 +6,7 @@ MTProto-прокси для Telegram на Rust. На одном Linux VPS мас
 
 **Telegram:** [Релизы mtevil](https://t.me/mtevil_releases) · [Форум RU / EN, баги и предложения](https://t.me/mtevil_chat) · [Поддержка](https://t.me/mtevil_support_bot)
 
-![Сетевой коммутатор в серверной стойке с оранжевым патч-кордом](docs/assets/mtevil-rack.webp)
+<img src="docs/assets/mtevil-telegram.jpg" alt="Логотип mtevil" width="160" height="160">
 
 ## Установка на один VPS
 
