@@ -7,6 +7,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      announce_tag:
+        description: "Announce an existing release in Telegram without rebuilding it"
+        type: string
+        required: false
 
 permissions:
   contents: write
@@ -18,7 +23,10 @@ concurrency:
 
 jobs:
   release:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.announce_tag == '' }}
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.publish_img.outputs.tag }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -224,3 +232,21 @@ jobs:
           grep -q "MTEVIL_PINNED_VERSION=\"${tag}\"" "${dl_dir}/install.sh"
           cmp -s dist/setup.py "${dl_dir}/setup.py"
           cmp -s dist/mtevilctl "${dl_dir}/mtevilctl"
+
+  announce:
+    needs: release
+    if: >-
+      ${{ !cancelled() && (needs.release.result == 'success' ||
+      (github.event_name == 'workflow_dispatch' && inputs.announce_tag != '' && needs.release.result == 'skipped')) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Announce stable or RC release in Telegram
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID || '@mtevil_releases' }}
+          RELEASE_TAG: ${{ inputs.announce_tag || needs.release.outputs.tag }}
+        run: python3 .github/announce_release.py "$RELEASE_TAG"
