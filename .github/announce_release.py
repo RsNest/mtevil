@@ -8,7 +8,6 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-ANNOUNCEMENT_MARKER = "<!-- mtevil-telegram-announced -->"
 RELEASE_TAG = re.compile(r"v\d+\.\d+\.\d+(?:-rc\.\d+)?")
 NOTES_DIR = Path(__file__).resolve().parents[1] / "docs" / "releases"
 
@@ -49,9 +48,10 @@ def build_message(tag, release):
     return heading + "\n\n" + "\n".join(bullets)
 
 
-def send_telegram(token, chat, text, release_url):
+def send_telegram(token, chat, thread_id, text, release_url):
     payload = {
         "chat_id": chat,
+        "message_thread_id": thread_id,
         "text": text,
         "reply_markup": {"inline_keyboard": [[{"text": "Релиз на GitHub", "url": release_url}]]},
     }
@@ -84,23 +84,29 @@ def main(tag):
     if not token:
         print("::warning::TELEGRAM_BOT_TOKEN is missing. Release announcement was skipped.")
         return 0
+    chat = os.environ.get("TELEGRAM_CHAT_ID", "@mtevil_chat")
+    topic = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
+    if not re.fullmatch(r"@[A-Za-z0-9_]+|-\d+", chat) or not topic.isascii() or not topic.isdecimal() or int(topic) <= 1:
+        print("::error::Set TELEGRAM_CHAT_ID and TELEGRAM_MESSAGE_THREAD_ID to a forum group and its release topic.")
+        return 1
+    thread_id = int(topic)
+    marker = f"<!-- mtevil-telegram-announced {chat}/{thread_id} -->"
     releases = f"repos/{os.environ['GITHUB_REPOSITORY']}/releases"
     release = github_api(f"{releases}/tags/{tag}")
     if release.get("draft"):
         print("::error::Publish the GitHub release before announcing it.")
         return 1
     body = release.get("body") or ""
-    if ANNOUNCEMENT_MARKER in body:
-        print(f"Skipping {tag}: announcement already attempted for this release.")
+    if marker in body:
+        print(f"Skipping {tag}: announcement already attempted in this Telegram topic.")
         return 0
 
     text = build_message(tag, release)
     release_endpoint = f"{releases}/{release['id']}"
-    github_api(release_endpoint, {"body": body + "\n\n" + ANNOUNCEMENT_MARKER + "\n"})
-    chat = os.environ.get("TELEGRAM_CHAT_ID", "@mtevil_releases")
-    delivery, detail = send_telegram(token, chat, text, release["html_url"])
+    github_api(release_endpoint, {"body": body + "\n\n" + marker + "\n"})
+    delivery, detail = send_telegram(token, chat, thread_id, text, release["html_url"])
     if delivery == "sent":
-        print(f"Announced {tag} in Telegram (message {detail}).")
+        print(f"Announced {tag} in Telegram topic {thread_id} (message {detail}).")
         return 0
     if delivery == "rejected":
         github_api(release_endpoint, {"body": body})

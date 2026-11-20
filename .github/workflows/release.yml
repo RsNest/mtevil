@@ -247,6 +247,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID || '@mtevil_releases' }}
+          TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID || '@mtevil_chat' }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ vars.TELEGRAM_MESSAGE_THREAD_ID }}
           RELEASE_TAG: ${{ inputs.announce_tag || needs.release.outputs.tag }}
         run: python3 .github/announce_release.py "$RELEASE_TAG"
