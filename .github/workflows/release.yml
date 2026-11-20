@@ -175,6 +175,7 @@ jobs:
           grep -q "MTEVIL_PINNED_VERSION=\"${tag}\"" dist/install.sh
           cp deploy/setup.py dist/setup.py
           cp deploy/mtevilctl dist/mtevilctl
+          (cd dist && sha256sum install.sh setup.py mtevilctl > SHA256SUMS)
 
           latest_flag="$(python3 - "${tag}" <<'PY'
           import json, subprocess, sys
@@ -203,20 +204,23 @@ jobs:
           if gh release view "${tag}" >/dev/null 2>&1; then
             is_draft="$(gh release view "${tag}" --json isDraft -q .isDraft)"
             assets="$(gh release view "${tag}" --json assets -q '.assets[].name')"
-            if ! printf '%s\n' "$assets" | grep -qx "install.sh"; then
-              gh release upload "${tag}" dist/install.sh
-            fi
-            if ! printf '%s\n' "$assets" | grep -qx "setup.py"; then
-              gh release upload "${tag}" dist/setup.py
-            fi
-            if ! printf '%s\n' "$assets" | grep -qx "mtevilctl"; then
-              gh release upload "${tag}" dist/mtevilctl
-            fi
+            existing_dir="$(mktemp -d)"
+            for asset in install.sh setup.py mtevilctl SHA256SUMS; do
+              if printf '%s\n' "$assets" | grep -qx "$asset"; then
+                gh release download "${tag}" --pattern "$asset" --dir "$existing_dir"
+                cmp "dist/$asset" "$existing_dir/$asset"
+              fi
+            done
+            for asset in install.sh setup.py mtevilctl SHA256SUMS; do
+              if ! printf '%s\n' "$assets" | grep -qx "$asset"; then
+                gh release upload "${tag}" "dist/$asset"
+              fi
+            done
             if [ "${is_draft}" = "true" ]; then
               gh release edit "${tag}" --draft=false --prerelease=false ${latest_flag}
             fi
           else
-            gh release create "${tag}" dist/install.sh dist/setup.py dist/mtevilctl \
+            gh release create "${tag}" dist/install.sh dist/setup.py dist/mtevilctl dist/SHA256SUMS \
               --target "${GITHUB_SHA}" \
               --title "${tag}" \
               --generate-notes \
@@ -229,6 +233,9 @@ jobs:
           curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${tag}/install.sh" -o "${dl_dir}/install.sh"
           curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${tag}/setup.py" -o "${dl_dir}/setup.py"
           curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${tag}/mtevilctl" -o "${dl_dir}/mtevilctl"
+          curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${tag}/SHA256SUMS" -o "${dl_dir}/SHA256SUMS"
+          cmp -s dist/SHA256SUMS "${dl_dir}/SHA256SUMS"
+          (cd "${dl_dir}" && sha256sum --strict -c SHA256SUMS)
           grep -q "MTEVIL_PINNED_VERSION=\"${tag}\"" "${dl_dir}/install.sh"
           cmp -s dist/setup.py "${dl_dir}/setup.py"
           cmp -s dist/mtevilctl "${dl_dir}/mtevilctl"

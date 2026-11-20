@@ -693,7 +693,7 @@ class SetupValidationTests(unittest.TestCase):
                 fake_docker = fake_bin / "docker"
                 fake_docker.write_text(
                     "#!/usr/bin/env bash\n"
-                    'if [ "$1" = "pull" ]; then echo "$2" > "' + str(pulled_file).replace("\\", "/") + '"; exit 0; fi\n'
+                    'if [ "$1" = "pull" ]; then echo "${@: -1}" > "' + str(pulled_file).replace("\\", "/") + '"; exit 0; fi\n'
                     "exit 0\n",
                     encoding="utf-8",
                     newline="\n",
@@ -1055,7 +1055,7 @@ class SetupValidationTests(unittest.TestCase):
                 }
             ]
 
-            def fake_download(url, dest, mode=None):
+            def fake_download(url, dest, mode=None, expected_sha256=None):
                 dest.write_text("#!/usr/bin/env python3\nprint('new setup')\n", encoding="utf-8")
 
             def fake_execv_fail(executable, argv):
@@ -1066,6 +1066,7 @@ class SetupValidationTests(unittest.TestCase):
             with (
                 mock.patch.object(setup, "run", side_effect=fake_run),
                 mock.patch.object(setup, "fetch_json_url", return_value=fake_releases),
+                mock.patch.object(setup, "fetch_release_checksums", return_value={"setup.py": "a" * 64, "mtevilctl": "b" * 64}),
                 mock.patch.object(setup, "download_url_atomic", side_effect=fake_download),
                 mock.patch.object(setup.os, "execv", side_effect=fake_execv_fail),
                 contextlib.redirect_stderr(err),
@@ -1083,6 +1084,20 @@ class SetupValidationTests(unittest.TestCase):
             self.assertEqual(up_called["n"], 0)
             self.assertEqual((d / ".env").read_text(encoding="utf-8"), orig_env)
             self.assertIn("Текущий контейнер не затронут", err.getvalue())
+
+            before = (d / "setup.py").read_bytes()
+            with (
+                mock.patch.object(setup, "run", side_effect=fake_run),
+                mock.patch.object(setup, "fetch_json_url", return_value=fake_releases),
+                mock.patch.object(setup, "fetch_release_checksums", return_value={"setup.py": "a" * 64, "mtevilctl": "b" * 64}),
+                mock.patch.object(setup, "download_url_atomic", side_effect=setup.ChecksumError("контрольная сумма не совпала")),
+                mock.patch.object(setup.os, "execv", side_effect=AssertionError("must not execute unverified setup.py")),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(setup.main(["update", "--prerelease", "--dir", str(d)]), 1)
+            self.assertEqual((d / "setup.py").read_bytes(), before)
+            self.assertEqual((d / ".env").read_text(encoding="utf-8"), orig_env)
+            self.assertEqual(up_called["n"], 0)
 
             # 2. If --reexec is already set, it must NOT call os.execv again (no loop).
             exec_calls.clear()
@@ -1120,24 +1135,36 @@ class SetupValidationTests(unittest.TestCase):
                 ],
             }
 
+        def release_assets(tag):
+            return {
+                "install.sh": install_text.replace(
+                    'MTEVIL_PINNED_VERSION="__AUTO__"',
+                    f'MTEVIL_PINNED_VERSION="{tag}"',
+                    1,
+                ).encode("utf-8"),
+                "setup.py": f"import sys\nprint('SELECTED_TAG={tag}', 'ARGS=' + ' '.join(sys.argv[1:]))\n".encode("utf-8"),
+                "mtevilctl": b"#!/bin/sh\n",
+            }
+
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 if self.path == "/releases":
                     body = setup.json.dumps(state["releases"]).encode("utf-8")
-                elif self.path.startswith("/download/") and self.path.endswith("/install.sh"):
-                    tag = self.path.split("/")[2]
-                    body = install_text.replace(
-                        'MTEVIL_PINNED_VERSION="__AUTO__"',
-                        f'MTEVIL_PINNED_VERSION="{tag}"',
-                        1,
-                    ).encode("utf-8")
-                elif self.path.startswith("/download/") and self.path.endswith("/setup.py"):
-                    tag = self.path.split("/")[2]
-                    body = f"import sys\nprint('SELECTED_TAG={tag}', 'ARGS=' + ' '.join(sys.argv[1:]))\n".encode("utf-8")
                 else:
-                    self.send_response(404)
-                    self.end_headers()
-                    return
+                    _, _, tag, name = self.path.split("/")
+                    files = release_assets(tag)
+                    if name == "SHA256SUMS":
+                        if state.get("missing_manifest"):
+                            self.send_error(404)
+                            return
+                        body = "".join(
+                            f"{setup.hashlib.sha256(data).hexdigest()}  {asset}\n"
+                            for asset, data in files.items()
+                        ).encode("utf-8")
+                    else:
+                        body = files[name]
+                        if state.get("tamper") == name:
+                            body += b"tampered"
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(body)
@@ -1160,7 +1187,7 @@ class SetupValidationTests(unittest.TestCase):
                 fake_docker = fake_bin / "docker"
                 fake_docker.write_text(
                     "#!/usr/bin/env bash\n"
-                    'if [ "$1" = "pull" ]; then echo "$2" > "' + str(pulled_file).replace("\\", "/") + '"; exit 0; fi\n'
+                    'if [ "$1" = "pull" ]; then echo "${@: -1}" > "' + str(pulled_file).replace("\\", "/") + '"; exit 0; fi\n'
                     "exit 0\n",
                     encoding="utf-8",
                     newline="\n",
@@ -1187,6 +1214,24 @@ class SetupValidationTests(unittest.TestCase):
                 self.assertEqual(p1b.returncode, 0, p1b.stdout + p1b.stderr)
                 self.assertIn("SELECTED_TAG=v0.2.0-rc.1", p1b.stdout)
                 self.assertEqual(pulled_file.read_text(encoding="utf-8").strip(), "ghcr.io/rsnest/mtevil:v0.2.0-rc.1")
+
+                # Reject a bad second asset before overwriting the installed helpers.
+                installed = d / "case1b"
+                before = (installed / "setup.py").read_bytes()
+                state["tamper"] = "mtevilctl"
+                p_bad = subprocess.run([bash_bin, str(inst)], env=env1b, capture_output=True, text=True)
+                self.assertNotEqual(p_bad.returncode, 0)
+                self.assertIn("контрольная сумма mtevilctl", p_bad.stderr)
+                self.assertNotIn("SELECTED_TAG", p_bad.stdout)
+                self.assertEqual((installed / "setup.py").read_bytes(), before)
+                state.pop("tamper")
+
+                state["missing_manifest"] = True
+                p_missing = subprocess.run([bash_bin, str(inst)], env=env1b, capture_output=True, text=True)
+                self.assertNotEqual(p_missing.returncode, 0)
+                self.assertIn("HTTP Error 404", p_missing.stderr)
+                self.assertNotIn("SELECTED_TAG", p_missing.stdout)
+                state.pop("missing_manifest")
 
                 # Case 2: Prerelease-only repository -> default fails clearly; --prerelease succeeds.
                 state["releases"] = [make_rel("v0.1.0-alpha.11"), make_rel("v0.1.0-rc.1")]
@@ -1255,17 +1300,80 @@ class SetupValidationTests(unittest.TestCase):
             # Fresh simple install with detected IPv4 and free port 443 uses strictly 2 prompts!
             self.assertEqual(len(prompts_seen), 2, prompts_seen)
             self.assertNotIn("IP интерфейса", out)
-            self.assertNotIn("HTTPS-cover", out)
+            self.assertNotIn("Адрес HTTPS-cover (host:port)", out)
             self.assertNotIn("network-host", out)
             self.assertIn("203.0.113.10 (определён автоматически)", out)
             self.assertIn("443 (свободен)", out)
             self.assertIn("Docker healthcheck", out)
+            self.assertIn("[1/4] Проверка конфигурации и HTTPS-cover", out)
+            self.assertIn("[2/4] Запуск контейнера", out)
+            self.assertIn("[3/4] Сквозная проверка связи с Telegram", out)
+            self.assertIn("[4/4] Проверка порта на публичном адресе", out)
+            self.assertIn("Проверено: прокси отвечает как Telegram", out)
+            self.assertIn("Проверка порта пропущена (адрес не публичный)", out)
             self.assertIn(f"Каталог установки: {d.resolve()}", out)
             self.assertIn("Проверка статуса:", out)
             self.assertIn(
                 "https://t.me/proxy?server=203.0.113.10&port=443&secret=ee11223344556677889900aabbccddeeff6578616d706c652e636f6d",
                 out.splitlines(),
             )
+
+    def test_public_port_check_states_and_nonfatal_telegram_probe_failure(self):
+        # skipped: private/documentation and unresolved hosts never trigger a network connection.
+        with mock.patch.object(setup.socket, "create_connection", side_effect=AssertionError("must not connect")):
+            self.assertEqual(setup.check_public_port_reachable("10.0.0.5", 443)[0], "skipped")
+            self.assertEqual(setup.check_public_port_reachable("203.0.113.10", 443)[0], "skipped")
+        # ok / unreachable for a global address.
+        class _Conn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        with mock.patch.object(setup.socket, "create_connection", return_value=_Conn()):
+            self.assertEqual(setup.check_public_port_reachable("93.184.216.34", 443), ("ok", ""))
+        with mock.patch.object(setup.socket, "create_connection", side_effect=OSError("timed out")):
+            st, detail = setup.check_public_port_reachable("93.184.216.34", 443)
+            self.assertEqual(st, "unreachable")
+            self.assertIn("timed out", detail)
+
+        # Wizard: failed Telegram probe and unreachable public port are warnings, not install failures,
+        # and the Telegram link is still printed.
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+
+            def fake_run(argv, **_kwargs):
+                if "link" in " ".join(argv):
+                    return subprocess.CompletedProcess(argv, 0, stdout="https://t.me/proxy?server=93.184.216.34&port=443&secret=ee00\n", stderr="")
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            out_buf = io.StringIO()
+            err_buf = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d), "--project", "mtevil-warn", "--image", "mtevil:v0.1.0", "--no-build"]),
+                mock.patch.object(sys, "stdin", io.StringIO("1\ny\n")),
+                mock.patch.object(sys, "stdout", out_buf),
+                mock.patch.object(sys, "stderr", err_buf),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "detect_local_global_ipv4", return_value="93.184.216.34"),
+                mock.patch.object(setup, "is_port_available", return_value=True),
+                mock.patch.object(setup, "deployment_owns_port", return_value=False),
+                mock.patch.object(setup, "ensure_generated_secret", return_value=True),
+                mock.patch.object(setup, "volume_file_exists", return_value=True),
+                mock.patch.object(setup, "check_cover_from_container", return_value=(True, "")),
+                mock.patch.object(setup, "wait_healthy", return_value=None),
+                mock.patch.object(setup, "verify_telegram_e2e", return_value=(False, "probe_telegram_timeout")),
+                mock.patch.object(setup, "check_public_port_reachable", return_value=("unreachable", "timed out")),
+                mock.patch.object(setup, "run", side_effect=fake_run),
+            ):
+                rc = setup.main()
+            self.assertEqual(rc, 0, out_buf.getvalue() + err_buf.getvalue())
+            self.assertIn("Не удалось получить ответ Telegram через прокси.", err_buf.getvalue())
+            self.assertIn("probe_telegram_timeout", err_buf.getvalue())
+            self.assertIn("Не удалось подключиться к 93.184.216.34:443 с самого сервера", out_buf.getvalue())
+            self.assertIn("ufw allow 443/tcp", out_buf.getvalue())
+            self.assertIn("https://t.me/proxy?server=93.184.216.34&port=443&secret=ee00", out_buf.getvalue().splitlines())
 
     def test_simple_missing_ip_occupied_port_invalid_input_switch_and_cancel(self):
         with tempfile.TemporaryDirectory() as td:

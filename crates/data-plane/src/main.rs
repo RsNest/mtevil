@@ -451,6 +451,19 @@ struct State {
 }
 
 fn format_edge_alert_message(ev: &EdgeAlertEvent) -> String {
+    if ev.reason == "background_egress_probe_dc2" {
+        return match ev.next {
+            EdgeRouteState::PrimaryOk => "Фоновая проверка DC2: доступность egress восстановилась.".into(),
+            EdgeRouteState::FailoverBackup(_) => format!(
+                "Фоновая проверка DC2: основной egress ({}) недоступен, резервный отвечает.",
+                ev.primary
+            ),
+            EdgeRouteState::Degraded { healthy, total } => {
+                format!("Фоновая проверка DC2: доступно egress {healthy} из {total}.")
+            }
+            EdgeRouteState::AllDown => "Фоновая проверка DC2: все egress недоступны.".into(),
+        };
+    }
     match ev.next {
         EdgeRouteState::FailoverBackup(_) => format!(
             "Основной egress ({}) недоступен — трафик переключён на резервный egress ({}).",
@@ -480,11 +493,10 @@ fn format_edge_alert_message(ev: &EdgeAlertEvent) -> String {
     }
 }
 
-fn send_http_alert_webhook(url: &str, payload: &str) {
+fn send_http_alert_webhook(url: &str, payload: &str) -> std::io::Result<()> {
+    use std::{io::{BufRead, BufReader, Write}, net::ToSocketAddrs};
     // Minimal stdlib-only HTTP POST for http://host[:port]/path webhooks (no extra crate deps).
-    let Some(rest) = url.strip_prefix("http://") else {
-        return;
-    };
+    let rest = url.strip_prefix("http://").ok_or_else(|| std::io::Error::other("expected an HTTP webhook URL"))?;
     let (host_port, path) = match rest.find('/') {
         Some(pos) => (&rest[..pos], &rest[pos..]),
         None => (rest, "/"),
@@ -499,12 +511,20 @@ fn send_http_alert_webhook(url: &str, payload: &str) {
         "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-        use std::io::Write;
-        let _ = stream.write_all(req.as_bytes());
-        let _ = stream.write_all(body);
+    let endpoint = addr.to_socket_addrs()?.next()
+        .ok_or_else(|| std::io::Error::other("webhook address did not resolve"))?;
+    let limit = Duration::from_secs(3);
+    let mut stream = std::net::TcpStream::connect_timeout(&endpoint, limit)?;
+    stream.set_write_timeout(Some(limit))?;
+    stream.set_read_timeout(Some(limit))?;
+    stream.write_all(req.as_bytes())?;
+    stream.write_all(body)?;
+    let mut status = String::new();
+    use std::io::Read;
+    BufReader::new(stream).take(256).read_line(&mut status)?;
+    match status.split_whitespace().nth(1).and_then(|code| code.parse::<u16>().ok()) {
+        Some(200..=299) => Ok(()),
+        _ => Err(std::io::Error::other("webhook did not return HTTP 2xx")),
     }
 }
 
@@ -545,8 +565,71 @@ fn emit_edge_route_alert(state: &State, ev: EdgeAlertEvent) {
     if let Some(url) = state.alert_webhook_url.clone() {
         let body = payload.to_string();
         std::thread::spawn(move || {
-            send_http_alert_webhook(&url, &body);
+            for delay in [0, 2, 8] {
+                std::thread::sleep(Duration::from_secs(delay));
+                if send_http_alert_webhook(&url, &body).is_ok() {
+                    return;
+                }
+            }
+            telemetry::event("edge_alert_webhook_failed", 0, json!({"attempts": 3}));
         });
+    }
+}
+
+async fn monitor_edge_egress(state: Arc<State>, period: Duration) {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut previous = None;
+    let mut confirmed = None;
+    loop {
+        interval.tick().await;
+        let mut probes = tokio::task::JoinSet::new();
+        for (idx, &address) in state.egress_upstreams.iter().enumerate() {
+            let token = state.egress_token;
+            probes.spawn(async move {
+                let limit = Duration::from_secs(4);
+                let available = timeout(limit, probe_egress_endpoint(address, 2, &token, limit))
+                    .await
+                    .is_ok_and(|probe| probe.dc_reachable);
+                (idx, available)
+            });
+        }
+        let mut available = vec![false; state.egress_upstreams.len()];
+        while let Some(result) = probes.join_next().await {
+            if let Ok((idx, ok)) = result {
+                available[idx] = ok;
+            }
+        }
+        let route = match available.iter().position(|ok| *ok) {
+            None => EdgeRouteState::AllDown,
+            Some(0) if state.egress_strategy == EgressStrategy::Ordered => EdgeRouteState::PrimaryOk,
+            Some(idx) if state.egress_strategy == EgressStrategy::Ordered => EdgeRouteState::FailoverBackup(idx),
+            Some(_) => {
+                let healthy = available.iter().filter(|ok| **ok).count();
+                let total = available.len();
+                if healthy == total {
+                    EdgeRouteState::PrimaryOk
+                } else {
+                    EdgeRouteState::Degraded { healthy, total }
+                }
+            }
+        };
+        // A single transient probe should not trigger an alert. Keep the live
+        // per-DC cooldowns independent from this DC2 observation.
+        if previous == Some(route) && confirmed != Some(route) {
+            confirmed = Some(route);
+            if let Some(event) = EgressHealth::transition_route_state(
+                &state.egress_health,
+                route,
+                &state.egress_upstreams,
+                "background_egress_probe_dc2".to_string(),
+                state.egress_strategy,
+                None,
+            ) {
+                emit_edge_route_alert(&state, event);
+            }
+        }
+        previous = Some(route);
     }
 }
 
@@ -1261,6 +1344,8 @@ async fn main() -> Result<()> {
             }
         })
     });
+    let egress_monitor = (!state.egress_upstreams.is_empty())
+        .then(|| tokio::spawn(monitor_edge_egress(state.clone(), Duration::from_secs(30))));
     let (users_stop_tx, users_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let users_task = reload_config
         .map(|cfg| spawn_users_reloader(state.clone(), cfg, Duration::from_secs(1), users_stop_rx));
@@ -1278,6 +1363,10 @@ async fn main() -> Result<()> {
     .await;
     let _ = stats_stop_tx.send(());
     let _ = stats_task.await;
+    if let Some(task) = egress_monitor {
+        task.abort();
+        let _ = task.await;
+    }
     let _ = users_stop_tx.send(());
     if let Some(task) = users_task {
         let _ = task.await;

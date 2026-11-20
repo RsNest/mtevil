@@ -109,6 +109,73 @@ fetch_url() {
   fi
 }
 
+# Stage each release payload before replacing installed files or executing any of it.
+fetch_release_assets() {
+  python3 - "$MTEVIL_RELEASE_BASE_URL" "$@" <<'PYTHON'
+import hashlib
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+base, version, directory, *assets = sys.argv[1:]
+tag = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)(?:-(?:alpha|beta|rc)\.\d+)?", version)
+if tag is None:
+    sys.exit(f"Недопустимый тег релиза: {version}")
+
+def fetch(name):
+    request = Request(f"{base}/{version}/{name}", headers={"User-Agent": "mtevil-install"})
+    with urlopen(request, timeout=30) as response:
+        return response.read()
+
+try:
+    try:
+        manifest = fetch("SHA256SUMS").decode("utf-8")
+    except HTTPError as exc:
+        if exc.code != 404 or tuple(map(int, tag.groups())) > (0, 1, 1):
+            raise
+        manifest = None
+        print("SHA256SUMS отсутствует в старом релизе.", file=sys.stderr)
+
+    checksums = {}
+    if manifest is not None:
+        for line in manifest.splitlines():
+            match = re.fullmatch(r"([0-9a-fA-F]{64})[ \t]+\*?([^\s]+)", line.strip())
+            if match is None:
+                continue
+            digest, name = match.groups()
+            if name in checksums:
+                raise ValueError(f"повторная запись в SHA256SUMS: {name}")
+            checksums[name] = digest.lower()
+        if not set(assets).issubset(checksums):
+            raise ValueError("в SHA256SUMS отсутствуют нужные файлы")
+
+    with tempfile.TemporaryDirectory(prefix=".release-", dir=directory) as tmp:
+        staged = []
+        for name in assets:
+            try:
+                data = fetch(name)
+            except HTTPError as exc:
+                if manifest is None and name == "mtevilctl" and exc.code == 404:
+                    continue
+                raise
+            if manifest is not None and hashlib.sha256(data).hexdigest() != checksums[name]:
+                raise ValueError(f"контрольная сумма {name} не совпала")
+            candidate = Path(tmp) / name
+            candidate.write_bytes(data)
+            candidate.chmod(0o755)
+            output = f"install.{version}.sh" if name == "install.sh" else name
+            staged.append((candidate, Path(directory) / output))
+        for candidate, destination in staged:
+            os.replace(candidate, destination)
+except (OSError, ValueError) as exc:
+    sys.exit(f"Не удалось проверить файлы релиза {version}: {exc}")
+PYTHON
+}
+
 if [[ -n "$USER_VERSION" ]]; then
   MTEVIL_VERSION="$USER_VERSION"
 elif [[ "$MTEVIL_PINNED_VERSION" != "__AUTO__" ]]; then
@@ -185,11 +252,7 @@ PY
   rm -f "$RELEASES_JSON"
   trap - EXIT
   PINNED_INSTALL="${MTEVIL_DIR}/install.${RESOLVED_VERSION}.sh"
-  PINNED_INSTALL_URL="${MTEVIL_RELEASE_BASE_URL}/${RESOLVED_VERSION}/install.sh"
-  if ! fetch_url "$PINNED_INSTALL_URL" "$PINNED_INSTALL"; then
-    echo "Не удалось скачать установщик релиза ${RESOLVED_VERSION} (${PINNED_INSTALL_URL})." >&2
-    exit 1
-  fi
+  fetch_release_assets "$RESOLVED_VERSION" "$MTEVIL_DIR" install.sh
   exec bash "$PINNED_INSTALL" "$@"
 fi
 
@@ -212,17 +275,9 @@ REPO_LOWER="$(printf '%s' "$MTEVIL_REPO" | tr '[:upper:]' '[:lower:]')"
 MTEVIL_IMAGE="${MTEVIL_IMAGE:-${MTVEIL_IMAGE:-ghcr.io/${REPO_LOWER}:${MTEVIL_VERSION}}}"
 
 mkdir -p "$MTEVIL_DIR"
-SETUP_URL="${MTEVIL_RELEASE_BASE_URL}/${MTEVIL_VERSION}/setup.py"
 echo "Скачивание мастера настройки mtevil (${MTEVIL_VERSION})..."
-if ! fetch_url "$SETUP_URL" "${MTEVIL_DIR}/setup.py"; then
-  echo "Не удалось скачать setup.py для версии ${MTEVIL_VERSION} (${SETUP_URL})." >&2
-  exit 1
-fi
-chmod +x "${MTEVIL_DIR}/setup.py" 2>/dev/null || true
-
-CTL_URL="${MTEVIL_RELEASE_BASE_URL}/${MTEVIL_VERSION}/mtevilctl"
-if fetch_url "$CTL_URL" "${MTEVIL_DIR}/mtevilctl" 2>/dev/null; then
-  chmod +x "${MTEVIL_DIR}/mtevilctl" 2>/dev/null || true
+fetch_release_assets "$MTEVIL_VERSION" "$MTEVIL_DIR" setup.py mtevilctl
+if [ -x "${MTEVIL_DIR}/mtevilctl" ]; then
   if [ -w "/usr/local/bin" ]; then
     ln -sf -- "${MTEVIL_DIR}/mtevilctl" "/usr/local/bin/mtevilctl" 2>/dev/null || true
   fi
@@ -236,7 +291,15 @@ if fetch_url "$CTL_URL" "${MTEVIL_DIR}/mtevilctl" 2>/dev/null; then
 fi
 
 echo "Загрузка Docker-образа ${MTEVIL_IMAGE}..."
-if ! docker pull "$MTEVIL_IMAGE"; then
+pull_image() {
+  # Show Docker's progress only for an interactive terminal; keep logs clean otherwise.
+  if [ -t 1 ]; then
+    docker pull "$MTEVIL_IMAGE"
+  else
+    docker pull -q "$MTEVIL_IMAGE" >/dev/null
+  fi
+}
+if ! pull_image; then
   echo "Не удалось загрузить Docker-образ ${MTEVIL_IMAGE}." >&2
   echo "Дальше: проверьте интернет-соединение и доступ к ghcr.io, затем повторите запуск." >&2
   exit 1

@@ -1666,6 +1666,97 @@ async fn probe_telegram_e2e_verifies_handshake_and_res_pq_reply() -> Result<()> 
     Ok(())
 }
 
+#[test]
+fn alert_webhook_requires_a_success_response() -> Result<()> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}/alerts", listener.local_addr()?);
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        for status in ["503 Unavailable", "204 No Content"] {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line)? == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let mut body = [0; 2];
+            reader.read_exact(&mut body)?;
+            assert_eq!(&body, b"{}");
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n")?;
+        }
+        Ok(())
+    });
+    assert!(send_http_alert_webhook(&url, "{}").is_err());
+    send_http_alert_webhook(&url, "{}")?;
+    server.join().map_err(|_| anyhow::anyhow!("webhook server panicked"))??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn background_egress_alerts_without_client_traffic() -> Result<()> {
+    let primary = TcpListener::bind("127.0.0.1:0").await?;
+    let primary_addr = primary.local_addr()?;
+    let backup = TcpListener::bind("127.0.0.1:0").await?;
+    let backup_addr = backup.local_addr()?;
+    let primary_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = primary_up.clone();
+    let primary_task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = primary.accept().await {
+            let mut preface = [0; 88];
+            if stream.read_exact(&mut preface).await.is_ok() {
+                let ack = if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    EGRESS_ACK_OK
+                } else {
+                    EGRESS_ACK_ERR
+                };
+                let _ = stream.write_all(&[ack]).await;
+            }
+        }
+    });
+    let backup_task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = backup.accept().await {
+            let mut preface = [0; 88];
+            if stream.read_exact(&mut preface).await.is_ok() {
+                let _ = stream.write_all(&[EGRESS_ACK_OK]).await;
+            }
+        }
+    });
+
+    let mut cfg = state(primary_addr, backup_addr);
+    let inner = Arc::get_mut(&mut cfg).context("unique state")?;
+    inner.egress_upstreams = vec![primary_addr, backup_addr];
+    inner.egress_strategy = EgressStrategy::Ordered;
+    inner.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+    let monitor = tokio::spawn(monitor_edge_egress(cfg.clone(), Duration::from_millis(25)));
+
+    let wait_for_route = |expected| {
+        let cfg = cfg.clone();
+        async move {
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    if cfg.egress_health.lock().map(|health| health.route_state).ok() == Some(expected) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+        }
+    };
+    wait_for_route(EdgeRouteState::FailoverBackup(1)).await?;
+    primary_up.store(true, std::sync::atomic::Ordering::Relaxed);
+    wait_for_route(EdgeRouteState::PrimaryOk).await?;
+
+    for task in [monitor, primary_task, backup_task] {
+        task.abort();
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn edge_route_alerts_emit_once_per_state_transition() -> Result<()> {
     let cover = cover_mock().await?;

@@ -4,6 +4,7 @@ import argparse
 import datetime
 import errno
 import getpass
+import hashlib
 import ipaddress
 import json
 import os
@@ -14,6 +15,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -845,6 +847,37 @@ def wait_healthy(base: list[str], timeout_s: int = 45) -> None:
     raise TimeoutError("mtevil container did not become healthy within 45s")
 
 
+def print_step(index: int, total: int, title: str) -> None:
+    print("\n" + heading(f"[{index}/{total}] {title}"))
+
+
+def check_public_port_reachable(host: str, port: int, timeout_s: float = 3.0) -> tuple[str, str]:
+    """Connect to host:port from this server. Returns (status, detail): ok | unreachable | skipped.
+
+    This only proves that the listener answers on the public address from the server itself.
+    It cannot prove that the provider firewall allows connections from the Internet.
+    """
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+            if infos:
+                ip = ipaddress.ip_address(infos[0][4][0])
+        except (socket.gaierror, ValueError):
+            ip = None
+    if ip is None:
+        return "skipped", "адрес не разрешился в IP"
+    if not ip.is_global:
+        return "skipped", "адрес не публичный"
+    try:
+        with socket.create_connection((str(ip), port), timeout=timeout_s):
+            return "ok", ""
+    except OSError as exc:
+        return "unreachable", str(exc)
+
+
 def choose_wizard_mode(default: str = "simple") -> str:
     default_num = "2" if default == "advanced" else "1"
     print()
@@ -1043,12 +1076,62 @@ def fetch_json_url(url: str) -> object:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def download_url_atomic(url: str, dest: Path, mode: int | None = None) -> None:
+class ChecksumError(RuntimeError):
+    """Raised when a downloaded release asset does not match the published SHA256SUMS."""
+
+
+def parse_sha256sums(text: str) -> dict[str, str]:
+    """Parse `sha256sum` output ("<hex>  <name>" or "<hex> *<name>") into {name: hex}."""
+    sums: dict[str, str] = {}
+    for line in text.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        digest, name = parts[0].lower(), parts[1].strip().lstrip("*")
+        if re.fullmatch(r"[0-9a-f]{64}", digest) and name:
+            if name in sums:
+                raise ChecksumError(f"повторная запись в SHA256SUMS: {name}")
+            sums[name] = digest
+    return sums
+
+
+def fetch_release_checksums(release_base_url: str, version: str) -> dict[str, str] | None:
+    """Return the release SHA256SUMS mapping, or None if the release does not publish one (older releases)."""
+    url = f"{release_base_url}/{version}/SHA256SUMS"
+    req = urllib.request.Request(url, headers={"User-Agent": "mtevilctl"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        key = parse_semver_tag(version)
+        if exc.code == 404 and key is not None and key[:3] <= (0, 1, 1):
+            return None
+        raise ChecksumError(f"не удалось получить SHA256SUMS релиза {version} (HTTP {exc.code})") from exc
+    except OSError as exc:
+        raise ChecksumError(f"не удалось получить SHA256SUMS релиза {version}: {exc}") from exc
+    sums = parse_sha256sums(text)
+    if not sums:
+        raise ChecksumError(f"файл SHA256SUMS релиза {version} пуст или повреждён")
+    return sums
+
+
+def download_url_atomic(
+    url: str,
+    dest: Path,
+    mode: int | None = None,
+    expected_sha256: str | None = None,
+) -> None:
     tmp = dest.with_name(f".{dest.name}.tmp.{os.getpid()}")
     req = urllib.request.Request(url, headers={"User-Agent": "mtevilctl"})
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = resp.read()
+        if expected_sha256 is not None:
+            actual = hashlib.sha256(data).hexdigest()
+            if actual != expected_sha256.lower():
+                raise ChecksumError(
+                    f"контрольная сумма {dest.name} не совпала (ожидалась {expected_sha256[:12]}…, получена {actual[:12]}…)"
+                )
         tmp.write_bytes(data)
         if mode is not None:
             try:
@@ -1378,6 +1461,10 @@ def run_update_command(
             print(err_text(f"Не удалось определить целевой релиз: {exc}"), file=sys.stderr)
             return 1
 
+    if parse_semver_tag(target_version) is None:
+        print(err_text(f"Недопустимый тег релиза: {target_version}"), file=sys.stderr)
+        return 1
+
     target_image = explicit_image or f"ghcr.io/{repo_lower}:{target_version}"
 
     # Fast path if installed version already matches target_version (preserves existing rollback snapshot untouched).
@@ -1391,53 +1478,60 @@ def run_update_command(
     if not reexec and os.environ.get("MTEVIL_SKIP_ASSET_DOWNLOAD") != "1":
         new_setup = deploy_dir / "setup.py"
         new_ctl = deploy_dir / "mtevilctl"
-        setup_downloaded = False
         try:
-            download_url_atomic(f"{release_base_url}/{target_version}/setup.py", new_setup, mode=0o755)
-            setup_downloaded = True
-        except Exception:
-            pass
+            checksums = fetch_release_checksums(release_base_url, target_version)
+            if checksums is None:
+                print("SHA256SUMS отсутствует в старом релизе.", file=sys.stderr)
+            elif not {"setup.py", "mtevilctl"}.issubset(checksums):
+                raise ChecksumError("в SHA256SUMS отсутствует setup.py или mtevilctl")
+
+            with tempfile.TemporaryDirectory(prefix=".release-", dir=deploy_dir) as staging_dir:
+                staging = Path(staging_dir)
+                for dest in (new_setup, new_ctl):
+                    try:
+                        download_url_atomic(
+                            f"{release_base_url}/{target_version}/{dest.name}",
+                            staging / dest.name,
+                            mode=0o755,
+                            expected_sha256=checksums[dest.name] if checksums is not None else None,
+                        )
+                    except urllib.error.HTTPError as exc:
+                        if checksums is not None or dest != new_ctl or exc.code != 404:
+                            raise
+
+                candidate = staging / new_setup.name
+                syntax_check = run([sys.executable, "-m", "py_compile", str(candidate)], check=False)
+                if syntax_check.returncode:
+                    raise ChecksumError("скачанный setup.py не проходит проверку синтаксиса")
+                os.replace(candidate, new_setup)
+                if (staging / new_ctl.name).is_file():
+                    os.replace(staging / new_ctl.name, new_ctl)
+        except (OSError, ChecksumError) as exc:
+            print(err_text(f"Обновление отменено: {exc}. Текущий контейнер не затронут."), file=sys.stderr)
+            return 1
+
+        reexec_argv = [
+            sys.executable,
+            str(new_setup),
+            "update",
+            "--dir",
+            str(deploy_dir),
+            "--version",
+            target_version,
+            "--reexec",
+        ]
+        if explicit_image:
+            reexec_argv.extend(["--image", explicit_image])
         try:
-            download_url_atomic(f"{release_base_url}/{target_version}/mtevilctl", new_ctl, mode=0o755)
-        except Exception:
-            pass
-        if setup_downloaded and new_setup.is_file():
-            reexec_argv = [
-                sys.executable,
-                str(new_setup),
-                "update",
-                "--dir",
-                str(deploy_dir),
-                "--version",
-                target_version,
-                "--reexec",
-            ]
-            if explicit_image:
-                reexec_argv.extend(["--image", explicit_image])
-            # Validate the newly downloaded script before replacing the current process:
-            # if syntax/launch fails, abort cleanly while the running container stays untouched.
-            syntax_check = run([sys.executable, "-m", "py_compile", str(new_setup)], check=False)
-            if syntax_check.returncode != 0:
-                detail = (syntax_check.stderr or syntax_check.stdout or "").strip()
-                print(
-                    err_text(
-                        f"Скачанный setup.py для версии {target_version} повреждён; обновление отменено, текущий контейнер не затронут."
-                    ),
-                    file=sys.stderr,
-                )
-                if detail:
-                    print(detail, file=sys.stderr)
-                return 1
-            try:
-                os.execv(sys.executable, reexec_argv)
-            except OSError as exc:
-                print(
-                    err_text(
-                        f"Не удалось запустить обновлённый setup.py ({target_version}): {exc}. Текущий контейнер не затронут."
-                    ),
-                    file=sys.stderr,
-                )
-                return 1
+            os.execv(sys.executable, reexec_argv)
+        except OSError as exc:
+            print(
+                err_text(
+                    f"Не удалось запустить обновлённый setup.py ({target_version}): {exc}. Текущий контейнер не затронут."
+                ),
+                file=sys.stderr,
+            )
+            return 1
 
     from_label = cur_version or cur_image_ref or "unknown"
     print(heading(f"Обновление mtevil: {from_label} -> {target_version}"))
@@ -2255,6 +2349,8 @@ def main(argv: list[str] | None = None) -> int:
             print("Отменено без изменений.")
             return 0
 
+    total_steps = 4 if role in ("direct", "edge") else 2
+    print_step(1, total_steps, "Проверка конфигурации и HTTPS-cover")
     deploy_dir.mkdir(parents=True, exist_ok=True)
     if use_network_host:
         if bind_ip == "::":
@@ -2470,6 +2566,7 @@ def main(argv: list[str] | None = None) -> int:
             print("Токен MTV2 сохранён в томе state.")
         run(base + ["config", "--quiet"])
 
+        print_step(2, total_steps, "Запуск контейнера")
         while True:
             up_args = ["up", "-d"]
             if had_backup:
@@ -2557,8 +2654,40 @@ def main(argv: list[str] | None = None) -> int:
                     rb_err = (rb_up.stderr or rb_up.stdout or "").strip()
                     print(err_text(f"Не удалось перезапустить прежний контейнер после отката: {rb_err}"), file=sys.stderr)
 
-    print(ok_text("Контейнер исправен (Docker healthcheck: локальный порт отвечает; сквозная связь с Telegram проверяется при подключении клиента)"))
+    print(ok_text("Контейнер исправен (Docker healthcheck: локальный порт отвечает)"))
     status_cmd = format_status_command(deploy_dir)
+
+    probe_ok: bool | None = None
+    probe_detail = ""
+    port_status = "skipped"
+    port_detail = ""
+    if role in ("direct", "edge"):
+        print_step(3, total_steps, "Сквозная проверка связи с Telegram")
+        probe_ok, probe_detail = verify_telegram_e2e(base, attempts=3, delay_s=2.0)
+        if probe_ok:
+            print(ok_text(f"Проверено: прокси отвечает как Telegram ({probe_detail})."))
+        else:
+            print(warn_text("Не удалось получить ответ Telegram через прокси."), file=sys.stderr)
+            if probe_detail:
+                print(f"  Причина: {probe_detail}", file=sys.stderr)
+            print(
+                "  Прокси запущен, но доступ к Telegram DC с этого сервера не подтверждён. "
+                "Проверьте исходящий доступ к Telegram и логи контейнера (см. deploy/README.md).",
+                file=sys.stderr,
+            )
+        print_step(4, total_steps, "Проверка порта на публичном адресе")
+        port_status, port_detail = check_public_port_reachable(public_host, int(pub_port))
+        if port_status == "ok":
+            print(ok_text(f"Порт {pub_port} отвечает по адресу {public_host} (проверено с самого сервера)."))
+            print("  Доступность из Интернета так не проверяется: убедитесь, что порт открыт в firewall провайдера и сервера.")
+        elif port_status == "unreachable":
+            print(warn_text(f"Не удалось подключиться к {public_host}:{pub_port} с самого сервера ({port_detail})."))
+            print(
+                f"  Откройте порт {pub_port}/tcp в панели провайдера и в firewall сервера "
+                "(например, ufw allow {0}/tcp). Если сервер за NAT, проверьте проброс порта.".format(pub_port)
+            )
+        else:
+            print(f"Проверка порта пропущена ({port_detail}).")
 
     if role in ("direct", "edge"):
         link = run(
