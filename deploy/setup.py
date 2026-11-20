@@ -32,10 +32,20 @@ def parse_semver_tag(tag: str) -> tuple[int, int, int, int, int] | None:
     return (major, minor, patch, STAGE_RANKS[stage], pre_num)
 
 
-def select_latest_release(releases: list[dict[str, object]]) -> str:
+def is_prerelease_tag(tag: str) -> bool:
+    key = parse_semver_tag(tag)
+    return key is not None and key[3] < STAGE_RANKS[None]
+
+
+def select_latest_release(
+    releases: list[dict[str, object]],
+    *,
+    allow_prerelease: bool = False,
+) -> str:
     if not isinstance(releases, list) or not releases:
         raise ValueError("no releases found")
     candidates: list[tuple[tuple[int, int, int, int, int], str]] = []
+    prerelease_candidates: list[tuple[tuple[int, int, int, int, int], str]] = []
     for rel in releases:
         if not isinstance(rel, dict) or rel.get("draft"):
             continue
@@ -53,9 +63,23 @@ def select_latest_release(releases: list[dict[str, object]]) -> str:
             and a.get("state") in (None, "uploaded")
             and a.get("browser_download_url")
         }
-        if {"install.sh", "setup.py"}.issubset(ready_names):
+        if not {"install.sh", "setup.py"}.issubset(ready_names):
+            continue
+        if key[3] < STAGE_RANKS[None]:
+            prerelease_candidates.append((key, tag))
+            if allow_prerelease:
+                candidates.append((key, tag))
+        else:
             candidates.append((key, tag))
     if not candidates:
+        if not allow_prerelease and prerelease_candidates:
+            prerelease_candidates.sort(key=lambda item: item[0])
+            newest_pre = prerelease_candidates[-1][1]
+            raise ValueError(
+                f"Стабильный релиз ещё не опубликован (последняя предварительная версия: {newest_pre}). "
+                f"Чтобы установить предварительную версию, укажите MTEVIL_CHANNEL=prerelease (или --prerelease), "
+                f"либо зафиксируйте тег явно: MTEVIL_VERSION={newest_pre}"
+            )
         raise ValueError("no eligible published release with install.sh and setup.py assets")
     candidates.sort(key=lambda item: item[0])
     return candidates[-1][1]
@@ -1156,11 +1180,23 @@ def perform_rollback(
     return 0
 
 
+def resolve_allow_prerelease(flag: bool = False) -> bool:
+    if flag:
+        return True
+    ch = (os.environ.get("MTEVIL_CHANNEL") or os.environ.get("MTVEIL_CHANNEL") or "stable").strip().lower()
+    if ch in ("prerelease", "pre", "alpha", "beta", "rc"):
+        return True
+    if ch in ("", "stable"):
+        return False
+    fail(f"Неизвестный канал обновлений MTEVIL_CHANNEL='{ch}' (допустимо: stable или prerelease).")
+
+
 def run_update_command(
     deploy_dir: Path,
     target_version_override: str | None = None,
     *,
     reexec: bool = False,
+    allow_prerelease: bool = False,
 ) -> int:
     check_prerequisites()
     compose_file = deploy_dir / "compose.yaml"
@@ -1190,6 +1226,7 @@ def run_update_command(
         or ""
     ).strip()
     explicit_image = (os.environ.get("MTEVIL_UPDATE_IMAGE") or "").strip()
+    use_prerelease = resolve_allow_prerelease(allow_prerelease)
 
     if requested_version:
         target_version = requested_version
@@ -1198,10 +1235,9 @@ def run_update_command(
             releases_data = fetch_json_url(api_url)
             if not isinstance(releases_data, list):
                 raise ValueError("Ответ GitHub API не является списком релизов.")
-            target_version = select_latest_release(releases_data)
+            target_version = select_latest_release(releases_data, allow_prerelease=use_prerelease)
         except Exception as exc:
-            print(err_text(f"Не удалось определить свежий релиз из GitHub API ({api_url}): {exc}"), file=sys.stderr)
-            print("Дальше: проверьте доступ к api.github.com или задайте версию через MTEVIL_VERSION.", file=sys.stderr)
+            print(err_text(f"Не удалось определить целевой релиз: {exc}"), file=sys.stderr)
             return 1
 
     target_image = explicit_image or f"ghcr.io/{repo_lower}:{target_version}"
@@ -1238,6 +1274,8 @@ def run_update_command(
                 target_version,
                 "--reexec",
             ]
+            if explicit_image:
+                reexec_argv.extend(["--image", explicit_image])
             # Validate the newly downloaded script before replacing the current process:
             # if syntax/launch fails, abort cleanly while the running container stays untouched.
             syntax_check = run([sys.executable, "-m", "py_compile", str(new_setup)], check=False)
@@ -1773,6 +1811,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Use Docker host networking (for Linux hosts with policy-routed mesh/VPN egress)",
     )
     parser.add_argument("--version", type=str, default=None, help="Target release version override for update")
+    parser.add_argument("--prerelease", action="store_true", help="Allow selecting alpha/beta/rc prereleases in update")
     parser.add_argument("--reexec", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--live", action="store_true", help="Refresh traffic statistics every second")
     parser.add_argument("--iterations", type=int, default=None, help=argparse.SUPPRESS)
@@ -1784,7 +1823,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             return run_status_command(deploy_dir)
         if args.command == "update":
-            return run_update_command(deploy_dir, target_version_override=args.version, reexec=args.reexec)
+            return run_update_command(
+                deploy_dir,
+                target_version_override=args.version,
+                reexec=args.reexec,
+                allow_prerelease=args.prerelease,
+            )
         if args.command == "rollback":
             return perform_rollback(deploy_dir)
         return run_traffic_command(deploy_dir, live=args.live, max_iterations=args.iterations)

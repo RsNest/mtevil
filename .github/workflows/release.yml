@@ -168,10 +168,29 @@ jobs:
           cp deploy/setup.py dist/setup.py
           cp deploy/mtevilctl dist/mtevilctl
 
-          prerelease_flag=""
-          if [[ "${tag}" == *-* ]]; then
-            prerelease_flag="--prerelease"
-          fi
+          latest_flag="$(python3 - "${tag}" <<'PY'
+          import json, subprocess, sys
+          sys.path.insert(0, "deploy")
+          import setup
+          tag = sys.argv[1]
+          target_key = setup.parse_semver_tag(tag)
+          raw = subprocess.check_output(
+              ["gh", "release", "list", "--limit", "100", "--json", "tagName,isDraft"],
+              text=True,
+          )
+          published = json.loads(raw)
+          is_newest = True
+          if target_key is not None:
+              for rel in published:
+                  if rel.get("isDraft"):
+                      continue
+                  other_key = setup.parse_semver_tag(str(rel.get("tagName") or ""))
+                  if other_key is not None and other_key > target_key:
+                      is_newest = False
+                      break
+          print("--latest" if is_newest else "")
+          PY
+          )"
 
           if gh release view "${tag}" >/dev/null 2>&1; then
             is_draft="$(gh release view "${tag}" --json isDraft -q .isDraft)"
@@ -186,16 +205,15 @@ jobs:
               gh release upload "${tag}" dist/mtevilctl
             fi
             if [ "${is_draft}" = "true" ]; then
-              gh release edit "${tag}" --draft=false ${prerelease_flag}
+              gh release edit "${tag}" --draft=false --prerelease=false ${latest_flag}
             fi
           else
             gh release create "${tag}" dist/install.sh dist/setup.py dist/mtevilctl \
               --target "${GITHUB_SHA}" \
               --title "${tag}" \
               --generate-notes \
-              --draft \
-              ${prerelease_flag}
-            gh release edit "${tag}" --draft=false
+              --draft
+            gh release edit "${tag}" --draft=false --prerelease=false ${latest_flag}
           fi
 
           dl_dir="$(mktemp -d)"

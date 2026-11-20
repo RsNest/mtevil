@@ -212,6 +212,10 @@ enum EdgeRouteState {
     #[default]
     PrimaryOk,
     FailoverBackup(usize),
+    Degraded {
+        healthy: usize,
+        total: usize,
+    },
     AllDown,
 }
 
@@ -220,6 +224,7 @@ impl EdgeRouteState {
         match self {
             EdgeRouteState::PrimaryOk => "primary_ok",
             EdgeRouteState::FailoverBackup(_) => "failover_backup",
+            EdgeRouteState::Degraded { .. } => "degraded",
             EdgeRouteState::AllDown => "all_down",
         }
     }
@@ -228,6 +233,7 @@ impl EdgeRouteState {
 #[derive(Default)]
 struct EgressHealth {
     nodes: Vec<CooldownSlot>,
+    node_failed: Vec<bool>,
     dc_slots: HashMap<(usize, i16), CooldownSlot>,
     route_state: EdgeRouteState,
 }
@@ -238,15 +244,32 @@ struct EdgeAlertEvent {
     primary: SocketAddr,
     active: Option<SocketAddr>,
     reason: String,
+    strategy: EgressStrategy,
 }
 
 impl EgressHealth {
     fn new(node_count: usize) -> Self {
         Self {
             nodes: vec![CooldownSlot::default(); node_count],
+            node_failed: vec![false; node_count],
             dc_slots: HashMap::new(),
             route_state: EdgeRouteState::PrimaryOk,
         }
+    }
+
+    fn set_node_availability(
+        health: &std::sync::Mutex<EgressHealth>,
+        idx: usize,
+        available: bool,
+    ) -> (usize, usize) {
+        let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
+        while h.node_failed.len() <= idx {
+            h.node_failed.push(false);
+        }
+        h.node_failed[idx] = !available;
+        let total = h.node_failed.len();
+        let healthy = h.node_failed.iter().filter(|failed| !**failed).count();
+        (healthy, total)
     }
 
     fn transition_route_state(
@@ -254,6 +277,8 @@ impl EgressHealth {
         next: EdgeRouteState,
         upstreams: &[SocketAddr],
         reason: String,
+        strategy: EgressStrategy,
+        active_override: Option<SocketAddr>,
     ) -> Option<EdgeAlertEvent> {
         let primary = *upstreams.first()?;
         let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
@@ -262,17 +287,19 @@ impl EgressHealth {
         }
         let prev = h.route_state;
         h.route_state = next;
-        let active = match next {
+        let active = active_override.or(match next {
             EdgeRouteState::PrimaryOk => Some(primary),
             EdgeRouteState::FailoverBackup(idx) => upstreams.get(idx).copied(),
+            EdgeRouteState::Degraded { .. } => None,
             EdgeRouteState::AllDown => None,
-        };
+        });
         Some(EdgeAlertEvent {
             prev,
             next,
             primary,
             active,
             reason,
+            strategy,
         })
     }
 }
@@ -430,14 +457,26 @@ fn format_edge_alert_message(ev: &EdgeAlertEvent) -> String {
             ev.primary,
             ev.active.map(|a| a.to_string()).unwrap_or_else(|| "unknown".into())
         ),
+        EdgeRouteState::Degraded { healthy, total } => format!(
+            "Часть узлов egress недоступна в режиме round-robin: доступно {} из {} (последний успешный: {}). Причина: {}",
+            healthy,
+            total,
+            ev.active.map(|a| a.to_string()).unwrap_or_else(|| "нет".into()),
+            ev.reason
+        ),
         EdgeRouteState::AllDown => format!(
             "Все узлы egress недоступны (основной: {}). Причина: {}",
             ev.primary, ev.reason
         ),
-        EdgeRouteState::PrimaryOk => format!(
-            "Основной egress ({}) восстановился — трафик вернулся на основной выход.",
-            ev.primary
-        ),
+        EdgeRouteState::PrimaryOk => match ev.strategy {
+            EgressStrategy::Ordered => format!(
+                "Основной egress ({}) восстановился — трафик вернулся на основной выход.",
+                ev.primary
+            ),
+            EgressStrategy::RoundRobin => {
+                "Все узлы egress снова доступны в режиме round-robin.".to_string()
+            }
+        },
     }
 }
 
@@ -2802,24 +2841,48 @@ async fn connect_upstream(
                     if let Some(c) = claim {
                         c.record_success();
                     }
-                    let next_state = if idx == 0 {
-                        EdgeRouteState::PrimaryOk
+                    let (healthy, total) =
+                        EgressHealth::set_node_availability(&state.egress_health, idx, true);
+                    let (next_state, reason, active_override) = if ordered {
+                        if idx == 0 {
+                            (
+                                EdgeRouteState::PrimaryOk,
+                                "primary_recovered".to_string(),
+                                Some(addr),
+                            )
+                        } else {
+                            (
+                                EdgeRouteState::FailoverBackup(idx),
+                                last_err
+                                    .as_ref()
+                                    .map(|e| format!("{e:#}"))
+                                    .unwrap_or_else(|| "primary_in_cooldown".to_string()),
+                                Some(addr),
+                            )
+                        }
+                    } else if healthy == total {
+                        (
+                            EdgeRouteState::PrimaryOk,
+                            "all_egress_recovered".to_string(),
+                            Some(addr),
+                        )
                     } else {
-                        EdgeRouteState::FailoverBackup(idx)
-                    };
-                    let reason = if idx == 0 {
-                        "primary_recovered".to_string()
-                    } else {
-                        last_err
-                            .as_ref()
-                            .map(|e| format!("{e:#}"))
-                            .unwrap_or_else(|| "primary_in_cooldown".to_string())
+                        (
+                            EdgeRouteState::Degraded { healthy, total },
+                            last_err
+                                .as_ref()
+                                .map(|e| format!("{e:#}"))
+                                .unwrap_or_else(|| "egress_node_unavailable".to_string()),
+                            Some(addr),
+                        )
                     };
                     if let Some(ev) = EgressHealth::transition_route_state(
                         &state.egress_health,
                         next_state,
                         &state.egress_upstreams,
                         reason,
+                        state.egress_strategy,
+                        active_override,
                     ) {
                         emit_edge_route_alert(state, ev);
                     }
@@ -2829,18 +2892,21 @@ async fn connect_upstream(
                     if let Some(c) = claim {
                         c.record_dc_failure(state.egress_cooldown);
                     }
+                    EgressHealth::set_node_availability(&state.egress_health, idx, false);
                     last_err = Some(err);
                 }
                 Ok(Err(AttemptErr::Node(err))) => {
                     if let Some(c) = claim {
                         c.record_node_failure(state.egress_cooldown);
                     }
+                    EgressHealth::set_node_availability(&state.egress_health, idx, false);
                     last_err = Some(err);
                 }
                 Err(_) => {
                     if let Some(c) = claim {
                         c.record_node_failure(state.egress_cooldown);
                     }
+                    EgressHealth::set_node_availability(&state.egress_health, idx, false);
                     last_err = Some(anyhow::anyhow!("egress_connect_timeout"));
                 }
             }
@@ -2852,6 +2918,8 @@ async fn connect_upstream(
             EdgeRouteState::AllDown,
             &state.egress_upstreams,
             format!("{err:#}"),
+            state.egress_strategy,
+            None,
         ) {
             emit_edge_route_alert(state, ev);
         }

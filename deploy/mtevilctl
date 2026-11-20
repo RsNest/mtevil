@@ -34,7 +34,9 @@ print_help() {
 
 Команды:
   mtevilctl status            Показать текущую версию, роль, состояние контейнера, время работы и версию для отката
-  mtevilctl update            Обновить контейнер до свежего релиза без повторного запуска мастера (с сохранением настроек и секретов)
+  mtevilctl update            Обновить контейнер до свежего стабильного релиза без повторного запуска мастера (с сохранением настроек и секретов)
+  mtevilctl update --prerelease
+                              Обновить контейнер с учётом предварительных релизов (alpha/beta/rc)
   mtevilctl rollback          Вернуть предыдущую рабочую версию и конфигурацию локально (без интернета)
   mtevilctl traffic           Показать активные сессии, принятые/отправленные байты по участкам и период счётчиков
   mtevilctl traffic --live    Обновлять статистику каждую секунду (скорость приёма/отдачи, отключения, ретрансмиссии TCP; выход по Ctrl+C)
@@ -44,6 +46,8 @@ print_help() {
 Примеры использования:
   mtevilctl status
   mtevilctl update
+  mtevilctl update --prerelease
+  mtevilctl update --version v0.1.0-rc.1
   mtevilctl rollback
   mtevilctl traffic
   mtevilctl traf --live
@@ -51,7 +55,8 @@ print_help() {
 
 Переменные окружения:
   MTEVIL_DIR      Каталог установки (по умолчанию ~/mtevil)
-  MTEVIL_VERSION  Целевая версия для update (по умолчанию выбирается свежий опубликованный релиз)
+  MTEVIL_CHANNEL  Канал релизов для update: stable (по умолчанию) или prerelease
+  MTEVIL_VERSION  Целевая версия для update (переопределяет канал и выбирает указанный тег)
 EOF
 }
 

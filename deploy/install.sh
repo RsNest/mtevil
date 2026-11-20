@@ -4,8 +4,33 @@ set -euo pipefail
 MTEVIL_REPO="${MTEVIL_REPO:-${MTVEIL_REPO:-RsNest/mtevil}}"
 MTEVIL_PINNED_VERSION="__AUTO__"
 USER_VERSION="${MTEVIL_VERSION:-${MTVEIL_VERSION:-}}"
+MTEVIL_CHANNEL="${MTEVIL_CHANNEL:-${MTVEIL_CHANNEL:-stable}}"
 MTEVIL_RELEASE_BASE_URL="${MTEVIL_RELEASE_BASE_URL:-https://github.com/${MTEVIL_REPO}/releases/download}"
 MTEVIL_RELEASES_API_URL="${MTEVIL_RELEASES_API_URL:-https://api.github.com/repos/${MTEVIL_REPO}/releases?per_page=30}"
+
+FORWARD_ARGS=()
+for arg in "$@"; do
+  if [[ "$arg" == "--prerelease" ]]; then
+    MTEVIL_CHANNEL="prerelease"
+  else
+    FORWARD_ARGS+=("$arg")
+  fi
+done
+set -- "${FORWARD_ARGS[@]}"
+
+MTEVIL_CHANNEL_NORM="$(printf '%s' "$MTEVIL_CHANNEL" | tr '[:upper:]' '[:lower:]')"
+case "$MTEVIL_CHANNEL_NORM" in
+  ""|stable)
+    ALLOW_PRERELEASE="0"
+    ;;
+  prerelease|pre|alpha|beta|rc)
+    ALLOW_PRERELEASE="1"
+    ;;
+  *)
+    echo "Неизвестный канал релизов MTEVIL_CHANNEL='${MTEVIL_CHANNEL}'. Используйте 'stable' или 'prerelease'." >&2
+    exit 1
+    ;;
+esac
 
 if [[ -z "${MTEVIL_DIR:-${MTVEIL_DIR:-}}" && -f "$HOME/mtveil/compose.yaml" ]]; then
   if [[ ! -e "$HOME/mtevil" && ! -L "$HOME/mtevil" ]]; then
@@ -63,9 +88,10 @@ else
     echo "Дальше: проверьте доступ к api.github.com или укажите версию явно: MTEVIL_VERSION=v0.1.0-alpha.5 bash install.sh" >&2
     exit 1
   fi
-  if ! RESOLVED_VERSION="$(python3 - "$RELEASES_JSON" <<'PY'
+  if ! RESOLVED_VERSION="$(python3 - "$RELEASES_JSON" "$ALLOW_PRERELEASE" <<'PY'
 import json, re, sys
 path = sys.argv[1]
+allow_prerelease = sys.argv[2] == "1"
 try:
     data = json.loads(open(path, encoding="utf-8").read())
 except Exception as exc:
@@ -76,7 +102,8 @@ if not isinstance(data, list) or not data:
     raise SystemExit(1)
 pat = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:-(alpha|beta|rc)\.(\d+))?$")
 ranks = {"alpha": 1, "beta": 2, "rc": 3, None: 4}
-cands = []
+all_cands = []
+stable_cands = []
 for rel in data:
     if not isinstance(rel, dict) or rel.get("draft"):
         continue
@@ -94,12 +121,29 @@ for rel in data:
     }
     if {"install.sh", "setup.py"}.issubset(names):
         key = (int(m.group(1)), int(m.group(2)), int(m.group(3)), ranks[m.group(4)], int(m.group(5) or 0))
-        cands.append((key, tag))
-if not cands:
+        all_cands.append((key, tag))
+        if m.group(4) is None:
+            stable_cands.append((key, tag))
+if not all_cands:
     print("Не найден ни один опубликованный релиз с готовыми файлами install.sh и setup.py.", file=sys.stderr)
     raise SystemExit(1)
-cands.sort(key=lambda x: x[0])
-print(cands[-1][1])
+if allow_prerelease:
+    all_cands.sort(key=lambda x: x[0])
+    print(all_cands[-1][1])
+else:
+    if not stable_cands:
+        all_cands.sort(key=lambda x: x[0])
+        latest_pre = all_cands[-1][1]
+        print(
+            "Не найден ни один стабильный релиз с готовыми файлами install.sh и setup.py. "
+            f"Доступен предварительный релиз {latest_pre}.\n"
+            f"Для установки предварительного релиза укажите канал: MTEVIL_CHANNEL=prerelease bash install.sh "
+            f"(или флаг --prerelease) либо зафиксируйте версию явно: MTEVIL_VERSION={latest_pre} bash install.sh",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    stable_cands.sort(key=lambda x: x[0])
+    print(stable_cands[-1][1])
 PY
   )"; then
     exit 1

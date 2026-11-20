@@ -1751,3 +1751,100 @@ async fn edge_route_alerts_emit_once_per_state_transition() -> Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
+
+#[tokio::test]
+async fn edge_round_robin_alerts_ignore_healthy_alternation_and_track_availability() -> Result<()> {
+    let cover = cover_mock().await?;
+    let token = [0x88u8; 16];
+
+    let node1_up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let node2_up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    let make_egress = |flag: Arc<std::sync::atomic::AtomicBool>| async move {
+        let l = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = l.local_addr()?;
+        let task = tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                if !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = s.shutdown().await;
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 88];
+                    if s.read_exact(&mut buf).await.is_ok() {
+                        let _ = s.write_all(&[EGRESS_ACK_OK]).await;
+                    }
+                });
+            }
+        });
+        Ok::<_, anyhow::Error>((addr, task))
+    };
+
+    let (addr1, t1) = make_egress(node1_up.clone()).await?;
+    let (addr2, t2) = make_egress(node2_up.clone()).await?;
+
+    let dir = std::env::temp_dir().join(format!(
+        "mtevil-rr-alerts-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    ));
+    std::fs::create_dir_all(&dir)?;
+    let alerts_path = dir.join("edge-alerts.jsonl");
+
+    let mut cfg = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut cfg).context("unique state")?;
+        sm.dcs.clear();
+        sm.egress_upstreams = vec![addr1, addr2];
+        sm.egress_strategy = EgressStrategy::RoundRobin;
+        sm.egress_token = token;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+        sm.handshake = Duration::from_secs(2);
+        sm.alerts_file = Some(alerts_path.clone());
+    }
+
+    let hdr = [0u8; 64];
+    // 1. Healthy alternation across 6 connections must emit ZERO alerts!
+    for _ in 0..6 {
+        let (_s, _) = connect_upstream(&cfg, 2, &hdr).await?;
+    }
+    assert!(
+        !alerts_path.exists(),
+        "healthy round-robin alternation must not emit any alerts"
+    );
+
+    // 2. Genuine failure of node 2 while node 1 stays healthy -> emits exactly ONE degraded alert.
+    node2_up.store(false, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..4 {
+        let (_s, _) = connect_upstream(&cfg, 2, &hdr).await?;
+    }
+
+    // 3. Both nodes down -> emits exactly ONE all_down alert.
+    node1_up.store(false, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..2 {
+        assert!(connect_upstream(&cfg, 2, &hdr).await.is_err());
+    }
+
+    // 4. Both nodes recover -> after both nodes handle traffic, emits primary_ok (all recovered).
+    node1_up.store(true, std::sync::atomic::Ordering::SeqCst);
+    node2_up.store(true, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..4 {
+        let (_s, _) = connect_upstream(&cfg, 2, &hdr).await?;
+    }
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&alerts_path)?
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let states: Vec<&str> = lines
+        .iter()
+        .filter_map(|v| v["state"].as_str())
+        .collect();
+    assert_eq!(states, vec!["degraded", "all_down", "degraded", "primary_ok"]);
+
+    t1.abort();
+    t2.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}

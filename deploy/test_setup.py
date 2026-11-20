@@ -561,15 +561,31 @@ class SetupValidationTests(unittest.TestCase):
             rel("v0.1.0-alpha.11", draft=True),
             rel("v0.1.0-alpha.12", assets=("install.sh",)),
         ]
-        self.assertEqual(setup.select_latest_release(releases), "v0.1.0-alpha.10")
+        # Prerelease-only repository: default (stable channel) must fail with clear guidance.
+        with self.assertRaises(ValueError) as pre_err:
+            setup.select_latest_release(releases)
+        self.assertIn("MTEVIL_CHANNEL=prerelease", str(pre_err.exception))
+        self.assertIn("MTEVIL_VERSION=v0.1.0-alpha.10", str(pre_err.exception))
+
+        # Explicit prerelease opt-in selects the newest valid prerelease.
+        self.assertEqual(setup.select_latest_release(releases, allow_prerelease=True), "v0.1.0-alpha.10")
 
         releases_with_beta = releases + [rel("v0.1.0-beta.1")]
-        self.assertEqual(setup.select_latest_release(releases_with_beta), "v0.1.0-beta.1")
+        self.assertEqual(setup.select_latest_release(releases_with_beta, allow_prerelease=True), "v0.1.0-beta.1")
+
+        # Newer prerelease alongside older stable release (even if GitHub marks prerelease=False for Latest):
+        # default stable channel must pick the stable tag, while prerelease opt-in picks the newer RC.
+        mixed_releases = releases_with_beta + [
+            rel("v0.1.0"),
+            dict(rel("v0.2.0-rc.1"), prerelease=False),
+        ]
+        self.assertEqual(setup.select_latest_release(mixed_releases), "v0.1.0")
+        self.assertEqual(setup.select_latest_release(mixed_releases, allow_prerelease=True), "v0.2.0-rc.1")
 
         with self.assertRaises(ValueError):
             setup.select_latest_release([])
         with self.assertRaises(ValueError):
-            setup.select_latest_release([rel("v0.1.0-alpha.6", draft=True)])
+            setup.select_latest_release([rel("v0.1.0-alpha.6", draft=True)], allow_prerelease=True)
 
         # Rerun for an already tagged commit SHA must reuse its tag without incrementing.
         tag, is_new = setup.resolve_commit_release_tag(
@@ -860,10 +876,18 @@ class SetupValidationTests(unittest.TestCase):
                 mock.patch.object(setup, "fetch_json_url", return_value=fake_releases),
                 mock.patch.dict(setup.os.environ, {"MTEVIL_SKIP_ASSET_DOWNLOAD": "1"}),
             ):
-                # 1. Update from alpha.5 -> alpha.6 succeeds and saves alpha.5 rollback snapshot.
+                # 0. Default stable channel refuses prerelease-only feed with clear opt-in hint.
+                err_stable = io.StringIO()
+                with contextlib.redirect_stderr(err_stable):
+                    rc_stable = setup.main(["update", "--dir", str(d)])
+                self.assertEqual(rc_stable, 1)
+                self.assertIn("MTEVIL_CHANNEL=prerelease", err_stable.getvalue())
+                self.assertIn("v0.1.0-alpha.6", err_stable.getvalue())
+
+                # 1. Update with --prerelease from alpha.5 -> alpha.6 succeeds and saves alpha.5 rollback snapshot.
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
-                    rc = setup.main(["update", "--dir", str(d)])
+                    rc = setup.main(["update", "--prerelease", "--dir", str(d)])
                 self.assertEqual(rc, 0)
                 self.assertIn("v0.1.0-alpha.5 -> v0.1.0-alpha.6", buf.getvalue())
                 self.assertTrue((d / "rollback.json").is_file())
@@ -874,7 +898,7 @@ class SetupValidationTests(unittest.TestCase):
                 # 2. Running update again when already on alpha.6 skips restart and preserves alpha.5 rollback!
                 buf2 = io.StringIO()
                 with contextlib.redirect_stdout(buf2):
-                    rc2 = setup.main(["update", "--dir", str(d)])
+                    rc2 = setup.main(["update", "--prerelease", "--dir", str(d)])
                 self.assertEqual(rc2, 0)
                 self.assertIn("Уже установлена актуальная версия v0.1.0-alpha.6", buf2.getvalue())
                 self.assertEqual(recreated_count["n"], 1)
@@ -1029,7 +1053,7 @@ class SetupValidationTests(unittest.TestCase):
                 mock.patch.object(setup.os, "execv", side_effect=fake_execv_fail),
                 contextlib.redirect_stderr(err),
             ):
-                rc = setup.main(["update", "--dir", str(d)])
+                rc = setup.main(["update", "--prerelease", "--dir", str(d)])
 
             # 1. Must abort with rc=1, pass --version v0.1.0-alpha.11 and --reexec,
             #    and leave .env and running container completely untouched!
@@ -1055,6 +1079,120 @@ class SetupValidationTests(unittest.TestCase):
                 rc2 = setup.main(["update", "--dir", str(d), "--version", "v0.1.0-alpha.11", "--reexec"])
             self.assertEqual(rc2, 0)
             self.assertEqual(up_called["n"], 1)
+
+    def test_install_sh_release_channel_and_explicit_pin(self):
+        bash_bin = "/bin/bash" if Path("/bin/bash").is_file() else None
+        if bash_bin is None:
+            self.skipTest("/bin/bash not available")
+
+        install_text = (Path(__file__).resolve().parent / "install.sh").read_text(encoding="utf-8")
+
+        import http.server
+        import threading
+
+        state = {"releases": []}
+
+        def make_rel(tag: str) -> dict:
+            return {
+                "tag_name": tag,
+                "draft": False,
+                "prerelease": False,
+                "assets": [
+                    {"name": "install.sh", "state": "uploaded", "browser_download_url": f"http://127.0.0.1/{tag}/install.sh"},
+                    {"name": "setup.py", "state": "uploaded", "browser_download_url": f"http://127.0.0.1/{tag}/setup.py"},
+                ],
+            }
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/releases":
+                    body = setup.json.dumps(state["releases"]).encode("utf-8")
+                elif self.path.startswith("/download/") and self.path.endswith("/install.sh"):
+                    tag = self.path.split("/")[2]
+                    body = install_text.replace(
+                        'MTEVIL_PINNED_VERSION="__AUTO__"',
+                        f'MTEVIL_PINNED_VERSION="{tag}"',
+                        1,
+                    ).encode("utf-8")
+                elif self.path.startswith("/download/") and self.path.endswith("/setup.py"):
+                    tag = self.path.split("/")[2]
+                    body = f"import sys\nprint('SELECTED_TAG={tag}', 'ARGS=' + ' '.join(sys.argv[1:]))\n".encode("utf-8")
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = srv.server_port
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                d = Path(td)
+                inst = d / "install.sh"
+                inst.write_text(install_text, encoding="utf-8", newline="\n")
+                fake_bin = d / "bin"
+                fake_bin.mkdir()
+                pulled_file = d / "pulled.txt"
+                fake_docker = fake_bin / "docker"
+                fake_docker.write_text(
+                    "#!/usr/bin/env bash\n"
+                    'if [ "$1" = "pull" ]; then echo "$2" > "' + str(pulled_file).replace("\\", "/") + '"; exit 0; fi\n'
+                    "exit 0\n",
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                setup.os.chmod(fake_docker, 0o755)
+
+                base_env = dict(setup.os.environ)
+                base_env["PATH"] = f"{fake_bin}:{base_env.get('PATH', '')}"
+                base_env["MTEVIL_RELEASES_API_URL"] = f"http://127.0.0.1:{port}/releases"
+                base_env["MTEVIL_RELEASE_BASE_URL"] = f"http://127.0.0.1:{port}/download"
+                for k in ("MTEVIL_VERSION", "MTVEIL_VERSION", "MTEVIL_CHANNEL", "MTVEIL_CHANNEL"):
+                    base_env.pop(k, None)
+
+                # Case 1: Newer prerelease alongside older stable -> default picks stable, channel=prerelease picks RC.
+                state["releases"] = [make_rel("v0.1.0"), make_rel("v0.2.0-rc.1")]
+                env1 = dict(base_env, MTEVIL_DIR=str(d / "case1"))
+                p1 = subprocess.run([bash_bin, str(inst)], env=env1, capture_output=True, text=True)
+                self.assertEqual(p1.returncode, 0, p1.stdout + p1.stderr)
+                self.assertIn("SELECTED_TAG=v0.1.0", p1.stdout)
+                self.assertEqual(pulled_file.read_text(encoding="utf-8").strip(), "ghcr.io/rsnest/mtevil:v0.1.0")
+
+                env1b = dict(base_env, MTEVIL_DIR=str(d / "case1b"), MTEVIL_CHANNEL="prerelease")
+                p1b = subprocess.run([bash_bin, str(inst)], env=env1b, capture_output=True, text=True)
+                self.assertEqual(p1b.returncode, 0, p1b.stdout + p1b.stderr)
+                self.assertIn("SELECTED_TAG=v0.2.0-rc.1", p1b.stdout)
+                self.assertEqual(pulled_file.read_text(encoding="utf-8").strip(), "ghcr.io/rsnest/mtevil:v0.2.0-rc.1")
+
+                # Case 2: Prerelease-only repository -> default fails clearly; --prerelease succeeds.
+                state["releases"] = [make_rel("v0.1.0-alpha.11"), make_rel("v0.1.0-rc.1")]
+                env2 = dict(base_env, MTEVIL_DIR=str(d / "case2"))
+                p2 = subprocess.run([bash_bin, str(inst)], env=env2, capture_output=True, text=True)
+                self.assertEqual(p2.returncode, 1)
+                self.assertIn("MTEVIL_CHANNEL=prerelease", p2.stderr)
+                self.assertIn("MTEVIL_VERSION=v0.1.0-rc.1", p2.stderr)
+
+                env2b = dict(base_env, MTEVIL_DIR=str(d / "case2b"))
+                p2b = subprocess.run([bash_bin, str(inst), "--prerelease"], env=env2b, capture_output=True, text=True)
+                self.assertEqual(p2b.returncode, 0, p2b.stdout + p2b.stderr)
+                self.assertIn("SELECTED_TAG=v0.1.0-rc.1", p2b.stdout)
+
+                # Case 3: Explicit version pin works even on stable channel.
+                env3 = dict(base_env, MTEVIL_DIR=str(d / "case3"), MTEVIL_VERSION="v0.1.0-alpha.11")
+                p3 = subprocess.run([bash_bin, str(inst)], env=env3, capture_output=True, text=True)
+                self.assertEqual(p3.returncode, 0, p3.stdout + p3.stderr)
+                self.assertIn("SELECTED_TAG=v0.1.0-alpha.11", p3.stdout)
+                self.assertEqual(pulled_file.read_text(encoding="utf-8").strip(), "ghcr.io/rsnest/mtevil:v0.1.0-alpha.11")
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":
