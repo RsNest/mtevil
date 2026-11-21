@@ -114,6 +114,12 @@ DEFAULT_DCS = [
     "4=149.154.167.91:443",
     "5=91.108.56.100:443",
 ]
+POPULAR_SNIS: tuple[tuple[str, str], ...] = (
+    ("ya.ru", "Яндекс (TLS 1.3, рекомендуется для РФ)"),
+    ("vk.com", "ВКонтакте (TLS 1.3)"),
+    ("ozon.ru", "Ozon (TLS 1.3)"),
+    ("example.com", "example.com (нейтральный международный домен)"),
+)
 HEX32_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 SNI_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
@@ -833,6 +839,45 @@ def read_volume_secret(base: list[str], path_in_container: str) -> str:
     ).stdout.strip()
 
 
+def read_allowed_snis_from_volume(base: list[str]) -> list[str]:
+    if not volume_file_exists(base, "/var/lib/mtevil/allowed-sni.txt"):
+        return []
+    try:
+        raw = read_volume_secret(base, "/var/lib/mtevil/allowed-sni.txt")
+    except Exception:
+        return []
+    out: list[str] = []
+    for tok in re.split(r"[\r\n,]+", raw):
+        s = tok.strip().lower()
+        if not s:
+            continue
+        try:
+            v = validate_sni(s)
+            if v not in out:
+                out.append(v)
+        except Exception:
+            pass
+    return out
+
+
+def record_allowed_snis_in_volume(base: list[str], snis: list[str]) -> list[str]:
+    existing = read_allowed_snis_from_volume(base)
+    merged: list[str] = []
+    for item in [*snis, *existing]:
+        s = (item or "").strip().lower()
+        if not s:
+            continue
+        try:
+            v = validate_sni(s)
+            if v not in merged:
+                merged.append(v)
+        except Exception:
+            pass
+    if merged:
+        write_volume_secret_stdin(base, "/var/lib/mtevil/allowed-sni.txt", "\n".join(merged))
+    return merged
+
+
 def wait_healthy(base: list[str], timeout_s: int = 45) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -990,6 +1035,27 @@ def ask_simple_confirm() -> str:
         if raw in ("n", "no", "н", "нет"):
             return "cancel"
         print("Некорректный выбор: введите y (установить), s (сменить SNI), a (расширенная настройка) или n (отмена).")
+
+
+def prompt_sni_choice(default_sni: str = "example.com") -> str:
+    print()
+    print(heading("Выбор домена для HTTPS-маскировки (SNI)"))
+    for idx, (dom, desc) in enumerate(POPULAR_SNIS, start=1):
+        mark = " [текущий]" if dom == default_sni else ""
+        print(f"  {idx}. {dom:<12} — {desc}{mark}")
+    print("  Или введите любой другой домен с поддержкой TLS 1.3 (без https:// и порта).")
+    while True:
+        raw = ask("Домен SNI (номер 1-4 или имя домена)", default_sni).strip()
+        if raw.isdigit():
+            num = int(raw)
+            if 1 <= num <= len(POPULAR_SNIS):
+                return POPULAR_SNIS[num - 1][0]
+            print(f"Введите номер от 1 до {len(POPULAR_SNIS)} или доменное имя.")
+            continue
+        try:
+            return validate_sni(raw)
+        except Exception as exc:
+            print(f"Некорректный домен SNI: {exc}")
 
 
 def choose_advanced_role(default_role: str = "direct") -> str:
@@ -1881,6 +1947,12 @@ def run_status_command(deploy_dir: Path) -> int:
     print(f"  Роль:              {role_names.get(role, role)}")
     if bind_val and port_val:
         print(f"  Порт и сеть:       {bind_val}:{port_val} ({net_mode_label})")
+    if role in ("direct", "edge"):
+        cur_sni = str(saved_cfg.get("sni") or "").strip()
+        if cur_sni:
+            extra_snis = [s for s in read_allowed_snis_from_volume(base) if s != cur_sni.lower()]
+            sni_note = f" (также разрешены: {', '.join(extra_snis)})" if extra_snis else ""
+            print(f"  Маскировка (SNI):  {cur_sni}{sni_note}")
     print(f"  Состояние:         {health_status}")
     print(f"  Время работы:      {uptime_str}")
     print(f"  Версия для отката: {rollback_ver}")
@@ -2133,15 +2205,273 @@ def run_traffic_command(deploy_dir: Path, *, live: bool = False, max_iterations:
     return 0
 
 
+def resolve_client_server_and_port(saved: dict[str, object]) -> tuple[str, int]:
+    port_raw = str(saved.get("MTEVIL_PORT") or "443").strip()
+    try:
+        port = validate_port(port_raw)
+    except Exception:
+        port = 443
+    host = str(saved.get("MTEVIL_PUBLIC_HOST") or "").strip()
+    if not host:
+        bind = str(saved.get("MTEVIL_BIND") or "").strip()
+        if bind and bind not in ("0.0.0.0", "::"):
+            host = bind
+    if not host:
+        host = detect_local_global_ipv4() or "127.0.0.1"
+    return host, port
+
+
+def run_link_command(
+    deploy_dir: Path,
+    *,
+    sni_override: str | None = None,
+    user: str | None = None,
+    all_users: bool = False,
+    dd: bool = False,
+) -> int:
+    check_prerequisites()
+    compose_file = deploy_dir / "compose.yaml"
+    env_file = deploy_dir / ".env"
+    cfg_file = deploy_dir / "config.json"
+    if not compose_file.is_file() or not env_file.is_file() or not cfg_file.is_file():
+        print(err_text(f"Существующая установка не найдена в {deploy_dir}."), file=sys.stderr)
+        return 1
+
+    saved = load_existing_defaults(deploy_dir)
+    saved_cfg = saved.get("config") if isinstance(saved.get("config"), dict) else {}
+    role = str(saved_cfg.get("role") or "direct")
+    if role == "direct" and saved_cfg.get("egress_upstreams"):
+        role = "edge"
+    if role == "egress":
+        print(err_text("Команда link доступна только на сервере входа (direct или edge)."), file=sys.stderr)
+        return 1
+
+    if sni_override is not None:
+        try:
+            sni_override = validate_sni(sni_override)
+        except Exception as exc:
+            print(err_text(f"Некорректный домен SNI: {exc}"), file=sys.stderr)
+            return 1
+
+    project = str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
+    base = compose_cmd(deploy_dir, project)
+    svc = compose_service(base)
+    server_host, pub_port = resolve_client_server_and_port(saved)
+
+    cid = run(base + ["ps", "-q", svc], check=False).stdout.strip()
+    cmd_prefix = base + (["exec", "-T", svc] if cid else ["run", "--rm", "-T", "--no-deps", svc])
+    link_args = [
+        "mtevil",
+        "link",
+        "--config",
+        "/etc/mtevil/config.json",
+        "--server",
+        server_host,
+        "--port",
+        str(pub_port),
+    ]
+    if dd:
+        link_args.append("--dd")
+    if user:
+        link_args.extend(["--user", user])
+    if all_users:
+        link_args.append("--all")
+    if sni_override:
+        link_args.extend(["--sni", sni_override])
+
+    proc = run(cmd_prefix + link_args, check=False)
+    if proc.returncode != 0 and sni_override:
+        # Backward compatibility if container runs an older binary (< v0.1.5) without `mtevil link --sni`:
+        retry_args = [a for a in link_args if a not in ("--sni", sni_override)]
+        retry_proc = run(cmd_prefix + retry_args, check=False)
+        if retry_proc.returncode == 0:
+            old_sni_hex = str(saved_cfg.get("sni") or "").encode("utf-8").hex()
+            new_sni_hex = sni_override.encode("utf-8").hex()
+            out_lines: list[str] = []
+            for ln in retry_proc.stdout.strip().splitlines():
+                if old_sni_hex and ln.endswith(old_sni_hex):
+                    out_lines.append(ln[: -len(old_sni_hex)] + new_sni_hex)
+                else:
+                    out_lines.append(ln)
+            print("\n".join(out_lines))
+            return 0
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        print(err_text(f"Не удалось сформировать ссылку: {detail}"), file=sys.stderr)
+        return 1
+    print(proc.stdout.strip())
+    return 0
+
+
+def run_sni_command(deploy_dir: Path, new_sni_arg: str | None = None) -> int:
+    check_prerequisites()
+    compose_file = deploy_dir / "compose.yaml"
+    env_file = deploy_dir / ".env"
+    cfg_file = deploy_dir / "config.json"
+    if not compose_file.is_file() or not env_file.is_file() or not cfg_file.is_file():
+        print(err_text(f"Существующая установка не найдена в {deploy_dir}."), file=sys.stderr)
+        return 1
+
+    saved = load_existing_defaults(deploy_dir)
+    saved_cfg = saved.get("config") if isinstance(saved.get("config"), dict) else {}
+    role = str(saved_cfg.get("role") or "direct")
+    if role == "direct" and saved_cfg.get("egress_upstreams"):
+        role = "edge"
+    if role == "egress":
+        print(err_text("Команда sni доступна только на сервере входа (direct или edge)."), file=sys.stderr)
+        return 1
+
+    old_sni = str(saved_cfg.get("sni") or "example.com").strip()
+    if new_sni_arg:
+        try:
+            new_sni = validate_sni(new_sni_arg)
+        except Exception as exc:
+            print(err_text(f"Некорректный домен SNI: {exc}"), file=sys.stderr)
+            return 1
+    else:
+        new_sni = prompt_sni_choice(old_sni)
+
+    new_cover = f"{new_sni}:443"
+    project = str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
+    base = compose_cmd(deploy_dir, project)
+    svc = compose_service(base)
+
+    print(f"Проверка HTTPS-cover ({new_cover}, SNI: {new_sni})...")
+    cover_ok, cover_out = check_cover_from_container(base, new_cover, new_sni)
+    if cover_ok:
+        print(ok_text("HTTPS-сайт для маскировки доступен."))
+    else:
+        print(err_text(f"HTTPS-сайт для маскировки ({new_cover}, SNI {new_sni}) не прошёл проверку."), file=sys.stderr)
+        if cover_out:
+            print(f"Детали: {cover_out}", file=sys.stderr)
+        if not sys.stdin.isatty() or not ask_yes_no("Всё равно применить этот SNI?", default=False):
+            print("Отменено без изменений.")
+            return 1
+
+    merged_snis = record_allowed_snis_in_volume(base, [new_sni, old_sni])
+    orig_cfg_text = cfg_file.read_text(encoding="utf-8")
+    new_cfg = dict(saved_cfg)
+    new_cfg["sni"] = new_sni
+    new_cfg["cover"] = new_cover
+    cfg_file.write_text(json.dumps(new_cfg, indent=2) + "\n", encoding="utf-8")
+
+    up_proc = run(base + ["up", "-d", "--no-build", "--force-recreate", svc], check=False)
+    if up_proc.returncode != 0:
+        cfg_file.write_text(orig_cfg_text, encoding="utf-8")
+        run(base + ["up", "-d", "--no-build", "--force-recreate", svc], check=False)
+        detail = (up_proc.stderr or up_proc.stdout or "").strip()
+        print(err_text(f"Не удалось перезапустить контейнер с новым SNI: {detail}"), file=sys.stderr)
+        return 1
+
+    try:
+        wait_healthy(base)
+    except TimeoutError:
+        print_failed_container_logs(base)
+        cfg_file.write_text(orig_cfg_text, encoding="utf-8")
+        run(base + ["up", "-d", "--no-build", "--force-recreate", svc], check=False)
+        print(err_text("Контейнер не перешёл в статус healthy; возвращён прежний SNI."), file=sys.stderr)
+        return 1
+
+    if os.environ.get("MTEVIL_SKIP_E2E_PROBE") != "1":
+        probe_ok, probe_detail = verify_telegram_e2e(base, attempts=3, delay_s=2.0)
+        if probe_ok:
+            print(ok_text(f"Сквозная проверка Telegram пройдена ({probe_detail})."))
+        else:
+            print(warn_text(f"Предупреждение: сквозная проверка Telegram не подтверждена ({probe_detail})."), file=sys.stderr)
+
+    print(ok_text(f"Основной SNI обновлён: {old_sni} -> {new_sni}"))
+    extra = [s for s in merged_snis if s != new_sni.lower()]
+    if extra:
+        print(f"Прежние ссылки клиентов со старым SNI ({', '.join(extra)}) продолжают работать без перенастройки.")
+    print("\n" + heading("Новая ссылка для подключения в Telegram"))
+    run_link_command(deploy_dir)
+    return 0
+
+
+def run_user_command(deploy_dir: Path, action: str, name: str | None = None, sni_override: str | None = None) -> int:
+    check_prerequisites()
+    compose_file = deploy_dir / "compose.yaml"
+    env_file = deploy_dir / ".env"
+    cfg_file = deploy_dir / "config.json"
+    if not compose_file.is_file() or not env_file.is_file() or not cfg_file.is_file():
+        print(err_text(f"Существующая установка не найдена в {deploy_dir}."), file=sys.stderr)
+        return 1
+
+    saved = load_existing_defaults(deploy_dir)
+    saved_cfg = saved.get("config") if isinstance(saved.get("config"), dict) else {}
+    role = str(saved_cfg.get("role") or "direct")
+    if role == "direct" and saved_cfg.get("egress_upstreams"):
+        role = "edge"
+    if role == "egress":
+        print(err_text("Управление пользователями доступно только на сервере входа (direct или edge)."), file=sys.stderr)
+        return 1
+
+    users_file = str(saved_cfg.get("users_file") or "/var/lib/mtevil/users.json")
+    if not saved_cfg.get("users_file"):
+        new_cfg = dict(saved_cfg)
+        new_cfg["users_file"] = users_file
+        cfg_file.write_text(json.dumps(new_cfg, indent=2) + "\n", encoding="utf-8")
+
+    project = str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
+    base = compose_cmd(deploy_dir, project)
+    svc = compose_service(base)
+    cid = run(base + ["ps", "-q", svc], check=False).stdout.strip()
+    cmd_prefix = base + (["exec", "-T", svc] if cid else ["run", "--rm", "-T", "--no-deps", svc])
+
+    act = (action or "list").strip().lower()
+    if act in ("list", "ls"):
+        proc = run(cmd_prefix + ["mtevil", "user-list", "--users-file", users_file], check=False)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            print(err_text(f"Не удалось получить список пользователей: {detail}"), file=sys.stderr)
+            return 1
+        names = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+        if not names:
+            print("Дополнительные пользователи не созданы (работает основной секрет default).")
+        else:
+            print(heading(f"Пользователи ({len(names)}):"))
+            for n in names:
+                print(f"  - {n}")
+        return 0
+
+    if act == "add":
+        if not name:
+            print(err_text("Укажите имя пользователя: mtevilctl user add <имя>"), file=sys.stderr)
+            return 1
+        proc = run(cmd_prefix + ["mtevil", "user-add", "--users-file", users_file, "--name", name], check=False)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            print(err_text(f"Не удалось добавить пользователя '{name}': {detail}"), file=sys.stderr)
+            return 1
+        print(ok_text(f"Пользователь '{name}' добавлен (подхватится прокси автоматически без перезапуска)."))
+        return run_link_command(deploy_dir, sni_override=sni_override, user=name)
+
+    if act in ("del", "delete", "rm", "remove"):
+        if not name:
+            print(err_text("Укажите имя пользователя: mtevilctl user del <имя>"), file=sys.stderr)
+            return 1
+        proc = run(cmd_prefix + ["mtevil", "user-del", "--users-file", users_file, "--name", name], check=False)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            print(err_text(f"Не удалось удалить пользователя '{name}': {detail}"), file=sys.stderr)
+            return 1
+        print(ok_text(f"Пользователь '{name}' удалён (доступ отозван без перезапуска контейнера)."))
+        return 0
+
+    print(err_text(f"Неизвестное действие '{action}'. Используйте: list, add <имя> или del <имя>."), file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Interactive Docker Compose wizard and lifecycle tool for mtevil")
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("wizard", "status", "update", "rollback", "traffic", "traf"),
+        choices=("wizard", "setup", "reconfigure", "status", "update", "rollback", "traffic", "traf", "link", "sni", "user"),
         default="wizard",
-        help="Action to perform: wizard (default), status, update, rollback, traffic (or traf)",
+        help="Action to perform: wizard (default), setup, status, update, rollback, traffic, link, sni, user",
     )
+    parser.add_argument("extra", nargs="*", help=argparse.SUPPRESS)
     parser.add_argument("--dir", type=Path, default=None, help="Target deployment directory (default: deploy/wizard)")
     parser.add_argument("--project", type=str, default=None, help="Docker Compose project name")
     parser.add_argument("--image", type=str, default=DEFAULT_IMAGE, help="Docker image tag")
@@ -2163,10 +2493,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reexec", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--live", action="store_true", help="Refresh traffic statistics every second")
     parser.add_argument("--iterations", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--sni", type=str, default=None, help="Custom SNI domain for link generation")
+    parser.add_argument("--user", type=str, default=None, help="Named user for link generation")
+    parser.add_argument("--all", action="store_true", help="Print links for all configured users")
+    parser.add_argument("--dd", action="store_true", help="Print dd-mode link instead of FakeTLS ee-link")
     args = parser.parse_args(argv)
 
     repo_root = Path(__file__).resolve().parent.parent
-    if args.command in ("status", "update", "rollback", "traffic", "traf"):
+    if args.command in ("status", "update", "rollback", "traffic", "traf", "link", "sni", "user"):
         deploy_dir = (args.dir or default_deploy_dir(repo_root)).resolve()
         if args.command == "status":
             return run_status_command(deploy_dir)
@@ -2179,7 +2513,33 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.command == "rollback":
             return perform_rollback(deploy_dir)
+        if args.command == "link":
+            return run_link_command(
+                deploy_dir,
+                sni_override=args.sni,
+                user=args.user,
+                all_users=args.all,
+                dd=args.dd,
+            )
+        if args.command == "sni":
+            target_sni = args.extra[0] if args.extra else args.sni
+            return run_sni_command(deploy_dir, target_sni)
+        if args.command == "user":
+            sub_action = args.extra[0] if len(args.extra) >= 1 else "list"
+            sub_name = args.extra[1] if len(args.extra) >= 2 else args.user
+            return run_user_command(deploy_dir, sub_action, sub_name, sni_override=args.sni)
         return run_traffic_command(deploy_dir, live=args.live, max_iterations=args.iterations)
+
+    if args.command in ("setup", "reconfigure"):
+        deploy_dir = (args.dir or default_deploy_dir(repo_root)).resolve()
+        saved_pre = load_existing_defaults(deploy_dir)
+        saved_img = str(saved_pre.get("MTEVIL_IMAGE") or "").strip()
+        if args.image == DEFAULT_IMAGE and saved_img:
+            args.image = saved_img
+        if not (repo_root / "Dockerfile").is_file():
+            args.no_build = True
+    else:
+        deploy_dir = (args.dir or (repo_root / "deploy" / "wizard")).resolve()
 
     # Resolve conflicting CLI flags explicitly before prompting.
     if args.mode == "simple" and args.role in ("edge", "egress"):
@@ -2199,8 +2559,6 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print_wizard_banner(args.image)
-
-    deploy_dir = (args.dir or (repo_root / "deploy" / "wizard")).resolve()
 
     check_prerequisites()
 
@@ -2290,7 +2648,7 @@ def main(argv: list[str] | None = None) -> int:
             print()
             action = ask_simple_confirm()
             if action == "sni":
-                sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, sni)
+                sni = prompt_sni_choice(sni)
                 cover = f"{sni}:443"
                 continue
             break
@@ -2564,6 +2922,9 @@ def main(argv: list[str] | None = None) -> int:
                 created = ensure_generated_secret(cand_base, "/var/lib/mtevil/proxy-secret")
                 if not volume_file_exists(cand_base, "/var/lib/mtevil/users.json"):
                     write_volume_secret_stdin(cand_base, "/var/lib/mtevil/users.json", "{}")
+                prev_sni = str(saved_cfg.get("sni") or "").strip()
+                snis_to_record = [sni] + ([prev_sni] if prev_sni and prev_sni != sni else [])
+                record_allowed_snis_in_volume(cand_base, snis_to_record)
             except RuntimeError as exc:
                 summary, action = diagnose_docker_error(str(exc), args.image)
                 print(f"{err_text(summary)}\nДальше: {action}", file=sys.stderr)
@@ -2852,6 +3213,9 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print(f"Каталог установки: {deploy_dir}")
         print(f"Проверка статуса:  {status_cmd}")
+        print("Показать ссылку:   mtevilctl link")
+        print("Сменить SNI:       mtevilctl sni <домен>  (старые ссылки продолжат работать)")
+        print("Перенастроить:     mtevilctl setup")
         if mode == "simple":
             print("\nОткройте ссылку в Telegram, нажмите «Подключить прокси» и проверьте отправку сообщения.")
             print("Справочник по диагностике, обновлению и откату: deploy/README.md")
@@ -2868,6 +3232,7 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print(f"Каталог установки: {deploy_dir}")
         print(f"Проверка статуса:  {status_cmd}")
+        print("Перенастроить:     mtevilctl setup")
 
     return 0
 

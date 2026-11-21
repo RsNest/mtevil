@@ -1740,6 +1740,141 @@ class SetupValidationTests(unittest.TestCase):
             self.assertNotIn("client_mss", cleaned)
             self.assertNotIn("client_mss_bulk", cleaned)
 
+    def test_mtevilctl_link_sni_user_and_setup_commands(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: mtevil:v0.1.5\n", encoding="utf-8")
+            (d / ".env").write_text(
+                "MTEVIL_PROJECT=mtevil-direct\nMTEVIL_IMAGE=mtevil:v0.1.5\nMTEVIL_BIND=0.0.0.0\nMTEVIL_PORT=443\nMTEVIL_PUBLIC_HOST=203.0.113.77\n",
+                encoding="utf-8",
+            )
+            (d / "config.json").write_text(
+                '{"role":"direct","sni":"example.com","cover":"example.com:443","users_file":"/var/lib/mtevil/users.json"}\n',
+                encoding="utf-8",
+            )
+
+            # 1. prompt_sni_choice supports numbered quick-pick (1 -> ya.ru, 2 -> vk.com) and custom hostname.
+            with mock.patch.object(sys, "stdin", io.StringIO("1\n")), mock.patch.object(sys, "stdout", io.StringIO()):
+                self.assertEqual(setup.prompt_sni_choice("example.com"), "ya.ru")
+            with mock.patch.object(sys, "stdin", io.StringIO("2\n")), mock.patch.object(sys, "stdout", io.StringIO()):
+                self.assertEqual(setup.prompt_sni_choice("example.com"), "vk.com")
+            with mock.patch.object(sys, "stdin", io.StringIO("custom.example.org\n")), mock.patch.object(sys, "stdout", io.StringIO()):
+                self.assertEqual(setup.prompt_sni_choice("example.com"), "custom.example.org")
+
+            # 2. mtevilctl link (--sni ya.ru) passes --sni to mtevil link and prints the link.
+            out_link = io.StringIO()
+            def fake_link_run(argv, **_kw):
+                cmd = " ".join(argv)
+                if "ps -q" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, stdout="cid123\n", stderr="")
+                if "mtevil link" in cmd:
+                    self.assertIn("--sni ya.ru", cmd)
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        stdout="https://t.me/proxy?server=203.0.113.77&port=443&secret=ee00112233445566778899aabbccddeeff79612e7275\n",
+                        stderr="",
+                    )
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "link", "--dir", str(d), "--sni", "ya.ru"]),
+                mock.patch.object(sys, "stdout", out_link),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "run", side_effect=fake_link_run),
+            ):
+                self.assertEqual(setup.main(), 0)
+            self.assertIn("79612e7275", out_link.getvalue())
+
+            # 3. mtevilctl sni ya.ru saves both new_sni (ya.ru) and old_sni (example.com) in allowed-sni.txt,
+            #    updates config.json with single hostname "ya.ru" (preserving 100% rollback compatibility),
+            #    recreates container, and prints the new link + note that old links keep working.
+            recorded_volume: dict[str, str] = {}
+            def fake_sni_run(argv, **kw):
+                cmd = " ".join(argv)
+                if "test -s /var/lib/mtevil/allowed-sni.txt" in cmd:
+                    return subprocess.CompletedProcess(argv, 0 if "allowed-sni.txt" in recorded_volume else 1, stdout="", stderr="")
+                if "/bin/cat /var/lib/mtevil/allowed-sni.txt" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, stdout=recorded_volume.get("allowed-sni.txt", ""), stderr="")
+                if "cat > /var/lib/mtevil/allowed-sni.txt" in cmd:
+                    recorded_volume["allowed-sni.txt"] = kw.get("input_text") or ""
+                    return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+                if "ps -q" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, stdout="cid123\n", stderr="")
+                if "mtevil link" in cmd:
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        stdout="https://t.me/proxy?server=203.0.113.77&port=443&secret=ee00112233445566778899aabbccddeeff79612e7275\n",
+                        stderr="",
+                    )
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            out_sni = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "sni", "ya.ru", "--dir", str(d)]),
+                mock.patch.object(sys, "stdout", out_sni),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "check_cover_from_container", return_value=(True, "")),
+                mock.patch.object(setup, "wait_healthy", return_value=None),
+                mock.patch.object(setup, "verify_telegram_e2e", return_value=(True, "DC 2 RTT 8ms")),
+                mock.patch.object(setup, "run", side_effect=fake_sni_run),
+            ):
+                self.assertEqual(setup.main(), 0)
+            updated_cfg = setup.json.loads((d / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(updated_cfg["sni"], "ya.ru")
+            self.assertEqual(updated_cfg["cover"], "ya.ru:443")
+            self.assertIn("ya.ru", recorded_volume.get("allowed-sni.txt", ""))
+            self.assertIn("example.com", recorded_volume.get("allowed-sni.txt", ""))
+            self.assertIn("Прежние ссылки клиентов со старым SNI (example.com) продолжают работать", out_sni.getvalue())
+
+            # 4. mtevilctl user add/list/del
+            out_user = io.StringIO()
+            def fake_user_run(argv, **_kw):
+                cmd = " ".join(argv)
+                if "ps -q" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, stdout="cid123\n", stderr="")
+                if "user-add" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, stdout="user 'phone' added\n", stderr="")
+                if "mtevil link" in cmd:
+                    self.assertIn("--user phone", cmd)
+                    return subprocess.CompletedProcess(argv, 0, stdout="phone: https://t.me/proxy?server=203.0.113.77&port=443&secret=eeaa\n", stderr="")
+                if "user-list" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, stdout="phone\n", stderr="")
+                if "user-del" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, stdout="user 'phone' deleted\n", stderr="")
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "user", "add", "phone", "--dir", str(d)]),
+                mock.patch.object(sys, "stdout", out_user),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "run", side_effect=fake_user_run),
+            ):
+                self.assertEqual(setup.main(), 0)
+            self.assertIn("Пользователь 'phone' добавлен", out_user.getvalue())
+            self.assertIn("phone: https://t.me/proxy", out_user.getvalue())
+
+            out_list = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "user", "list", "--dir", str(d)]),
+                mock.patch.object(sys, "stdout", out_list),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "run", side_effect=fake_user_run),
+            ):
+                self.assertEqual(setup.main(), 0)
+            self.assertIn("- phone", out_list.getvalue())
+
+            out_del = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "user", "del", "phone", "--dir", str(d)]),
+                mock.patch.object(sys, "stdout", out_del),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "run", side_effect=fake_user_run),
+            ):
+                self.assertEqual(setup.main(), 0)
+            self.assertIn("Пользователь 'phone' удалён", out_del.getvalue())
+
 
 if __name__ == "__main__":
     prog = unittest.main(verbosity=2, exit=False)

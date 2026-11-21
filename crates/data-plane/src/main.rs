@@ -131,6 +131,8 @@ enum Action {
         user: Option<String>,
         #[arg(long)]
         all: bool,
+        #[arg(long)]
+        sni: Option<String>,
     },
     /// TCP listener check only. Does not verify Telegram DC connectivity.
     Health {
@@ -426,6 +428,7 @@ impl<'a> EgressAttemptClaim<'a> {
 struct State {
     secrets: std::sync::RwLock<Arc<Vec<NamedSecret>>>,
     sni: String,
+    allowed_snis: std::sync::RwLock<Arc<String>>,
     cover: String,
     enable_dd: bool,
     proxy_protocol: bool,
@@ -641,29 +644,54 @@ impl State {
             .clone()
     }
 
+    fn current_allowed_snis(&self) -> Arc<String> {
+        let cur = self
+            .allowed_snis
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if cur.is_empty() {
+            Arc::new(self.sni.clone())
+        } else {
+            cur
+        }
+    }
+
     fn reload_secrets(&self, config: &Config) {
-        match config.load_secrets_allow_empty() {
-            Ok(new_secrets) => {
-                let cur = self.current_secrets();
-                let same = cur.len() == new_secrets.len()
-                    && cur
-                        .iter()
-                        .zip(new_secrets.iter())
-                        .all(|(a, b)| a.name == b.name && a.key == b.key);
-                if !same {
-                    let count = new_secrets.len();
-                    *self.secrets.write().unwrap_or_else(|e| e.into_inner()) =
-                        Arc::new(new_secrets);
-                    telemetry::event("users_reloaded", 0, json!({"users": count}));
+        if config.users_file.is_some() {
+            match config.load_secrets_allow_empty() {
+                Ok(new_secrets) => {
+                    let cur = self.current_secrets();
+                    let same = cur.len() == new_secrets.len()
+                        && cur
+                            .iter()
+                            .zip(new_secrets.iter())
+                            .all(|(a, b)| a.name == b.name && a.key == b.key);
+                    if !same {
+                        let count = new_secrets.len();
+                        *self.secrets.write().unwrap_or_else(|e| e.into_inner()) =
+                            Arc::new(new_secrets);
+                        telemetry::event("users_reloaded", 0, json!({"users": count}));
+                    }
+                }
+                Err(err) => {
+                    telemetry::event(
+                        "users_reload_failed",
+                        0,
+                        json!({"error": format!("{err:#}")}),
+                    );
                 }
             }
-            Err(err) => {
-                telemetry::event(
-                    "users_reload_failed",
-                    0,
-                    json!({"error": format!("{err:#}")}),
-                );
-            }
+        }
+        let next_snis = config.allowed_snis();
+        let cur_snis = self.current_allowed_snis();
+        if *cur_snis != next_snis {
+            let count = next_snis.split(',').filter(|s| !s.is_empty()).count();
+            *self
+                .allowed_snis
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = Arc::new(next_snis);
+            telemetry::event("allowed_sni_reloaded", 0, json!({"sni_count": count}));
         }
     }
 }
@@ -1024,6 +1052,7 @@ async fn main() -> Result<()> {
                 dd,
                 user,
                 all,
+                sni,
             } => {
                 ensure!(
                     !server.is_empty()
@@ -1035,6 +1064,16 @@ async fn main() -> Result<()> {
                     "invalid server or port"
                 );
                 let config = Config::load(&config)?;
+                let target_sni = match sni.as_deref() {
+                    Some(custom) => {
+                        ensure!(
+                            config::is_valid_sni_hostname(custom),
+                            "invalid SNI hostname"
+                        );
+                        custom
+                    }
+                    None => config.sni.as_str(),
+                };
                 let secrets = config.secrets()?;
                 let server = server
                     .replace(':', "%3A")
@@ -1057,7 +1096,7 @@ async fn main() -> Result<()> {
                         ensure!(config.enable_dd, "dd mode is disabled in this config");
                         format!("dd{key}")
                     } else {
-                        format!("ee{key}{}", hex::encode(config.sni.as_bytes()))
+                        format!("ee{key}{}", hex::encode(target_sni.as_bytes()))
                     };
                     if all || user.is_some() {
                         println!(
@@ -1236,7 +1275,9 @@ async fn main() -> Result<()> {
     let max_cover_connections = (config.max_connections / 4).max(1);
     let user_count = secrets.len();
     let persistent_replay = config.replay_file.is_some();
-    let reload_config = config.users_file.is_some().then(|| config.clone());
+    let reload_config = (config.users_file.is_some() || config.allowed_sni_file().is_some())
+        .then(|| config.clone());
+    let allowed_snis = config.allowed_snis();
     let egress_count = config.egress_upstreams.len();
     let counters = Arc::new(telemetry::Counters::default());
     counters.ensure_started();
@@ -1246,6 +1287,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(State {
         secrets: std::sync::RwLock::new(Arc::new(secrets)),
         sni: config.sni,
+        allowed_snis: std::sync::RwLock::new(Arc::new(allowed_snis)),
         cover: config.cover,
         enable_dd: config.enable_dd,
         proxy_protocol: config.proxy_protocol,
@@ -1707,6 +1749,7 @@ async fn connection_inner(client: &mut TcpStream, state: &State, session_id: u64
         1
     };
     let secrets = state.current_secrets();
+    let allowed_snis = state.current_allowed_snis();
     let (auth, failure) = match received {
         Ok(Ok(Some(bytes))) => {
             let mut matched = None;
@@ -1716,7 +1759,7 @@ async fn connection_inner(client: &mut TcpStream, state: &State, session_id: u64
                     &bytes,
                     record_minor,
                     &s.key,
-                    &state.sni,
+                    &allowed_snis,
                     now,
                 ) {
                     Ok(hello) => {
@@ -2222,26 +2265,65 @@ impl RelayStats {
 
 // Telegram iOS emits FakeTLS application records with up to 16,408 payload bytes.
 const MAX_CLIENT_RECORD: usize = 16_408;
+const TLS_READER_CHUNK: usize = 5 + MAX_CLIENT_RECORD;
 
 #[derive(Default)]
 struct TlsReader {
     pending: Vec<u8>,
     offset: usize,
+    raw: Vec<u8>,
+    raw_offset: usize,
     /// Wire bytes read from the socket, including TLS headers and partial records.
     consumed: u64,
 }
 impl TlsReader {
-    async fn read_exact_counted<R: AsyncRead + Unpin>(
+    async fn read_wire_some<R: AsyncRead + Unpin>(
+        &mut self,
+        r: &mut R,
+        dst: &mut [u8],
+    ) -> std::io::Result<usize> {
+        if self.raw_offset < self.raw.len() {
+            let avail = self.raw.len() - self.raw_offset;
+            let n = dst.len().min(avail);
+            dst[..n].copy_from_slice(&self.raw[self.raw_offset..self.raw_offset + n]);
+            self.raw_offset += n;
+            if self.raw_offset == self.raw.len() {
+                self.raw.clear();
+                self.raw_offset = 0;
+            }
+            return Ok(n);
+        }
+        if self.raw.capacity() == 0 {
+            self.raw.reserve_exact(TLS_READER_CHUNK);
+        }
+        self.raw.resize(TLS_READER_CHUNK, 0);
+        let got = r.read(&mut self.raw).await?;
+        self.raw.truncate(got);
+        self.raw_offset = 0;
+        if got == 0 {
+            return Ok(0);
+        }
+        self.consumed += got as u64;
+        let n = dst.len().min(got);
+        dst[..n].copy_from_slice(&self.raw[..n]);
+        self.raw_offset = n;
+        if self.raw_offset == self.raw.len() {
+            self.raw.clear();
+            self.raw_offset = 0;
+        }
+        Ok(n)
+    }
+
+    async fn read_wire_exact<R: AsyncRead + Unpin>(
+        &mut self,
         r: &mut R,
         mut bytes: &mut [u8],
-        consumed: &mut u64,
     ) -> std::io::Result<()> {
         while !bytes.is_empty() {
-            let n = r.read(bytes).await?;
+            let n = self.read_wire_some(r, bytes).await?;
             if n == 0 {
                 return Err(std::io::ErrorKind::UnexpectedEof.into());
             }
-            *consumed += n as u64;
             bytes = &mut bytes[n..];
         }
         Ok(())
@@ -2258,12 +2340,13 @@ impl TlsReader {
             // Permit only one CCS before an application record. No unbounded empty-record loop.
             for _ in 0..2 {
                 let mut h = [0u8; 5];
-                let n = r.read(&mut h[..1]).await?;
-                if n == 0 {
+                let first = self.read_wire_some(r, &mut h).await?;
+                if first == 0 {
                     return Ok(0);
                 }
-                self.consumed += n as u64;
-                Self::read_exact_counted(r, &mut h[1..], &mut self.consumed).await?;
+                if first < 5 {
+                    self.read_wire_exact(r, &mut h[first..]).await?;
+                }
                 ensure!(h[1..3] == [3, 3], "TLS record version");
                 let n = usize::from(u16::from_be_bytes([h[3], h[4]]));
                 let limit = if h[0] == 0x17 {
@@ -2272,8 +2355,11 @@ impl TlsReader {
                     wire::MAX_RECORD
                 };
                 ensure!(n > 0 && n <= limit, "TLS record limit");
-                self.pending.resize(n, 0);
-                Self::read_exact_counted(r, &mut self.pending, &mut self.consumed).await?;
+                let mut pending = std::mem::take(&mut self.pending);
+                pending.resize(n, 0);
+                let read_res = self.read_wire_exact(r, &mut pending).await;
+                self.pending = pending;
+                read_res?;
                 if h[0] == 0x14 {
                     ensure!(self.pending == [1], "invalid CCS");
                     self.pending.clear();
@@ -2834,20 +2920,97 @@ async fn probe_telegram_e2e(
     .context("probe_telegram_timeout")?
 }
 
+#[cfg(test)]
 fn lookup_dc_addr(dcs: &HashMap<i16, SocketAddr>, dc_id: i16) -> Option<SocketAddr> {
+    lookup_dc_candidates(dcs, dc_id, 0).into_iter().next()
+}
+
+fn lookup_dc_candidates(dcs: &HashMap<i16, SocketAddr>, dc_id: i16, seq: usize) -> Vec<SocketAddr> {
+    let std_dc2 = SocketAddr::from(([149, 154, 167, 51], 443));
+    let std_dc2_media = SocketAddr::from(([149, 154, 167, 151], 443));
+    let std_dc2_alt = SocketAddr::from(([149, 154, 167, 220], 443));
+    let std_dc4 = SocketAddr::from(([149, 154, 167, 91], 443));
+    let std_dc4_media = SocketAddr::from(([149, 154, 166, 120], 443));
+    let std_dc4_alt = SocketAddr::from(([149, 154, 167, 92], 443));
+
     if let Some(&addr) = dcs.get(&dc_id) {
-        return Some(addr);
+        let mut out = vec![addr];
+        if dc_id == 2 && addr == std_dc2 {
+            out.push(std_dc2_alt);
+        } else if dc_id == -2 && addr == std_dc2_media {
+            if seq % 2 == 1 {
+                out = vec![std_dc2_alt, std_dc2_media, std_dc2];
+            } else {
+                out.push(std_dc2_alt);
+                out.push(std_dc2);
+            }
+        } else if dc_id == 4 && addr == std_dc4 {
+            out.push(std_dc4_alt);
+        } else if dc_id == -4 && addr == std_dc4_media {
+            if seq % 2 == 1 {
+                out = vec![std_dc4_alt, std_dc4_media, std_dc4];
+            } else {
+                out.push(std_dc4_alt);
+                out.push(std_dc4);
+            }
+        }
+        return out;
     }
-    let base = *dcs.get(&dc_id.abs())?;
+    let Some(&base) = dcs.get(&dc_id.abs()) else {
+        return Vec::new();
+    };
     // When using the default production signaling DCs, route negative media DC requests (-2, -4)
-    // to Telegram's dedicated media DC endpoints unless overridden in config.
-    if dc_id == -2 && base == SocketAddr::from(([149, 154, 167, 51], 443)) {
-        return Some(SocketAddr::from(([149, 154, 167, 151], 443)));
+    // across Telegram's dedicated media DC endpoints with automatic failover unless overridden.
+    if dc_id == -2 && base == std_dc2 {
+        return if seq % 2 == 1 {
+            vec![std_dc2_alt, std_dc2_media, std_dc2]
+        } else {
+            vec![std_dc2_media, std_dc2_alt, std_dc2]
+        };
     }
-    if dc_id == -4 && base == SocketAddr::from(([149, 154, 167, 91], 443)) {
-        return Some(SocketAddr::from(([149, 154, 166, 120], 443)));
+    if dc_id == -4 && base == std_dc4 {
+        return if seq % 2 == 1 {
+            vec![std_dc4_alt, std_dc4_media, std_dc4]
+        } else {
+            vec![std_dc4_media, std_dc4_alt, std_dc4]
+        };
     }
-    Some(base)
+    vec![base]
+}
+
+async fn connect_dc_candidates(
+    candidates: &[SocketAddr],
+    handshake: Duration,
+) -> Result<TcpStream> {
+    ensure!(!candidates.is_empty(), "DC not configured");
+    if candidates.len() == 1 {
+        let stream = timeout(handshake, TcpStream::connect(candidates[0]))
+            .await
+            .context("dc_connect_timeout")?
+            .context("dc_connect_failed")?;
+        configure_tcp_socket(&stream)?;
+        return Ok(stream);
+    }
+    let per_try = (handshake / (candidates.len() as u32))
+        .max(Duration::from_millis(200))
+        .min(Duration::from_millis(1500));
+    timeout(handshake, async {
+        let mut last_err = None;
+        for &addr in candidates {
+            match timeout(per_try, TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => {
+                    configure_tcp_socket(&stream)?;
+                    return Ok(stream);
+                }
+                Ok(Err(err)) => last_err = Some(anyhow::Error::from(err)),
+                Err(_) => last_err = Some(anyhow::anyhow!("dc_connect_timeout")),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("dc_connect_failed")))
+            .context("dc_connect_failed")
+    })
+    .await
+    .context("dc_connect_timeout")?
 }
 
 async fn connect_upstream(
@@ -2857,12 +3020,9 @@ async fn connect_upstream(
 ) -> Result<(TcpStream, &'static str)> {
     use std::sync::atomic::Ordering::Relaxed;
     if state.egress_upstreams.is_empty() {
-        let address = lookup_dc_addr(&state.dcs, dc_id).context("DC not configured")?;
-        let mut upstream = timeout(state.handshake, TcpStream::connect(address))
-            .await
-            .context("dc_connect_timeout")?
-            .context("dc_connect_failed")?;
-        configure_tcp_socket(&upstream)?;
+        let seq = state.egress_rr.fetch_add(1, Relaxed);
+        let candidates = lookup_dc_candidates(&state.dcs, dc_id, seq);
+        let mut upstream = connect_dc_candidates(&candidates, state.handshake).await?;
         timeout(state.handshake, upstream.write_all(dc_header)).await??;
         state
             .counters
@@ -3112,16 +3272,18 @@ async fn egress_connection(
         let _ = edge.shutdown().await;
         return Ok(());
     }
-    let Some(addr) = lookup_dc_addr(dcs, raw_dc_id) else {
+    let seq = counters.active.load(Relaxed) as usize;
+    let candidates = lookup_dc_candidates(dcs, raw_dc_id, seq);
+    if candidates.is_empty() {
         if edge.write_all(&[EGRESS_ACK_ERR]).await.is_ok() {
             counters.downstream_tx_bytes.fetch_add(1, Relaxed);
         }
         let _ = edge.shutdown().await;
         bail!("DC not configured on egress");
-    };
-    let mut dc = match timeout(handshake, TcpStream::connect(addr)).await {
-        Ok(Ok(stream)) => stream,
-        _ => {
+    }
+    let mut dc = match connect_dc_candidates(&candidates, handshake).await {
+        Ok(stream) => stream,
+        Err(_) => {
             if edge.write_all(&[EGRESS_ACK_ERR]).await.is_ok() {
                 counters.downstream_tx_bytes.fetch_add(1, Relaxed);
             }
@@ -3129,7 +3291,6 @@ async fn egress_connection(
             bail!("dc_connect_failed");
         }
     };
-    configure_tcp_socket(&dc)?;
     timeout(handshake, edge.write_all(&[EGRESS_ACK_OK])).await??;
     counters.downstream_tx_bytes.fetch_add(1, Relaxed);
     let edge_fd = stream_raw_fd(edge);

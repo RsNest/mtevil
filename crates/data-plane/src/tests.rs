@@ -59,6 +59,7 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
             key: Zeroizing::new(secret()),
         }])),
         sni: "example.com".into(),
+        allowed_snis: std::sync::RwLock::new(Arc::new("example.com".into())),
         cover: cover.to_string(),
         enable_dd: false,
         proxy_protocol: false,
@@ -1992,5 +1993,103 @@ async fn media_dc_negative_ids_route_to_dedicated_address_with_fallback_and_zero
 
     let _ = stop_tx.send(());
     let _ = egress_task.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn allowed_sni_file_accepts_previous_and_current_sni_without_breaking_links() -> Result<()> {
+    let cover = cover_mock().await?;
+    let dc = TcpListener::bind("127.0.0.1:0").await?;
+    let dc_addr = dc.local_addr()?;
+
+    let dir = std::env::temp_dir().join(format!(
+        "mtevil-allowed-sni-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    ));
+    std::fs::create_dir_all(&dir)?;
+    let sec_path = dir.join("proxy-secret");
+    std::fs::write(&sec_path, format!("{}\n", hex::encode(secret())))?;
+    let allowed_path = dir.join("allowed-sni.txt");
+    std::fs::write(&allowed_path, "example.com\nvk.com\n")?;
+
+    let cfg = Config {
+        role: Role::Direct,
+        listen: "127.0.0.1:24443".parse()?,
+        secret_file: Some(sec_path),
+        users_file: None,
+        replay_file: None,
+        sni: "ya.ru".into(),
+        cover: cover.addr.to_string(),
+        enable_dd: false,
+        proxy_protocol: false,
+        dc: vec![format!("2={dc_addr}")],
+        egress_upstreams: Vec::new(),
+        egress_strategy: EgressStrategy::RoundRobin,
+        egress_token_file: None,
+        max_connections: 16,
+        client_hello_timeout_secs: 2,
+        handshake_timeout_secs: 2,
+        idle_timeout_secs: 5,
+        drain_timeout_secs: 1,
+        fake_tls_cert_bytes: wire::DEFAULT_CERT_BYTES,
+        fake_tls_cert_jitter: 0,
+        flight_shaping: false,
+        client_mss: None,
+        client_mss_bulk: None,
+        alert_webhook_url: None,
+    };
+    assert_eq!(cfg.allowed_snis(), "ya.ru,example.com,vk.com");
+
+    let mut proxy_state = state(cover.addr, dc_addr);
+    {
+        let sm = Arc::get_mut(&mut proxy_state).context("unique state")?;
+        sm.sni = "ya.ru".into();
+        sm.allowed_snis = std::sync::RwLock::new(Arc::new(cfg.allowed_snis()));
+    }
+
+    // Client connecting with old SNI "example.com" still authenticates even though primary sni is "ya.ru".
+    let (mut client, task) = proxy(proxy_state.clone()).await?;
+    let raw = hello()?;
+    client.write_all(&raw).await?;
+    flight(&mut client, &raw).await?;
+    client.shutdown().await?;
+    assert!(timeout(Duration::from_secs(1), task).await??.is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dc_candidates_fail_over_when_first_candidate_unreachable() -> Result<()> {
+    let dead_addr = closed_port().await?;
+    let live_dc = TcpListener::bind("127.0.0.1:0").await?;
+    let live_addr = live_dc.local_addr()?;
+
+    let dc_task = tokio::spawn(async move {
+        let (_peer, _) = live_dc.accept().await?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let stream = connect_dc_candidates(&[dead_addr, live_addr], Duration::from_secs(2)).await?;
+    assert_eq!(stream.peer_addr()?, live_addr);
+    timeout(Duration::from_secs(1), dc_task).await???;
+
+    let mut std_dcs = HashMap::new();
+    std_dcs.insert(2, SocketAddr::from(([149, 154, 167, 51], 443)));
+    std_dcs.insert(4, SocketAddr::from(([149, 154, 167, 91], 443)));
+    let c_neg2_0 = lookup_dc_candidates(&std_dcs, -2, 0);
+    let c_neg2_1 = lookup_dc_candidates(&std_dcs, -2, 1);
+    assert_eq!(c_neg2_0.len(), 3);
+    assert_eq!(c_neg2_0[0], SocketAddr::from(([149, 154, 167, 151], 443)));
+    assert_eq!(c_neg2_1[0], SocketAddr::from(([149, 154, 167, 220], 443)));
+    let c_pos2 = lookup_dc_candidates(&std_dcs, 2, 0);
+    assert_eq!(
+        c_pos2,
+        vec![
+            SocketAddr::from(([149, 154, 167, 51], 443)),
+            SocketAddr::from(([149, 154, 167, 220], 443)),
+        ]
+    );
     Ok(())
 }

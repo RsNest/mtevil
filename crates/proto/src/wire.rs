@@ -465,7 +465,14 @@ pub fn authenticate_with_record_version(
                 let n = list.u16()?;
                 let name = list.take(n)?;
                 if ty == 0 {
-                    sni_ok = name.eq_ignore_ascii_case(sni.as_bytes());
+                    sni_ok = !name.is_empty()
+                        && sni
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .any(|allowed| {
+                                allowed == "*" || name.eq_ignore_ascii_case(allowed.as_bytes())
+                            });
                 }
             }
         } else if kind == 0x2b {
@@ -1034,6 +1041,8 @@ mod tests {
         }
         let body = &raw[5..];
         assert!(authenticate(body, &secret, "example.com", 1700000000).is_ok());
+        assert!(authenticate(body, &secret, "ya.ru, example.com, vk.com", 1700000000).is_ok());
+        assert!(authenticate(body, &secret, "ya.ru,vk.com", 1700000000).is_err());
         assert!(authenticate(body, &[99; 16], "example.com", 1700000000).is_err());
         assert!(authenticate(body, &secret, "wrong.example", 1700000000).is_err());
         assert!(authenticate(body, &secret, "example.com", 1700000121).is_err());

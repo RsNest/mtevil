@@ -275,6 +275,7 @@ REPO_LOWER="$(printf '%s' "$MTEVIL_REPO" | tr '[:upper:]' '[:lower:]')"
 MTEVIL_IMAGE="${MTEVIL_IMAGE:-${MTVEIL_IMAGE:-ghcr.io/${REPO_LOWER}:${MTEVIL_VERSION}}}"
 
 mkdir -p "$MTEVIL_DIR"
+rm -f "${MTEVIL_DIR}"/install.v*.sh 2>/dev/null || true
 echo "Скачивание мастера настройки mtevil (${MTEVIL_VERSION})..."
 fetch_release_assets "$MTEVIL_VERSION" "$MTEVIL_DIR" setup.py mtevilctl
 if [ -x "${MTEVIL_DIR}/mtevilctl" ]; then

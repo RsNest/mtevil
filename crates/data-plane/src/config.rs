@@ -197,19 +197,7 @@ impl Config {
         } else {
             self.datacenters()?;
         }
-        ensure!(
-            !self.sni.is_empty()
-                && self.sni.len() <= 253
-                && self.sni.is_ascii()
-                && self.sni.split('.').all(|label| !label.is_empty()
-                    && label.len() <= 63
-                    && !label.starts_with('-')
-                    && !label.ends_with('-')
-                    && label
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')),
-            "invalid SNI hostname"
-        );
+        ensure!(is_valid_sni_hostname(&self.sni), "invalid SNI hostname");
         let (host, port) = self
             .cover
             .rsplit_once(':')
@@ -290,6 +278,44 @@ impl Config {
             None => Ok([0u8; 16]),
         }
     }
+
+    pub fn allowed_sni_file(&self) -> Option<PathBuf> {
+        self.secret_file
+            .as_ref()
+            .or(self.users_file.as_ref())
+            .or(self.replay_file.as_ref())
+            .and_then(|p| p.parent().map(|dir| dir.join("allowed-sni.txt")))
+    }
+
+    pub fn allowed_snis(&self) -> String {
+        let mut list = vec![self.sni.trim().to_ascii_lowercase()];
+        if let Some(path) = self.allowed_sni_file() {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                for token in text.split(['\n', '\r', ',']) {
+                    let s = token.trim().to_ascii_lowercase();
+                    if is_valid_sni_hostname(&s) && !list.contains(&s) {
+                        list.push(s);
+                    }
+                }
+            }
+        }
+        list.join(",")
+    }
+}
+
+pub fn is_valid_sni_hostname(sni: &str) -> bool {
+    !sni.is_empty()
+        && sni.len() <= 253
+        && sni.is_ascii()
+        && sni.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 fn decode_secret_file(path: &Path) -> Result<Zeroizing<[u8; 16]>> {

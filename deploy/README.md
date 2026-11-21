@@ -160,7 +160,11 @@ python3 deploy/setup.py --mode advanced --network-host
 Для установок, созданных мастером, используйте `mtevilctl` (или `python3 deploy/setup.py <команда> --dir <путь>`):
 
 ```bash
-mtevilctl status                 # Версия, роль, статус контейнера, uptime и доступная версия для отката
+mtevilctl status                 # Версия, роль, SNI, статус контейнера, uptime и доступная версия для отката
+mtevilctl link                   # Показать текущую ссылку для подключения (--sni <домен>, --user <имя>, --all)
+mtevilctl sni [домен]            # Сменить основной SNI с сохранением работы прежних ссылок (/var/lib/mtevil/allowed-sni.txt)
+mtevilctl user add <имя>         # Добавить пользователя и вывести его ссылку (user list / user del <имя>)
+mtevilctl setup                  # Запустить интерактивный мастер перенастройки текущей установки (reconfigure)
 mtevilctl update                 # Обновить до свежего стабильного релиза (с re-exec, проверкой Telegram и автооткатом)
 mtevilctl update --prerelease    # Обновить с учётом предварительных релизов (alpha/beta/rc)
 mtevilctl update --version v0.1.0-rc.1  # Установить конкретный тег (переопределяет канал)
