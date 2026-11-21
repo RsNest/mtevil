@@ -255,7 +255,7 @@ pub(crate) async fn egress_connection(
         .context("egress_header_timeout")
         .and_then(|r| r.context("egress_header_eof"))
     {
-        security.record_auth_failure(peer_ip);
+        counters.egress_preface_aborted.fetch_add(1, Relaxed);
         return Err(err);
     }
     counters
@@ -269,7 +269,7 @@ pub(crate) async fn egress_connection(
             .context("egress_v3_header_timeout")
             .and_then(|r| r.context("egress_v3_header_eof"))
         {
-            security.record_auth_failure(peer_ip);
+            counters.egress_preface_aborted.fetch_add(1, Relaxed);
             return Err(err);
         }
         counters
@@ -317,7 +317,7 @@ pub(crate) async fn egress_connection(
             .context("egress_v2_header_timeout")
             .and_then(|r| r.context("egress_v2_header_eof"))
         {
-            security.record_auth_failure(peer_ip);
+            counters.egress_preface_aborted.fetch_add(1, Relaxed);
             return Err(err);
         }
         counters

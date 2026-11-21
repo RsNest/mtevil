@@ -96,6 +96,7 @@ pub struct Counters {
     pub cover_dns_fail: AtomicU64,
     pub egress_legacy_connections: AtomicU64,
     pub egress_mtv3_connections: AtomicU64,
+    pub egress_preface_aborted: AtomicU64,
 }
 
 impl Counters {
@@ -160,6 +161,7 @@ impl Counters {
             "cover_dns_fail": self.cover_dns_fail.load(Ordering::Relaxed),
             "egress_legacy_connections": self.egress_legacy_connections.load(Ordering::Relaxed),
             "egress_mtv3_connections": self.egress_mtv3_connections.load(Ordering::Relaxed),
+            "egress_preface_aborted": self.egress_preface_aborted.load(Ordering::Relaxed),
         })
     }
 
@@ -261,6 +263,17 @@ impl Counters {
             out,
             "mtevil_egress_mtv3_connections_total {}",
             self.egress_mtv3_connections.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_egress_preface_aborted_total Egress connections closed or timed out before completing preface (not auth failures)"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_egress_preface_aborted_total counter");
+        let _ = writeln!(
+            out,
+            "mtevil_egress_preface_aborted_total {}",
+            self.egress_preface_aborted.load(Ordering::Relaxed)
         );
 
         let _ = writeln!(

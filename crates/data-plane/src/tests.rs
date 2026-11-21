@@ -3603,3 +3603,97 @@ async fn inv10_f23_hedge_10000_connections_no_fd_leak() -> Result<()> {
     t_fast.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn inv10_f31_egress_aborted_prefaces_never_rate_limit_but_bad_hmac_does() -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let dc_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let dc_addr = dc_listener.local_addr()?;
+    let dc_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = dc_listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut hdr = [0u8; 64];
+                let _ = s.read_exact(&mut hdr).await;
+            });
+        }
+    });
+
+    let egress_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let egress_addr = egress_listener.local_addr()?;
+    let mut dcs = HashMap::new();
+    dcs.insert(2, dc_addr);
+    let token = [0x44u8; 16];
+    let counters = Arc::new(telemetry::Counters::default());
+    let mut sec = EgressSecurityConfig::default_for(64);
+    sec.max_failed_per_ip = 16;
+    sec.max_unauth_handshakes = 64;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let srv = tokio::spawn(serve_egress_with_security(
+        egress_listener,
+        Arc::new(dcs),
+        token,
+        64,
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        counters.clone(),
+        sec,
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+
+    // 1. 200 aborted prefaces (empty close or partial MTV3 header, simulating hedge cancellations)
+    //    must NEVER trigger IP rate-limiting.
+    for i in 0..200u32 {
+        let mut s = TcpStream::connect(egress_addr).await?;
+        if i.is_multiple_of(2) {
+            let _ = s.write_all(b"MTV3").await;
+        }
+        drop(s);
+    }
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(
+        counters.egress_preface_aborted.load(Relaxed) >= 150,
+        "expected aborted preface counter to increment (got {})",
+        counters.egress_preface_aborted.load(Relaxed)
+    );
+
+    // Valid MTV3 connection from the same IP still succeeds!
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let ok_preface = wire::build_egress_preface_v3(&token, 2, now, &[0x11; 16], &[0x22; 64])?;
+    let mut s_ok = TcpStream::connect(egress_addr).await?;
+    s_ok.write_all(&ok_preface).await?;
+    let mut ack = [0u8; 1];
+    timeout(Duration::from_secs(2), s_ok.read_exact(&mut ack)).await??;
+    assert_eq!(ack[0], EGRESS_ACK_OK);
+    drop(s_ok);
+
+    // 2. 17 invalid HMACs from the same IP MUST trigger rate-limit.
+    let mut bad_preface = ok_preface;
+    bad_preface[30] ^= 0xff;
+    for _ in 0..17 {
+        let mut s = TcpStream::connect(egress_addr).await?;
+        let _ = s.write_all(&bad_preface).await;
+        let mut buf = [0u8; 1];
+        let _ = timeout(Duration::from_millis(500), s.read(&mut buf)).await;
+    }
+
+    // Subsequent valid MTV3 connection from the same IP is now rate-limited (EOF without ACK).
+    let ok_preface2 = wire::build_egress_preface_v3(&token, 2, now, &[0x12; 16], &[0x22; 64])?;
+    let mut s_blocked = TcpStream::connect(egress_addr).await?;
+    let _ = s_blocked.write_all(&ok_preface2).await;
+    let mut buf = [0u8; 1];
+    let n = timeout(Duration::from_secs(2), s_blocked.read(&mut buf))
+        .await?
+        .unwrap_or(0);
+    assert_eq!(n, 0, "IP must be rate-limited after 17 invalid HMACs");
+
+    let _ = stop_tx.send(());
+    let _ = timeout(Duration::from_secs(2), srv).await;
+    dc_task.abort();
+    Ok(())
+}
