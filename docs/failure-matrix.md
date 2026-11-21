@@ -12,8 +12,8 @@ Phase 0 (F1–F10 в phase-0.md §9) — подмножество; столбе�
 
 | ID | Сбой | Фаза | Ожидаемое поведение | Метрика | INV | Инъекция |
 |---|---|---|---|---|---|---|
-| F-01 | DNS cover недоступен | PreAuth/PreCommit | cached address → relay; кэша нет → bounded graceful close | cover_dns_fail | INV-04 | F3 |
-| F-02 | DNS timeout (не отказ) | PreAuth/PreCommit | то же, с тайм-аутом ≤ configured deadline | cover_dns_fail, dns_deadline_exceeded | INV-03, INV-04 | F3 |
+| F-01 | DNS cover недоступен | PreAuth/PreCommit | фоновый `CoverResolver` (`cover_dns_ttl_secs = 60 с`) сохраняет `last-known-good` → relay без блокировки data-потоков; кэша нет → bounded graceful close | cover_dns_fail | INV-04 | F3 |
+| F-02 | DNS timeout (не отказ) | PreAuth/PreCommit | то же, фоновый резолв ограничен `handshake_timeout_secs`, data-потоки не ждут DNS | cover_dns_fail, dns_deadline_exceeded | INV-03, INV-04 | F3 |
 | F-03 | Cover connect fail (основная цель) | PreAuth/PreCommit | запасная цель → relay; нет запасной → graceful close | cover_connect_fail | INV-04 | F9 |
 | F-04 | Cover перегрузка/сбой процесса | PreAuth + установленные сессии | новые PreAuth деградируют по INV-04; MTProto-сессии **не страдают** | cover_overload_degrades, mtproto_sessions_survive | INV-07 | F9 |
 | F-05 | ME dial fail | PostCommit | close сессии + reconnect клиента; новых bind на мёртвого writer нет | me_dial_fail | INV-05 | F2 |

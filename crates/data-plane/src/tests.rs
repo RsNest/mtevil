@@ -60,7 +60,10 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         }])),
         sni: "example.com".into(),
         allowed_snis: std::sync::RwLock::new(Arc::new("example.com".into())),
-        cover: cover.to_string(),
+        cover_resolver: Arc::new(CoverResolver::new(
+            cover.to_string(),
+            Duration::from_secs(config::default_cover_dns_ttl_secs()),
+        )),
         enable_dd: false,
         proxy_protocol: false,
         cover_permits: Semaphore::new(8),
@@ -1265,6 +1268,7 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         egress_max_failed_per_ip: config::default_egress_max_failed_per_ip(),
         dc_media_override: config::default_dc_media_override(),
         dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
+        cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
     };
 
     let mut proxy_state = state(cover.addr, dc_addr);
@@ -1702,6 +1706,7 @@ async fn probe_telegram_e2e_verifies_handshake_and_res_pq_reply() -> Result<()> 
         egress_max_failed_per_ip: config::default_egress_max_failed_per_ip(),
         dc_media_override: config::default_dc_media_override(),
         dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
+        cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
     };
 
     let rtt_ms = probe_telegram_e2e(&cfg, proxy_addr, 2, Duration::from_secs(3)).await?;
@@ -2108,6 +2113,7 @@ async fn allowed_sni_file_accepts_previous_and_current_sni_without_breaking_link
         egress_max_failed_per_ip: config::default_egress_max_failed_per_ip(),
         dc_media_override: config::default_dc_media_override(),
         dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
+        cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
     };
     assert_eq!(cfg.allowed_snis(), "ya.ru,example.com,vk.com");
 
@@ -3083,5 +3089,59 @@ async fn dc_media_override_is_configurable_and_background_dc_self_check_leaves_r
     );
 
     dc_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn inv04_cover_dns_caches_and_preserves_last_known_good_on_failure_or_timeout() -> Result<()>
+{
+    use std::sync::atomic::Ordering::Relaxed;
+    let counters = telemetry::Counters::default();
+    let resolver = CoverResolver::new("cover.invalid:443".into(), Duration::from_secs(60));
+    assert!(!resolver.is_static_ip());
+    assert!(resolver.next_addr().is_none());
+
+    // 1. Initial DNS failure leaves cache empty and increments cover_dns_fail.
+    let ok = resolver
+        .refresh_with(Duration::from_millis(100), &counters, |_| async {
+            Err(std::io::Error::other("nxdomain"))
+        })
+        .await;
+    assert!(!ok);
+    assert!(resolver.next_addr().is_none());
+    assert_eq!(counters.cover_dns_fail.load(Relaxed), 1);
+
+    // 2. Successful DNS resolution populates cache with round-robin addresses.
+    let a1: SocketAddr = "127.0.0.1:4431".parse()?;
+    let a2: SocketAddr = "127.0.0.1:4432".parse()?;
+    let ok = resolver
+        .refresh_with(Duration::from_millis(100), &counters, |_| async move {
+            Ok(vec![a1, a2])
+        })
+        .await;
+    assert!(ok);
+    assert_eq!(resolver.next_addr(), Some(a1));
+    assert_eq!(resolver.next_addr(), Some(a2));
+
+    // 3. Subsequent DNS error AND DNS timeout preserve last-known-good addresses!
+    let ok_err = resolver
+        .refresh_with(Duration::from_millis(100), &counters, |_| async {
+            Err(std::io::Error::other("servfail"))
+        })
+        .await;
+    assert!(!ok_err);
+    assert_eq!(counters.cover_dns_fail.load(Relaxed), 2);
+    assert_eq!(resolver.next_addr(), Some(a1));
+
+    let ok_timeout = resolver
+        .refresh_with(Duration::from_millis(30), &counters, |_| async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(vec!["127.0.0.1:9999".parse().unwrap_or(a1)])
+        })
+        .await;
+    assert!(!ok_timeout);
+    assert_eq!(counters.cover_dns_fail.load(Relaxed), 3);
+    // Last-known-good still served immediately without blocking data path:
+    assert_eq!(resolver.next_addr(), Some(a2));
     Ok(())
 }

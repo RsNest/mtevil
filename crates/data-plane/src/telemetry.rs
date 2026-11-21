@@ -89,6 +89,7 @@ pub struct Counters {
     pub replay_flush_failed: AtomicU64,
     pub dc_self_check_ok: AtomicU64,
     pub dc_self_check_failed: AtomicU64,
+    pub cover_dns_fail: AtomicU64,
 }
 
 impl Counters {
@@ -146,6 +147,7 @@ impl Counters {
             "replay_flush_failed": self.replay_flush_failed.load(Ordering::Relaxed),
             "dc_self_check_ok": self.dc_self_check_ok.load(Ordering::Relaxed),
             "dc_self_check_failed": self.dc_self_check_failed.load(Ordering::Relaxed),
+            "cover_dns_fail": self.cover_dns_fail.load(Ordering::Relaxed),
         })
     }
 }

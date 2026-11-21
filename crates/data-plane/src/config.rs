@@ -208,6 +208,9 @@ pub struct Config {
     /// Background DC self-check interval in seconds on direct/egress (0 = disabled).
     #[serde(default = "default_dc_probe_interval_secs")]
     pub dc_probe_interval_secs: u64,
+    /// Background cover DNS cache TTL / refresh interval in seconds (INV-04).
+    #[serde(default = "default_cover_dns_ttl_secs")]
+    pub cover_dns_ttl_secs: u64,
 }
 fn default_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 24443))
@@ -268,6 +271,9 @@ pub fn default_dc_media_override() -> Vec<String> {
     ]
 }
 pub fn default_dc_probe_interval_secs() -> u64 {
+    60
+}
+pub fn default_cover_dns_ttl_secs() -> u64 {
     60
 }
 
@@ -344,6 +350,10 @@ impl Config {
         ensure!(
             self.dc_probe_interval_secs <= 86400,
             "dc_probe_interval_secs must be 0..=86400"
+        );
+        ensure!(
+            (1..=86400).contains(&self.cover_dns_ttl_secs),
+            "cover_dns_ttl_secs must be 1..=86400"
         );
         self.parsed_egress_allow_from()?;
         self.dc_media_overrides()?;
@@ -576,6 +586,7 @@ mod tests {
         assert_eq!(c.egress_max_failed_per_ip, 16);
         assert_eq!(c.dc_media_override.len(), 6);
         assert_eq!(c.dc_probe_interval_secs, 60);
+        assert_eq!(c.cover_dns_ttl_secs, 60);
         assert!(serde_json::from_str::<Config>(r#"{"secret_file":"secret","sni":"example.com","cover":"example.com:443","dc":[],"max_conections":100}"#).is_err());
         Ok(())
     }
@@ -667,6 +678,9 @@ mod tests {
         assert!(c.validate().is_err());
         let mut c = config()?;
         c.dc_probe_interval_secs = 86_401;
+        assert!(c.validate().is_err());
+        let mut c = config()?;
+        c.cover_dns_ttl_secs = 0;
         assert!(c.validate().is_err());
 
         let edge: Config = serde_json::from_str(

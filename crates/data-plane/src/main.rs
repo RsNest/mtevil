@@ -34,7 +34,7 @@ const BUILD_VERSION: &str = match option_env!("MTEVIL_BUILD_VERSION") {
 struct Args {
     #[command(subcommand)]
     command: Option<Action>,
-    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms","egress_probe_interval_secs","egress_probe_degraded_interval_secs","egress_hedge_ms","egress_accept_legacy","egress_use_mtv3","egress_allow_from","egress_max_failed_per_ip","dc_media_override","dc_probe_interval_secs"])]
+    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms","egress_probe_interval_secs","egress_probe_degraded_interval_secs","egress_hedge_ms","egress_accept_legacy","egress_use_mtv3","egress_allow_from","egress_max_failed_per_ip","dc_media_override","dc_probe_interval_secs","cover_dns_ttl_secs"])]
     config: Option<PathBuf>,
     #[arg(long)]
     check_config: bool,
@@ -122,6 +122,9 @@ struct Args {
     /// Background DC self-check interval in seconds on direct/egress (0 = disabled).
     #[arg(long)]
     dc_probe_interval_secs: Option<u64>,
+    /// Background cover DNS cache TTL / refresh interval in seconds.
+    #[arg(long)]
+    cover_dns_ttl_secs: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -263,6 +266,9 @@ impl Args {
             dc_probe_interval_secs: self
                 .dc_probe_interval_secs
                 .unwrap_or_else(config::default_dc_probe_interval_secs),
+            cover_dns_ttl_secs: self
+                .cover_dns_ttl_secs
+                .unwrap_or_else(config::default_cover_dns_ttl_secs),
         };
         config.validate()?;
         Ok(config)
@@ -617,11 +623,131 @@ impl<'a> EgressAttemptClaim<'a> {
     }
 }
 
+struct CoverResolver {
+    target: String,
+    ttl: Duration,
+    cached: std::sync::RwLock<Option<(Vec<SocketAddr>, Instant)>>,
+    rr: std::sync::atomic::AtomicUsize,
+}
+
+impl CoverResolver {
+    fn new(target: String, ttl: Duration) -> Self {
+        let initial = target
+            .parse::<SocketAddr>()
+            .ok()
+            .map(|addr| (vec![addr], Instant::now()));
+        Self {
+            target,
+            ttl,
+            cached: std::sync::RwLock::new(initial),
+            rr: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn is_static_ip(&self) -> bool {
+        self.target.parse::<SocketAddr>().is_ok()
+    }
+
+    fn update_addrs(&self, addrs: Vec<SocketAddr>) {
+        if !addrs.is_empty() {
+            *self.cached.write().unwrap_or_else(|e| e.into_inner()) = Some((addrs, Instant::now()));
+        }
+    }
+
+    fn has_cached(&self) -> bool {
+        self.cached
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|(v, _)| !v.is_empty())
+    }
+
+    fn next_addr(&self) -> Option<SocketAddr> {
+        let guard = self.cached.read().unwrap_or_else(|e| e.into_inner());
+        let (addrs, _) = guard.as_ref()?;
+        if addrs.is_empty() {
+            return None;
+        }
+        let idx = self.rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % addrs.len();
+        Some(addrs[idx])
+    }
+
+    async fn refresh_with<F, Fut>(
+        &self,
+        dns_timeout: Duration,
+        counters: &telemetry::Counters,
+        resolve_fn: F,
+    ) -> bool
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>>,
+    {
+        if self.is_static_ip() {
+            return true;
+        }
+        match timeout(dns_timeout, resolve_fn(self.target.clone())).await {
+            Ok(Ok(addrs)) if !addrs.is_empty() => {
+                self.update_addrs(addrs);
+                true
+            }
+            outcome => {
+                counters
+                    .cover_dns_fail
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let reason = match outcome {
+                    Ok(Ok(_)) => "empty_dns_result".to_string(),
+                    Ok(Err(err)) => format!("dns_error: {err}"),
+                    Err(_) => "dns_timeout".to_string(),
+                };
+                telemetry::event(
+                    "cover_dns_fail",
+                    0,
+                    json!({
+                        "reason": reason,
+                        "has_last_known_good": self.has_cached(),
+                    }),
+                );
+                false
+            }
+        }
+    }
+
+    async fn refresh_once(&self, dns_timeout: Duration, counters: &telemetry::Counters) -> bool {
+        self.refresh_with(dns_timeout, counters, |target| async move {
+            let iter = tokio::net::lookup_host(target).await?;
+            Ok(iter.collect::<Vec<_>>())
+        })
+        .await
+    }
+}
+
+fn spawn_cover_resolver(
+    resolver: Arc<CoverResolver>,
+    counters: Arc<telemetry::Counters>,
+    dns_timeout: Duration,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let wait = if resolver.has_cached() {
+                resolver.ttl
+            } else {
+                resolver.ttl.min(Duration::from_secs(5))
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = &mut stop_rx => break,
+            }
+            let _ = resolver.refresh_once(dns_timeout, &counters).await;
+        }
+    })
+}
+
 struct State {
     secrets: std::sync::RwLock<Arc<Vec<NamedSecret>>>,
     sni: String,
     allowed_snis: std::sync::RwLock<Arc<String>>,
-    cover: String,
+    cover_resolver: Arc<CoverResolver>,
     enable_dd: bool,
     proxy_protocol: bool,
     cover_permits: Semaphore,
@@ -1623,11 +1749,17 @@ async fn main() -> Result<()> {
     let alerts_file = std::env::var_os("MTEVIL_ALERTS_FILE")
         .map(PathBuf::from)
         .or_else(|| stats_path.parent().map(|dir| dir.join("edge-alerts.jsonl")));
+    let cover_resolver = Arc::new(CoverResolver::new(
+        config.cover,
+        Duration::from_secs(config.cover_dns_ttl_secs),
+    ));
+    let handshake_dur = Duration::from_secs(config.handshake_timeout_secs);
+    let _ = cover_resolver.refresh_once(handshake_dur, &counters).await;
     let state = Arc::new(State {
         secrets: std::sync::RwLock::new(Arc::new(secrets)),
         sni: config.sni,
         allowed_snis: std::sync::RwLock::new(Arc::new(allowed_snis)),
-        cover: config.cover,
+        cover_resolver: cover_resolver.clone(),
         enable_dd: config.enable_dd,
         proxy_protocol: config.proxy_protocol,
         cover_permits: Semaphore::new(max_cover_connections),
@@ -1762,6 +1894,15 @@ async fn main() -> Result<()> {
                 Duration::from_secs(config.dc_probe_interval_secs),
             ))
         });
+    let (cover_stop_tx, cover_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let cover_dns_task = (!cover_resolver.is_static_ip()).then(|| {
+        spawn_cover_resolver(
+            cover_resolver,
+            state.counters.clone(),
+            handshake_dur,
+            cover_stop_rx,
+        )
+    });
     let (users_stop_tx, users_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let users_task = reload_config
         .map(|cfg| spawn_users_reloader(state.clone(), cfg, Duration::from_secs(1), users_stop_rx));
@@ -1785,6 +1926,10 @@ async fn main() -> Result<()> {
     }
     if let Some(task) = dc_monitor {
         task.abort();
+        let _ = task.await;
+    }
+    let _ = cover_stop_tx.send(());
+    if let Some(task) = cover_dns_task {
         let _ = task.await;
     }
     let _ = users_stop_tx.send(());
@@ -3214,7 +3359,11 @@ async fn bounded_cover(
 }
 
 async fn cover(client: &mut TcpStream, raw: Vec<u8>, state: &State) -> Result<()> {
-    let mut upstream = timeout(state.handshake, TcpStream::connect(&state.cover)).await??;
+    let addr = state
+        .cover_resolver
+        .next_addr()
+        .context("cover_dns_unavailable")?;
+    let mut upstream = timeout(state.handshake, TcpStream::connect(addr)).await??;
     // INV-01: first backend write commits cover; never reconsider the protocol.
     timeout(state.handshake, upstream.write_all(&raw)).await??;
     let (cr, cw) = client.split();
@@ -3598,6 +3747,7 @@ fn default_media_override_map() -> HashMap<i16, Vec<SocketAddr>> {
         egress_max_failed_per_ip: config::default_egress_max_failed_per_ip(),
         dc_media_override: config::default_dc_media_override(),
         dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
+        cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
     }
     .dc_media_overrides()
     .unwrap_or_default()
