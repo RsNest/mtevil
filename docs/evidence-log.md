@@ -962,3 +962,9 @@ wire-точность. Перебор высоких портов сгорает
   - На старте читается `/proc/self/limits` (`Max open files`), вычисляется `effective_max = min(max_connections, (nofile - 128) / 2)` (fail-fast при `effective_max < 16`), в событие `startup` пишутся `max_connections`, `effective_max_connections` и `rlimit_nofile`.
   - В `deploy/setup.py` (`render_compose`) лимит `ulimits.nofile` рассчитывается как `max(4096, max_connections * 2 + 512)`.
   - Тесты `fd_budget_clamps_effective_max_connections_and_fails_fast_below_16` и `test_render_compose_without_build` зелёные.
+
+
+## 2026-11-21 · Фаза 1 / T3: Circuit breaker для всех стратегий (`ordered` и `round-robin`, `F-23`)
+
+- В `connect_upstream` (`crates/data-plane/src/main.rs`) `EgressHealth::try_claim` включён для всех стратегий (`Ordered` и `RoundRobin`). В режиме `RoundRobin` узлы, находящиеся в cooldown, пропускаются без ожидания `per_try`, а порядок обхода сохраняет RR-смещение `(start + offset) % count`.
+- Тест `round_robin_circuit_breaker_skips_cooldown_node_and_preserves_rr_offset` подтверждает, что из 3 узлов в `RoundRobin` отказавший узел `node1` после единственной ошибки получает `0` попыток подключения на протяжении cooldown (трафик распределяется между `node0` и `node2` по RR-смещению), а после истечения cooldown и восстановления — возвращается в ротацию.

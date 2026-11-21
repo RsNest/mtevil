@@ -3322,15 +3322,10 @@ async fn connect_upstream(
         let mut last_err = None;
         for offset in 0..count {
             let idx = (start + offset) % count;
-            let claim = if ordered {
-                let Some(c) =
-                    EgressHealth::try_claim(&state.egress_health, idx, dc_abs, Instant::now())
-                else {
-                    continue;
-                };
-                Some(c)
-            } else {
-                None
+            let Some(claim) =
+                EgressHealth::try_claim(&state.egress_health, idx, dc_abs, Instant::now())
+            else {
+                continue;
             };
             let addr = state.egress_upstreams[idx];
             enum AttemptErr {
@@ -3379,9 +3374,7 @@ async fn connect_upstream(
             .await;
             match attempt {
                 Ok(Ok(upstream)) => {
-                    if let Some(c) = claim {
-                        c.record_success();
-                    }
+                    claim.record_success();
                     let (healthy, total) =
                         EgressHealth::set_node_availability(&state.egress_health, idx, true);
                     let (next_state, reason, active_override) = if ordered {
@@ -3430,23 +3423,17 @@ async fn connect_upstream(
                     return Ok((upstream, "egress"));
                 }
                 Ok(Err(AttemptErr::Dc(err))) => {
-                    if let Some(c) = claim {
-                        c.record_dc_failure(state.egress_cooldown);
-                    }
+                    claim.record_dc_failure(state.egress_cooldown);
                     EgressHealth::set_node_availability(&state.egress_health, idx, false);
                     last_err = Some(err);
                 }
                 Ok(Err(AttemptErr::Node(err))) => {
-                    if let Some(c) = claim {
-                        c.record_node_failure(state.egress_cooldown);
-                    }
+                    claim.record_node_failure(state.egress_cooldown);
                     EgressHealth::set_node_availability(&state.egress_health, idx, false);
                     last_err = Some(err);
                 }
                 Err(_) => {
-                    if let Some(c) = claim {
-                        c.record_node_failure(state.egress_cooldown);
-                    }
+                    claim.record_node_failure(state.egress_cooldown);
                     EgressHealth::set_node_availability(&state.egress_health, idx, false);
                     last_err = Some(anyhow::anyhow!("egress_connect_timeout"));
                 }

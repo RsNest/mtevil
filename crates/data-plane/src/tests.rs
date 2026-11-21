@@ -1912,6 +1912,7 @@ async fn edge_round_robin_alerts_ignore_healthy_alternation_and_track_availabili
         sm.egress_strategy = EgressStrategy::RoundRobin;
         sm.egress_token = token;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+        sm.egress_cooldown = Duration::from_millis(100);
         sm.handshake = Duration::from_secs(2);
         sm.alerts_file = Some(alerts_path.clone());
     }
@@ -1938,7 +1939,8 @@ async fn edge_round_robin_alerts_ignore_healthy_alternation_and_track_availabili
         assert!(connect_upstream(&cfg, 2, &hdr).await.is_err());
     }
 
-    // 4. Both nodes recover -> after both nodes handle traffic, emits primary_ok (all recovered).
+    // 4. Both nodes recover after cooldown -> after both nodes handle traffic, emits primary_ok (all recovered).
+    tokio::time::sleep(Duration::from_millis(130)).await;
     node1_up.store(true, std::sync::atomic::Ordering::SeqCst);
     node2_up.store(true, std::sync::atomic::Ordering::SeqCst);
     for _ in 0..4 {
@@ -2301,5 +2303,104 @@ Max processes             128                  128                  processes
     // Configured < 16 -> fail-fast Err
     assert!(compute_effective_max_connections(15, Some(4096)).is_err());
     assert!(compute_effective_max_connections(15, None).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn round_robin_circuit_breaker_skips_cooldown_node_and_preserves_rr_offset() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    let cover = cover_mock().await?;
+    let token = [0x66u8; 16];
+
+    let spawn_node = |up: Arc<AtomicBool>, hits: Arc<AtomicUsize>| async move {
+        let l = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = l.local_addr()?;
+        let task = tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                hits.fetch_add(1, SeqCst);
+                if !up.load(SeqCst) {
+                    let _ = s.shutdown().await;
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let mut preface = [0u8; 88];
+                    if s.read_exact(&mut preface).await.is_ok() {
+                        let _ = s.write_all(&[EGRESS_ACK_OK]).await;
+                    }
+                });
+            }
+        });
+        Ok::<_, anyhow::Error>((addr, task))
+    };
+
+    let n0_up = Arc::new(AtomicBool::new(true));
+    let n1_up = Arc::new(AtomicBool::new(false)); // node 1 starts dead
+    let n2_up = Arc::new(AtomicBool::new(true));
+    let h0 = Arc::new(AtomicUsize::new(0));
+    let h1 = Arc::new(AtomicUsize::new(0));
+    let h2 = Arc::new(AtomicUsize::new(0));
+
+    let (addr0, t0) = spawn_node(n0_up.clone(), h0.clone()).await?;
+    let (addr1, t1) = spawn_node(n1_up.clone(), h1.clone()).await?;
+    let (addr2, t2) = spawn_node(n2_up.clone(), h2.clone()).await?;
+
+    let mut cfg = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut cfg).context("unique state")?;
+        sm.dcs.clear();
+        sm.egress_upstreams = vec![addr0, addr1, addr2];
+        sm.egress_strategy = EgressStrategy::RoundRobin;
+        sm.egress_token = token;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(3));
+        sm.egress_cooldown = Duration::from_millis(300);
+        sm.handshake = Duration::from_secs(2);
+    }
+
+    let hdr = [0u8; 64];
+    // Connection 0 (start=0): hits node 0 -> succeeds.
+    let (_s, _) = connect_upstream(&cfg, 2, &hdr).await?;
+    assert_eq!(
+        (h0.load(SeqCst), h1.load(SeqCst), h2.load(SeqCst)),
+        (1, 0, 0)
+    );
+
+    // Connection 1 (start=1): hits dead node 1 (h1=1), puts node 1 into cooldown,
+    // and advances in RR order to node 2 (h2=1).
+    let (_s, _) = connect_upstream(&cfg, 2, &hdr).await?;
+    assert_eq!(
+        (h0.load(SeqCst), h1.load(SeqCst), h2.load(SeqCst)),
+        (1, 1, 1)
+    );
+
+    // Next 6 connections during cooldown: node 1 MUST receive 0 hits!
+    // Look at RR starts:
+    // start=2 -> node 2 (h2=2)
+    // start=0 -> node 0 (h0=2)
+    // start=1 -> skips node 1 -> node 2 (h2=3)
+    // start=2 -> node 2 (h2=4)
+    // start=0 -> node 0 (h0=3)
+    // start=1 -> skips node 1 -> node 2 (h2=5)
+    for _ in 0..6 {
+        let (_s, _) = connect_upstream(&cfg, 2, &hdr).await?;
+    }
+    assert_eq!(
+        h1.load(SeqCst),
+        1,
+        "dead node in cooldown must be skipped in round-robin"
+    );
+    assert_eq!(h0.load(SeqCst), 3);
+    assert_eq!(h2.load(SeqCst), 5);
+
+    // After cooldown expires and node 1 recovers, node 1 is probed and rejoins rotation.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    n1_up.store(true, SeqCst);
+    for _ in 0..3 {
+        let (_s, _) = connect_upstream(&cfg, 2, &hdr).await?;
+    }
+    assert_eq!(h1.load(SeqCst), 2);
+
+    t0.abort();
+    t1.abort();
+    t2.abort();
     Ok(())
 }

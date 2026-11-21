@@ -34,7 +34,7 @@ Phase 0 (F1–F10 в phase-0.md §9) — подмножество; столбе�
 | F-20 | Replay-таблица saturated | PreAuth | sweep; полно → CoverRelay новых CH (fail-safe наружу) | replay_saturated_relays | INV-02 | нагрузка |
 | F-21 | Replay: смерть владельца мьютекса | PreAuth | robust mutex `EOWNERDEAD` → recovery → ровно один Accepted из двух CH | replay_owner_died_recoveries | INV-02 | тест барьером |
 | F-22 | Replay-файл потерян (reboot/crash) | PreAuth | честный рестарт с пустой таблицей; остаточный риск <120 с задокументирован | replay_table_reinit | INV-02 | рестарт стенда |
-| F-23 | Upstream fail | PostCommit | новые conn на здоровый маршрут; старые дренируются по deadline | upstream_failover | §7 | F10 |
+| F-23 | Upstream fail | PostCommit | новые conn на здоровый маршрут (circuit breaker для `ordered` и `round-robin` с сохранением RR-смещения); старые дренируются по deadline | upstream_failover | §7 | F10 |
 | F-24 | Egress partition (loss 100%) | PostCommit | как F-23 + recovery-таксономия по §11.2 | upstream_recovery_time, service_recovery_time | §11.2 | F10 |
 | F-25 | Config prepare fail на любой стадии | control | drop PrepareSet → автооткат внешних ресурсов; commit не случается | config_prepare_failures | INV-06 | тест-фолт |
 | F-26 | Config retire error | control | лог/ретрай, commit не блокируется; reconcile против сирот | config_retire_errors, config_orphans | INV-06 | тест-фолт |
