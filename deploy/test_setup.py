@@ -1892,6 +1892,58 @@ class SetupValidationTests(unittest.TestCase):
                 self.assertEqual(setup.main(), 0)
             self.assertIn("Пользователь 'phone' удалён", out_del.getvalue())
 
+    def test_state_ro_user_and_sni_use_init_service_and_replay_stats_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            repo_root = Path(__file__).resolve().parent.parent
+            compose_text = setup.render_compose(repo_root, d, "direct", include_build=False)
+            (d / "compose.yaml").write_text(compose_text, encoding="utf-8")
+            (d / ".env").write_text(
+                "MTEVIL_PROJECT=mtevil-ro\nMTEVIL_IMAGE=mtevil:v0.2.0-rc.1\nMTEVIL_BIND=0.0.0.0\nMTEVIL_PORT=443\nMTEVIL_PUBLIC_HOST=203.0.113.77\n",
+                encoding="utf-8",
+            )
+            (d / "config.json").write_text(
+                '{"role":"direct","sni":"example.com","cover":"example.com:443","users_file":"/var/lib/mtevil/users.json","replay_file":"/var/lib/mtevil-replay/replay.bin"}\n',
+                encoding="utf-8",
+            )
+            calls: list[list[str]] = []
+
+            def fake_run(argv, **_kw):
+                calls.append(list(argv))
+                cmd = " ".join(argv)
+                if "ps -q" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, stdout="cid999\n", stderr="")
+                if "user-add" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+                if "mtevil link" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, stdout="alice: https://t.me/proxy?server=203.0.113.77&port=443&secret=eeaa\n", stderr="")
+                if "user-del" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "user", "add", "alice", "--dir", str(d)]),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "run", side_effect=fake_run),
+            ):
+                self.assertEqual(setup.main(), 0)
+            add_cmds = [" ".join(c) for c in calls if "user-add" in " ".join(c)]
+            self.assertEqual(len(add_cmds), 1)
+            self.assertIn(" run --rm -T --no-deps init ", add_cmds[0])
+
+            calls.clear()
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "user", "del", "alice", "--dir", str(d)]),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "run", side_effect=fake_run),
+            ):
+                self.assertEqual(setup.main(), 0)
+            del_cmds = [" ".join(c) for c in calls if "user-del" in " ".join(c)]
+            self.assertEqual(len(del_cmds), 1)
+            self.assertIn(" run --rm -T --no-deps init ", del_cmds[0])
+
 
 if __name__ == "__main__":
     prog = unittest.main(verbosity=2, exit=False)

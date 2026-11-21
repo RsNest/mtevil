@@ -762,11 +762,19 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             Action::Stats { stats_file } => {
-                let text = std::fs::read_to_string(&stats_file).with_context(|| {
-                    format!("reading runtime stats file {}", stats_file.display())
+                let effective = if !stats_file.exists()
+                    && stats_file == std::path::Path::new(RUNTIME_STATS_DEFAULT_PATH)
+                    && std::path::Path::new(RUNTIME_STATS_LEGACY_PATH).exists()
+                {
+                    PathBuf::from(RUNTIME_STATS_LEGACY_PATH)
+                } else {
+                    stats_file
+                };
+                let text = std::fs::read_to_string(&effective).with_context(|| {
+                    format!("reading runtime stats file {}", effective.display())
                 })?;
                 let val: serde_json::Value = serde_json::from_str(&text).with_context(|| {
-                    format!("parsing runtime stats file {}", stats_file.display())
+                    format!("parsing runtime stats file {}", effective.display())
                 })?;
                 println!("{}", serde_json::to_string_pretty(&val)?);
                 return Ok(());
@@ -822,7 +830,19 @@ async fn main() -> Result<()> {
             config
                 .replay_file
                 .as_ref()
-                .or(config.secret_file.as_ref())
+                .and_then(|p| p.parent().map(|dir| dir.join("runtime-stats.json")))
+        })
+        .or_else(|| {
+            let preferred = PathBuf::from(RUNTIME_STATS_DEFAULT_PATH);
+            preferred
+                .parent()
+                .is_some_and(|p| p.is_dir())
+                .then_some(preferred)
+        })
+        .or_else(|| {
+            config
+                .secret_file
+                .as_ref()
                 .or(config.egress_token_file.as_ref())
                 .and_then(|p| p.parent().map(|dir| dir.join("runtime-stats.json")))
         })

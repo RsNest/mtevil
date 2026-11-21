@@ -2002,12 +2002,17 @@ def run_status_command(deploy_dir: Path) -> int:
                 '"egress_accept_legacy": false в config.json и перезапустите egress.'
             )
     if role == "edge" and running:
-        alerts_proc = run(
-            base + ["exec", "-T", svc, "/bin/cat", "/var/lib/mtevil/edge-alerts.jsonl"],
-            check=False,
-        )
-        if alerts_proc.returncode == 0 and alerts_proc.stdout.strip():
-            lines = [ln.strip() for ln in alerts_proc.stdout.splitlines() if ln.strip()]
+        alerts_text = ""
+        for alerts_path in ("/var/lib/mtevil-replay/edge-alerts.jsonl", "/var/lib/mtevil/edge-alerts.jsonl"):
+            alerts_proc = run(
+                base + ["exec", "-T", svc, "/bin/cat", alerts_path],
+                check=False,
+            )
+            if alerts_proc.returncode == 0 and alerts_proc.stdout.strip():
+                alerts_text = alerts_proc.stdout.strip()
+                break
+        if alerts_text:
+            lines = [ln.strip() for ln in alerts_text.splitlines() if ln.strip()]
             if lines:
                 try:
                     last_ev = json.loads(lines[-1])
