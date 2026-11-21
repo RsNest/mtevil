@@ -3418,3 +3418,188 @@ async fn inv10_f29_graceful_shutdown_completes_within_drain_timeout() -> Result<
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn inv10_f23_hedge_zero_disabled_at_most_one_hedge_and_loser_closed() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let cover = cover_mock().await?;
+
+    // Helper: mock egress that sleeps `ack_delay_ms`, sends ACK_OK, and tracks EOF on loser socket.
+    async fn spawn_delay_egress(
+        ack_delay_ms: u64,
+    ) -> Result<(
+        SocketAddr,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        let l = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = l.local_addr()?;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let h_cl = hits.clone();
+        let c_cl = closed.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else {
+                    break;
+                };
+                h_cl.fetch_add(1, Relaxed);
+                let c_inner = c_cl.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 88];
+                    if s.read_exact(&mut buf).await.is_ok() {
+                        if ack_delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(ack_delay_ms)).await;
+                        }
+                        let _ = s.write_all(&[EGRESS_ACK_OK]).await;
+                        let mut drain = [0u8; 16];
+                        let _ = timeout(Duration::from_secs(2), s.read(&mut drain)).await;
+                    }
+                    c_inner.fetch_add(1, Relaxed);
+                });
+            }
+        });
+        Ok((addr, hits, closed, task))
+    }
+
+    // 1. egress_hedge_ms = 0: slow primary (120ms) completes without starting backup hedge.
+    let (p1, p1_hits, _, t1) = spawn_delay_egress(120).await?;
+    let (b1, b1_hits, _, t2) = spawn_delay_egress(0).await?;
+    let mut st0 = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut st0).context("unique state")?;
+        sm.egress_upstreams = vec![p1, b1];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+        sm.egress_hedge_ms = 0;
+        sm.egress_use_mtv3 = false;
+        sm.handshake = Duration::from_secs(3);
+    }
+    let s = connect_upstream(&st0, 2, &[0x11; 64]).await?;
+    drop(s);
+    assert_eq!(st0.counters.hedge_started.load(Relaxed), 0);
+    assert_eq!(st0.counters.hedge_won_by_backup.load(Relaxed), 0);
+    assert_eq!(p1_hits.load(Relaxed), 1);
+    assert_eq!(b1_hits.load(Relaxed), 0);
+
+    // 2. egress_hedge_ms = 40 with 3 nodes: at most ONE hedge per connection, loser socket closes cleanly.
+    let (p2, p2_hits, p2_closed, t3) = spawn_delay_egress(350).await?;
+    let (b2, b2_hits, _, t4) = spawn_delay_egress(10).await?;
+    let (b3, b3_hits, _, t5) = spawn_delay_egress(0).await?;
+    let mut st1 = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut st1).context("unique state")?;
+        sm.egress_upstreams = vec![p2, b2, b3];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(3));
+        sm.egress_hedge_ms = 40;
+        sm.egress_use_mtv3 = false;
+        sm.handshake = Duration::from_secs(3);
+    }
+    let fd_before = detect_fd_used();
+    let s = connect_upstream(&st1, 2, &[0x22; 64]).await?;
+    drop(s);
+    assert_eq!(st1.counters.hedge_started.load(Relaxed), 1);
+    assert_eq!(st1.counters.hedge_won_by_backup.load(Relaxed), 1);
+    assert_eq!(p2_hits.load(Relaxed), 1);
+    assert_eq!(b2_hits.load(Relaxed), 1);
+    assert_eq!(b3_hits.load(Relaxed), 0, "at most one hedge per connection");
+    // Wait briefly and confirm the losing primary socket observed peer close (no FD leak).
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert_eq!(
+        p2_closed.load(Relaxed),
+        1,
+        "losing primary socket must be closed after backup wins"
+    );
+    if let (Some(before), Some(after)) = (fd_before, detect_fd_used()) {
+        assert!(
+            after <= before + 8,
+            "FD leak detected after hedged connect: before={before} after={after}"
+        );
+    }
+
+    for t in [t1, t2, t3, t4, t5] {
+        t.abort();
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "manual B4 stress test: 10000 hedged connections FD leak check"]
+async fn inv10_f23_hedge_10000_connections_no_fd_leak() -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let cover = cover_mock().await?;
+
+    let l_slow = TcpListener::bind("127.0.0.1:0").await?;
+    let a_slow = l_slow.local_addr()?;
+    let t_slow = tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l_slow.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 88];
+                if s.read_exact(&mut buf).await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    let _ = s.write_all(&[EGRESS_ACK_OK]).await;
+                }
+            });
+        }
+    });
+
+    let l_fast = TcpListener::bind("127.0.0.1:0").await?;
+    let a_fast = l_fast.local_addr()?;
+    let t_fast = tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l_fast.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 88];
+                if s.read_exact(&mut buf).await.is_ok() {
+                    let _ = s.write_all(&[EGRESS_ACK_OK]).await;
+                }
+            });
+        }
+    });
+
+    let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut st).context("unique state")?;
+        sm.egress_upstreams = vec![a_slow, a_fast];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+        sm.egress_hedge_ms = 2;
+        sm.egress_use_mtv3 = false;
+        sm.handshake = Duration::from_secs(3);
+    }
+
+    let fd_before = detect_fd_used();
+    let sem = Arc::new(Semaphore::new(32));
+    let mut joins = Vec::with_capacity(10_000);
+    for _ in 0..10_000u64 {
+        let p = sem.clone().acquire_owned().await?;
+        let st_c = st.clone();
+        joins.push(tokio::spawn(async move {
+            let _p = p;
+            if let Ok(s) = connect_upstream(&st_c, 2, &[0x33; 64]).await {
+                drop(s);
+            }
+        }));
+    }
+    for j in joins {
+        let _ = j.await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(st.counters.hedge_started.load(Relaxed) <= 10_000);
+    if let (Some(before), Some(after)) = (fd_before, detect_fd_used()) {
+        assert!(
+            after <= before + 32,
+            "FD leak after 10000 hedged connections: before={before} after={after}"
+        );
+    }
+    t_slow.abort();
+    t_fast.abort();
+    Ok(())
+}
