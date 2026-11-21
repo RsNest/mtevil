@@ -1098,3 +1098,22 @@ wire-точность. Перебор высоких портов сгорает
 | 100 параллельных потоков × 512 KiB (50 MiB, `strace -c`) | `v0.2.0-rc.1` (`diagnostics=true`) | **301** (−92.2%) | 380.0 | 1022.7 | 48.9 |
 | 100 параллельных потоков × 512 KiB (50 MiB, `strace -c`) | `v0.2.0-rc.1` (`diagnostics=false`) | **301** (−92.2%) | 400.0 | 1173.1 | 42.6 |
 | Rust release `bench_t12_relay_loopback_throughput` (64 MiB, без `strace`) | `diagnostics=true` / `false` | — | — | 245.0 / 242.6 | 261.2 / 263.9 |
+
+
+## 2026-11-22 · Фаза E (`release-prep-v0.2 @ a151ab8`): `state:ro` lifecycle (E1) и честный A/B-замер `v0.1.5` vs `rc.1` (E3/E4)
+
+- **Актуальные счётчики тестов (`a151ab8`):** `101` Rust-тест (`69` data-plane + `4` chaos + `1` egress + `4` guard + `11` harness + `12` proto; `0` failed, `2` ignored manual bench/stress), `30` тестов `deploy/test_setup.py`.
+- **E1 (`state:ro` + отдельный `replay`-том `/var/lib/mtevil-replay` на Linux-стенде):**
+  - В `compose.yaml` подтверждены `- state:/var/lib/mtevil:ro` и `- replay:/var/lib/mtevil-replay`; попытка записи из работающего контейнера в `/var/lib/mtevil` завершается ошибкой (read-only).
+  - `mtevilctl user add alice` (запись через `init` с `--entrypoint /usr/local/bin/mtevil`), `mtevilctl user list` (`alice` виден), горячая перезагрузка `users.json` без рестарта контейнера (`users_reloaded` в логе, `StartedAt` контейнера не изменился), `mtevil stats` и `mtevilctl status` (читают `/var/lib/mtevil-replay/runtime-stats.json`), `mtevilctl sni ya.ru`, `mtevilctl user del alice` и сквозная проба после `docker restart` — **все 16 проверок PASS**.
+- **E3/E4 — Честный A/B `v0.1.5` vs `rc.1` в одной методике (прямая волна 30 клиентов, без `docker exec`, медиана и min–max):**
+
+| Сценарий (`edge → 2× egress`, 30 клиентов) | Прогоны | `v0.1.5` `p50` (мс) | `v0.1.5` `p95` (мс) | `rc.1` `p50` (мс) | `rc.1` `p95` (мс) | Ошибки |
+|---|---:|---|---|---|---|---|
+| Baseline healthy (harness + Telegram overhead) | 3 | 143.0 (106.9–167.2) | 193.0 (128.9–241.4) | 124.1 (118.0–168.5) | 158.5 (145.0–241.1) | 0 / 0 |
+| `docker kill` primary (`ordered`) | 5 | 2078.6 (2063.7–2091.9) | 2126.0 (2079.8–2156.2) | **366.9** (323.4–412.3) | **517.8** (466.0–532.9) | 0 / 0 |
+| Blackhole primary (`iptables DROP`, loss 100%) | 5 | 2060.0 (2047.6–2075.7) | 2076.3 (2056.3–2103.0) | **349.7** (314.1–374.6) | **459.3** (441.0–491.3) | 0 / 0 |
+| Loss 30% + RTT +300 мс (`tc netem`) | 5 | 2368.7 (2088.1–2555.9) | 5113.5 (4165.1–5830.0) | **335.0** (310.5–355.5) | **439.8** (416.9–458.3) | 0 / 0 |
+| Flap primary каждые 10 с (22 с) | 3 | 14.1 (14.0–14.5) | 2014.5 (2014.4–2016.0) | 14.7 (14.4–14.9) | **315.1** (314.4–316.2) | 0 / 0 |
+| `round-robin` с 1 мёртвым узлом (`iptables DROP`, цель E4 `p95 ≤ 700 мс`) | 5 | 2041.3 (2031.1–2055.1) | 2096.0 (2084.9–2107.1) | **141.4** (132.9–192.0) | **394.5** (366.6–439.0) | 0 / 0 |
+| Оба `egress` в `DROP` 20 с → восстановление | 3 | — | **13091.1** (13076.9–13139.8) | — | **98.8** (92.7–109.7) | 0 / 0 |
