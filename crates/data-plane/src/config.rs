@@ -44,6 +44,18 @@ impl IpCidr {
                     None => 128,
                 };
                 ensure!(prefix <= 128, "IPv6 CIDR prefix must be 0..=128");
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    if prefix >= 96 {
+                        let v4_prefix = prefix - 96;
+                        let mask = if v4_prefix == 0 {
+                            0
+                        } else {
+                            u32::MAX << (32 - v4_prefix)
+                        };
+                        let net = u32::from_be_bytes(v4.octets()) & mask;
+                        return Ok(Self::V4 { net, mask });
+                    }
+                }
                 let mask = if prefix == 0 {
                     0
                 } else {
@@ -729,6 +741,27 @@ mod tests {
             r#"{"role":"egress","listen":"10.203.0.9:29443","dc":["2=149.154.167.51:443"]}"#,
         )?;
         egress.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn ip_cidr_normalizes_ipv4_mapped_ipv6_on_parse_and_contains() -> Result<()> {
+        let v4_cidr = IpCidr::parse("10.203.0.0/24")?;
+        let mapped_cidr = IpCidr::parse("::ffff:10.203.0.0/120")?;
+        let mapped_host = IpCidr::parse("::ffff:10.203.0.42")?;
+        let v6_cidr = IpCidr::parse("2001:db8::/32")?;
+        assert!(v4_cidr.contains("10.203.0.42".parse()?));
+        assert!(v4_cidr.contains("::ffff:10.203.0.42".parse()?));
+        assert!(!v4_cidr.contains("::ffff:10.204.0.1".parse()?));
+        assert!(mapped_cidr.contains("10.203.0.42".parse()?));
+        assert!(mapped_cidr.contains("::ffff:10.203.0.42".parse()?));
+        assert!(!mapped_cidr.contains("10.204.0.1".parse()?));
+        assert!(mapped_host.contains("10.203.0.42".parse()?));
+        assert!(mapped_host.contains("::ffff:10.203.0.42".parse()?));
+        assert!(!mapped_host.contains("10.203.0.43".parse()?));
+        assert!(v6_cidr.contains("2001:db8::1".parse()?));
+        assert!(!v6_cidr.contains("10.203.0.42".parse()?));
+        assert!(!v6_cidr.contains("::ffff:10.203.0.42".parse()?));
         Ok(())
     }
 }
