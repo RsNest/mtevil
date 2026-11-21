@@ -1049,3 +1049,52 @@ wire-точность. Перебор высоких портов сгорает
   - В `crates/egress` (`mtevil-egress`) перенесены примитивы экспоненциального backoff и jitter (`compute_egress_cooldown_unclamped_ms`, `apply_cooldown_jitter_ms`, `compute_egress_cooldown` + unit-тест);
   - Пустые placeholder-крейты `crates/me-pool` и `crates/control` удалены из `Cargo.toml` и репозитория, `Cargo.lock` обновлён только по workspace-зависимостям;
   - Проверка: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings` (0 предупреждений), `cargo test --workspace --locked` (**88/88** тестов зелёные).
+
+
+## 2026-11-22 · Фаза A (Linux x86_64 стенд): сравнение «до» (`v0.1.5`) и «после» (`v0.2.0-rc.1`), реальные сетевые отказы, смешанные версии и `strace -c`
+
+Среда замера «после»: изолированный Linux x86_64 стенд (`1 vCPU`, `1.9 GiB RAM`, Docker `29.1.3`, ядро `7.0.0-38-generic`), без затрагивания рабочих контейнеров.
+
+### A1. Сборка и полные тесты на Linux
+- `docker build` (`Dockerfile`, `rust:1.100.0-bookworm`): **PASS**.
+- `cargo test --workspace --locked` в контейнере сборки: **88 passed, 0 failed, 1 ignored** (ручной бенчмарк T12).
+- `MTEVIL_REQUIRE_ALL_TESTS=1 python3 -m unittest discover -s deploy -p "test_*.py" -v`: **29/29 OK** (0 пропусков).
+
+### A2. Массовое переподключение `edge -> 2x egress` (30 клиентов, `docker kill` primary)
+
+| Сценарий / режим | Версия | Ошибки | `p50` (мс) | `p95` (мс) | `max` (мс) | `wave_total` (мс) | Память `edge` |
+|---|---|---:|---:|---:|---:|---:|---|
+| `failover_bench.py` (`docker compose exec`, 4 vCPU, «до») | `v0.1.5` | 0/30 | 13385.7 | 15780.4 | 15789.9 | 15891.6 | 1.45 → 3.11 MiB |
+| `failover_bench.py` (`docker compose exec`, 1 vCPU, контроль) | `v0.1.5` | 0/30 | 13123.4 | 13799.4 | 13830.8 | 13970.9 | — |
+| `failover_bench.py` (`docker compose exec`, 1 vCPU, медиана 3 прогонов) | `v0.2.0-rc.1` | 0/90 | 12172.5 | 12710.6 | 12750.9 | 12918.0 | 1.58 → 1.75 MiB |
+| Прямая волна 30 клиентов (`mtevil probe-telegram` без оверхеда `docker exec`, медиана 3 прогонов) | `v0.2.0-rc.1` | 0/90 | **458.4** | **482.5** | **488.8** | **697.8** | — |
+
+Наблюдение: в `failover_bench.py` основной вклад (~11–12 с) на 1 vCPU вносит параллельный спавн 30 процессов `docker compose exec`; прямая волна из 30 клиентов к порту `edge` показывает реальное время переключения при `egress_hedge_ms = 400` — **`p95 = 482.5 мс`** (цель `≤ 4 с` перевыполнена в 8×).
+
+### A3. Реальные сетевые отказы (`iptables` / `tc netem` в netns контейнеров `egress`)
+
+| Сценарий | Клиенты | Доля ошибок | `p50` (мс) | `p95` (мс) | `max` (мс) | Время восстановления |
+|---|---:|---:|---:|---:|---:|---|
+| 1. Blackhole primary (`iptables DROP`, loss 100%) | 30 | 0.0% | 451.3 | 461.3 | 475.2 | hedge на 400 мс, волна 687.9 мс |
+| 2. Loss 30% + RTT +300 мс (`tc netem`) | 30 | 0.0% | 457.6 | 468.8 | 470.8 | волна 666.2 мс |
+| 3. Flap primary каждые 10 с (32 с) | 60 | 0.0% | 14.2 | 415.2 | 422.0 | без потерь клиентов |
+| 4. Оба `egress` в `DROP` 20 с → восстановление | 1-я проба после | 0.0% | — | — | — | **90.3 мс** (1-я попытка, вместо окна 15 с) |
+| 5. `round-robin` с 1 мёртвым узлом (`iptables DROP`) | 30 | 0.0% | 2042.3 | 2074.9 | 2076.8 | волна 2302.3 мс |
+
+### A4. Смешанные версии (`egress` → `edge`) и `mtevilctl update` / `rollback`
+- `(a)` Новый `egress` (`egress_accept_legacy=true`) + старый `edge` (`v0.1.5`, MTV2): **PASS** (`rtt_ms = 7`).
+- `(b)` Новый `egress` + новый `edge` (MTV3): **PASS** (`rtt_ms = 9`).
+- `(c)` Новый `egress` (`egress_accept_legacy=false`) + старый `edge` (`v0.1.5`, MTV2): **корректный отказ** с событием `{"event":"session_error","details":{"reason":"egress legacy MTV2 disabled"}}`.
+- `(d)` `mtevilctl update` с инъекцией сбоя пробы (`v0.1.5 → v0.2.0-rc.2`): 3 сбоя пробы → **автооткат на `v0.1.5`** (проба после отката `17 мс`); чистое обновление `v0.1.5 → v0.2.0-rc.1`: **PASS** (`8 мс`); ручной `mtevilctl rollback → v0.1.5`: **PASS** (`31 мс`).
+
+### A5. Бенчмарк T12 на Linux (`strace -c -f -e trace=getsockopt`)
+
+| Нагрузка | Версия / режим | `getsockopt` вызовов | CPU (`user+sys`, мс) | Время (мс) | Скорость (MiB/s) |
+|---|---|---:|---:|---:|---:|
+| 64 MiB loopback (1 поток, `strace -c`) | `v0.1.5` («до») | **4395** | 370.0 | 880.3 | 72.7 |
+| 64 MiB loopback (1 поток, `strace -c`) | `v0.2.0-rc.1` (`diagnostics=true`) | **4** (−99.9%) | 230.0 | 545.9 | 117.2 |
+| 64 MiB loopback (1 поток, `strace -c`) | `v0.2.0-rc.1` (`diagnostics=false`) | **4** (−99.9%) | 320.0 | 742.4 | 86.2 |
+| 100 параллельных потоков × 512 KiB (50 MiB, `strace -c`) | `v0.1.5` («до») | **3839** | 420.0 | 1158.7 | 43.2 |
+| 100 параллельных потоков × 512 KiB (50 MiB, `strace -c`) | `v0.2.0-rc.1` (`diagnostics=true`) | **301** (−92.2%) | 380.0 | 1022.7 | 48.9 |
+| 100 параллельных потоков × 512 KiB (50 MiB, `strace -c`) | `v0.2.0-rc.1` (`diagnostics=false`) | **301** (−92.2%) | 400.0 | 1173.1 | 42.6 |
+| Rust release `bench_t12_relay_loopback_throughput` (64 MiB, без `strace`) | `diagnostics=true` / `false` | — | — | 245.0 / 242.6 | 261.2 / 263.9 |
