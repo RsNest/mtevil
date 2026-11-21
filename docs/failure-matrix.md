@@ -35,7 +35,7 @@ Phase 0 (F1–F10 в phase-0.md §9) — подмножество; столбе�
 | F-21 | Replay: смерть владельца мьютекса | PreAuth | robust mutex `EOWNERDEAD` → recovery → ровно один Accepted из двух CH | replay_owner_died_recoveries | INV-02 | тест барьером |
 | F-22 | Replay-файл потерян (reboot/crash) | PreAuth | честный рестарт с пустой таблицей; остаточный риск <120 с задокументирован | replay_table_reinit | INV-02 | рестарт стенда |
 | F-23 | Upstream fail | PostCommit | новые conn на здоровый маршрут (circuit breaker с экспоненциальным backoff `egress_cooldown_base_ms`..`egress_cooldown_max_ms` ×2 ±20% jitter, сброс на успехе); старые дренируются по deadline | upstream_failover | §7 | F10 |
-| F-24 | Egress partition (loss 100%) / все в cooldown | PostCommit | как F-23 + fail-open: принудительная проба узла с ближайшим окончанием cooldown (не более 1 одновременно на узел) + recovery-таксономия по §11.2 | upstream_recovery_time, service_recovery_time | §11.2 | F10 |
+| F-24 | Egress partition (loss 100%) / все в cooldown | PostCommit | как F-23 + fail-open проба + фоновый монитор (`30 с` / `5 с` при деградации, ротация DC `2, 4, -2, -4`) ставит и снимает cooldown без жертвы живым клиентом | upstream_recovery_time, service_recovery_time | §11.2 | F10 |
 | F-25 | Config prepare fail на любой стадии | control | drop PrepareSet → автооткат внешних ресурсов; commit не случается | config_prepare_failures | INV-06 | тест-фолт |
 | F-26 | Config retire error | control | лог/ретрай, commit не блокируется; reconcile против сирот | config_retire_errors, config_orphans | INV-06 | тест-фолт |
 | F-27 | Control API flood + blocking-шторм | control vs data | p99 data plane в пределах +10% или ADR-002 триггер | api_flood_p99_delta | INV-07, §3 | нагрузка |

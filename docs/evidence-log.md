@@ -975,3 +975,7 @@ wire-точность. Перебор высоких портов сгорает
   - В `Config` и CLI добавлены `egress_cooldown_base_ms` (default `3000`, `50..=300000`) и `egress_cooldown_max_ms` (default `60000`, `>= base_ms`, `<= 600000`) с полной обратной совместимостью для существующих `config.json`.
   - В `CooldownSlot` добавлен счётчик подряд идущих сбоев `failures`: длительность cooldown растёт `×2` за каждый подряд сбой до `egress_cooldown_max_ms` с jitter `±20%` и сбрасывается в `0` при успешном соединении. Сбои узла (TCP/timeout/invalid ACK) и сбои конкретного DC (negative ACK) ведутся раздельно.
   - Тест `egress_cooldown_exponential_backoff_jitter_reset_and_node_vs_dc_separation` зелёный.
+- **T6 (`F-24`, управление circuit breaker из фоновых проб и ротация DC):**
+  - В `Config` и CLI добавлены `egress_probe_interval_secs` (default `30`) и `egress_probe_degraded_interval_secs` (default `5`).
+  - `monitor_edge_egress` ротирует проверяемые DC по кругу (`2, 4, -2, -4`), переключает период с `30 с` на `5 с` при наличии хотя бы одного недоступного узла, ставит cooldown при сбое фоновой пробы и автоматически снимает cooldown/счётчик сбоев при успешной пробе (failback без жертвования живым клиентом). Подтверждение алертов двумя замерами подряд сохранено.
+  - Тест `background_probe_rotates_dcs_sets_and_clears_breaker_cooldown_and_switches_interval` зелёный.

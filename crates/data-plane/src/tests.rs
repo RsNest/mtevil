@@ -72,6 +72,10 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         egress_health: std::sync::Mutex::new(EgressHealth::new(0)),
         egress_cooldown: Duration::from_millis(config::default_egress_cooldown_base_ms()),
         egress_cooldown_max: Duration::from_millis(config::default_egress_cooldown_max_ms()),
+        egress_probe_interval: Duration::from_secs(config::default_egress_probe_interval_secs()),
+        egress_probe_degraded_interval: Duration::from_secs(
+            config::default_egress_probe_degraded_interval_secs(),
+        ),
         client_hello: Duration::from_millis(150),
         handshake: Duration::from_millis(150),
         idle: Duration::from_millis(300),
@@ -1249,6 +1253,8 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         alert_webhook_url: None,
         egress_cooldown_base_ms: config::default_egress_cooldown_base_ms(),
         egress_cooldown_max_ms: config::default_egress_cooldown_max_ms(),
+        egress_probe_interval_secs: config::default_egress_probe_interval_secs(),
+        egress_probe_degraded_interval_secs: config::default_egress_probe_degraded_interval_secs(),
     };
 
     let mut proxy_state = state(cover.addr, dc_addr);
@@ -1677,6 +1683,8 @@ async fn probe_telegram_e2e_verifies_handshake_and_res_pq_reply() -> Result<()> 
         alert_webhook_url: None,
         egress_cooldown_base_ms: config::default_egress_cooldown_base_ms(),
         egress_cooldown_max_ms: config::default_egress_cooldown_max_ms(),
+        egress_probe_interval_secs: config::default_egress_probe_interval_secs(),
+        egress_probe_degraded_interval_secs: config::default_egress_probe_degraded_interval_secs(),
     };
 
     let rtt_ms = probe_telegram_e2e(&cfg, proxy_addr, 2, Duration::from_secs(3)).await?;
@@ -2074,6 +2082,8 @@ async fn allowed_sni_file_accepts_previous_and_current_sni_without_breaking_link
         alert_webhook_url: None,
         egress_cooldown_base_ms: config::default_egress_cooldown_base_ms(),
         egress_cooldown_max_ms: config::default_egress_cooldown_max_ms(),
+        egress_probe_interval_secs: config::default_egress_probe_interval_secs(),
+        egress_probe_degraded_interval_secs: config::default_egress_probe_degraded_interval_secs(),
     };
     assert_eq!(cfg.allowed_snis(), "ya.ru,example.com,vk.com");
 
@@ -2466,9 +2476,17 @@ async fn all_nodes_in_cooldown_fail_open_forces_soonest_probe_with_storm_protect
     }
 
     let hdr = [0u8; 64];
-    // 1. Both nodes fail -> both enter 15-second cooldown (node 0 fails first, so node 0 has the soonest expiry).
+    // 1. Both nodes fail -> both enter cooldown.
     assert!(connect_upstream(&cfg, 2, &hdr).await.is_err());
     assert_eq!((h0.load(SeqCst), h1.load(SeqCst)), (1, 1));
+    // Set deterministic distinct expiry deadlines (node 0 expires in 10s, node 1 in 20s)
+    // so try_claim_forced_soonest deterministically selects node 0 first regardless of ±20% jitter.
+    {
+        let now = Instant::now();
+        let mut h = cfg.egress_health.lock().unwrap_or_else(|e| e.into_inner());
+        h.nodes[0].until = Some(now + Duration::from_secs(10));
+        h.nodes[1].until = Some(now + Duration::from_secs(20));
+    }
 
     // 2. Verify storm protection on try_claim_forced_soonest:
     //    First claim gets node 0 (soonest expiry); second concurrent claim gets node 1;
@@ -2586,6 +2604,120 @@ fn egress_cooldown_exponential_backoff_jitter_reset_and_node_vs_dc_separation() 
         let h = health.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(h.dc_slots.get(&(0, 2)).map(|s| s.failures), Some(0));
         assert!(h.dc_slots.get(&(0, 2)).and_then(|s| s.until).is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn background_probe_rotates_dcs_sets_and_clears_breaker_cooldown_and_switches_interval(
+) -> Result<()> {
+    let primary = TcpListener::bind("127.0.0.1:0").await?;
+    let primary_addr = primary.local_addr()?;
+    let backup = TcpListener::bind("127.0.0.1:0").await?;
+    let backup_addr = backup.local_addr()?;
+    let primary_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen_dcs = Arc::new(std::sync::Mutex::new(Vec::<i16>::new()));
+    let flag = primary_up.clone();
+    let seen_clone = seen_dcs.clone();
+    let primary_task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = primary.accept().await {
+            let mut preface = [0; 88];
+            if stream.read_exact(&mut preface).await.is_ok() {
+                let dc_id = i16::from_le_bytes([preface[4], preface[5]]);
+                seen_clone
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(dc_id);
+                let ack = if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    EGRESS_ACK_OK
+                } else {
+                    EGRESS_ACK_ERR
+                };
+                let _ = stream.write_all(&[ack]).await;
+            }
+        }
+    });
+    let backup_task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = backup.accept().await {
+            let mut preface = [0; 88];
+            if stream.read_exact(&mut preface).await.is_ok() {
+                let _ = stream.write_all(&[EGRESS_ACK_OK]).await;
+            }
+        }
+    });
+
+    let mut cfg = state(primary_addr, backup_addr);
+    {
+        let inner = Arc::get_mut(&mut cfg).context("unique state")?;
+        inner.egress_upstreams = vec![primary_addr, backup_addr];
+        inner.egress_strategy = EgressStrategy::Ordered;
+        inner.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+        // Long 30s cooldown to prove that background probe recovery clears cooldown directly!
+        inner.egress_cooldown = Duration::from_secs(30);
+        inner.egress_cooldown_max = Duration::from_secs(60);
+        inner.egress_probe_interval = Duration::from_millis(40);
+        inner.egress_probe_degraded_interval = Duration::from_millis(10);
+    }
+
+    let monitor = tokio::spawn(monitor_edge_egress(cfg.clone(), Duration::from_millis(40)));
+
+    // 1. Wait until primary fails at least 2 background probes -> primary is placed into 30s cooldown!
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let in_cooldown = cfg
+                .egress_health
+                .lock()
+                .map(|h| {
+                    h.route_state == EdgeRouteState::FailoverBackup(1)
+                        && h.nodes.first().and_then(|s| s.until).is_some()
+                })
+                .unwrap_or(false);
+            if in_cooldown {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+
+    // 2. Restore primary -> background probe (running at fast 10ms degraded interval)
+    //    must clear primary's 30s cooldown automatically without any client traffic!
+    primary_up.store(true, std::sync::atomic::Ordering::Relaxed);
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let recovered = cfg
+                .egress_health
+                .lock()
+                .map(|h| {
+                    h.route_state == EdgeRouteState::PrimaryOk
+                        && h.nodes.first().and_then(|s| s.until).is_none()
+                        && h.nodes.first().map(|s| s.failures) == Some(0)
+                })
+                .unwrap_or(false);
+            if recovered {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+
+    // 3. Verify DC rotation covered [2, 4, -2, -4].
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let len = seen_dcs.lock().unwrap_or_else(|e| e.into_inner()).len();
+            if len >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let dcs_snapshot = seen_dcs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(&dcs_snapshot[..4], &[2, 4, -2, -4]);
+
+    for task in [monitor, primary_task, backup_task] {
+        task.abort();
     }
     Ok(())
 }

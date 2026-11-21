@@ -95,6 +95,12 @@ pub struct Config {
     /// Maximum exponential backoff cooldown in milliseconds for an egress upstream or DC.
     #[serde(default = "default_egress_cooldown_max_ms")]
     pub egress_cooldown_max_ms: u64,
+    /// Background egress probe interval in seconds when all egress nodes are healthy.
+    #[serde(default = "default_egress_probe_interval_secs")]
+    pub egress_probe_interval_secs: u64,
+    /// Background egress probe interval in seconds while at least one egress node is unavailable.
+    #[serde(default = "default_egress_probe_degraded_interval_secs")]
+    pub egress_probe_degraded_interval_secs: u64,
 }
 fn default_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 24443))
@@ -125,6 +131,12 @@ pub fn default_egress_cooldown_base_ms() -> u64 {
 }
 pub fn default_egress_cooldown_max_ms() -> u64 {
     60_000
+}
+pub fn default_egress_probe_interval_secs() -> u64 {
+    30
+}
+pub fn default_egress_probe_degraded_interval_secs() -> u64 {
+    5
 }
 
 impl Config {
@@ -179,6 +191,15 @@ impl Config {
             (50..=600_000).contains(&self.egress_cooldown_max_ms)
                 && self.egress_cooldown_max_ms >= self.egress_cooldown_base_ms,
             "egress_cooldown_max_ms must be >= egress_cooldown_base_ms and <= 600000"
+        );
+        ensure!(
+            (1..=3600).contains(&self.egress_probe_interval_secs),
+            "egress_probe_interval_secs must be 1..=3600"
+        );
+        ensure!(
+            (1..=3600).contains(&self.egress_probe_degraded_interval_secs)
+                && self.egress_probe_degraded_interval_secs <= self.egress_probe_interval_secs,
+            "egress_probe_degraded_interval_secs must be 1..=egress_probe_interval_secs"
         );
         mtevil_proto::ServerFlightProfile {
             cert_bytes: self.fake_tls_cert_bytes,
@@ -367,6 +388,8 @@ mod tests {
         assert_eq!(c.fake_tls_cert_jitter, 0);
         assert_eq!(c.egress_cooldown_base_ms, 3_000);
         assert_eq!(c.egress_cooldown_max_ms, 60_000);
+        assert_eq!(c.egress_probe_interval_secs, 30);
+        assert_eq!(c.egress_probe_degraded_interval_secs, 5);
         assert!(serde_json::from_str::<Config>(r#"{"secret_file":"secret","sni":"example.com","cover":"example.com:443","dc":[],"max_conections":100}"#).is_err());
         Ok(())
     }
@@ -432,6 +455,10 @@ mod tests {
         assert!(c.validate().is_err());
         let mut c = config()?;
         c.egress_cooldown_base_ms = 10;
+        assert!(c.validate().is_err());
+        let mut c = config()?;
+        c.egress_probe_interval_secs = 10;
+        c.egress_probe_degraded_interval_secs = 20;
         assert!(c.validate().is_err());
 
         let edge: Config = serde_json::from_str(

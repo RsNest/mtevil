@@ -34,7 +34,7 @@ const BUILD_VERSION: &str = match option_env!("MTEVIL_BUILD_VERSION") {
 struct Args {
     #[command(subcommand)]
     command: Option<Action>,
-    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms"])]
+    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms","egress_probe_interval_secs","egress_probe_degraded_interval_secs"])]
     config: Option<PathBuf>,
     #[arg(long)]
     check_config: bool,
@@ -95,6 +95,12 @@ struct Args {
     /// Maximum exponential backoff cooldown in milliseconds for an egress upstream or DC.
     #[arg(long)]
     egress_cooldown_max_ms: Option<u64>,
+    /// Background egress probe interval in seconds when all egress nodes are healthy.
+    #[arg(long)]
+    egress_probe_interval_secs: Option<u64>,
+    /// Background egress probe interval in seconds while at least one egress node is unavailable.
+    #[arg(long)]
+    egress_probe_degraded_interval_secs: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -209,6 +215,12 @@ impl Args {
             egress_cooldown_max_ms: self
                 .egress_cooldown_max_ms
                 .unwrap_or_else(config::default_egress_cooldown_max_ms),
+            egress_probe_interval_secs: self
+                .egress_probe_interval_secs
+                .unwrap_or_else(config::default_egress_probe_interval_secs),
+            egress_probe_degraded_interval_secs: self
+                .egress_probe_degraded_interval_secs
+                .unwrap_or_else(config::default_egress_probe_degraded_interval_secs),
         };
         config.validate()?;
         Ok(config)
@@ -306,6 +318,42 @@ impl EgressHealth {
         let total = h.node_failed.len();
         let healthy = h.node_failed.iter().filter(|failed| !**failed).count();
         (healthy, total)
+    }
+
+    fn apply_background_probe(
+        health: &std::sync::Mutex<EgressHealth>,
+        idx: usize,
+        dc_abs: i16,
+        available: bool,
+        base: Duration,
+        max: Duration,
+    ) {
+        let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
+        while h.nodes.len() <= idx {
+            h.nodes.push(CooldownSlot::default());
+        }
+        while h.node_failed.len() <= idx {
+            h.node_failed.push(false);
+        }
+        if available {
+            let slot = &mut h.nodes[idx];
+            slot.until = None;
+            slot.probing = false;
+            slot.failures = 0;
+            if let Some(dc_slot) = h.dc_slots.get_mut(&(idx, dc_abs)) {
+                dc_slot.until = None;
+                dc_slot.probing = false;
+                dc_slot.failures = 0;
+            }
+            h.node_failed[idx] = false;
+        } else {
+            let slot = &mut h.nodes[idx];
+            slot.failures = slot.failures.saturating_add(1);
+            let cooldown = compute_egress_cooldown(base, max, slot.failures);
+            slot.until = Some(Instant::now() + cooldown);
+            slot.probing = false;
+            h.node_failed[idx] = true;
+        }
     }
 
     fn transition_route_state(
@@ -543,6 +591,8 @@ struct State {
     egress_health: std::sync::Mutex<EgressHealth>,
     egress_cooldown: Duration,
     egress_cooldown_max: Duration,
+    egress_probe_interval: Duration,
+    egress_probe_degraded_interval: Duration,
     client_hello: Duration,
     handshake: Duration,
     idle: Duration,
@@ -695,21 +745,32 @@ fn emit_edge_route_alert(state: &State, ev: EdgeAlertEvent) {
     }
 }
 
+const BACKGROUND_PROBE_DCS: [i16; 4] = [2, 4, -2, -4];
+
 async fn monitor_edge_egress(state: Arc<State>, period: Duration) {
-    let mut interval = tokio::time::interval(period);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut previous = None;
     let mut confirmed = None;
+    let mut dc_rot: usize = 0;
+    let mut first = true;
+    let mut next_wait = period;
     loop {
-        interval.tick().await;
+        if !first {
+            tokio::time::sleep(next_wait).await;
+        }
+        first = false;
+        let probe_dc = BACKGROUND_PROBE_DCS[dc_rot % BACKGROUND_PROBE_DCS.len()];
+        dc_rot = dc_rot.wrapping_add(1);
         let mut probes = tokio::task::JoinSet::new();
         for (idx, &address) in state.egress_upstreams.iter().enumerate() {
             let token = state.egress_token;
             probes.spawn(async move {
                 let limit = Duration::from_secs(4);
-                let available = timeout(limit, probe_egress_endpoint(address, 0, &token, limit))
-                    .await
-                    .is_ok_and(|probe| probe.dc_reachable);
+                let available = timeout(
+                    limit,
+                    probe_egress_endpoint(address, probe_dc, &token, limit),
+                )
+                .await
+                .is_ok_and(|probe| probe.dc_reachable);
                 (idx, available)
             });
         }
@@ -717,8 +778,22 @@ async fn monitor_edge_egress(state: Arc<State>, period: Duration) {
         while let Some(result) = probes.join_next().await {
             if let Ok((idx, ok)) = result {
                 available[idx] = ok;
+                EgressHealth::apply_background_probe(
+                    &state.egress_health,
+                    idx,
+                    probe_dc.abs(),
+                    ok,
+                    state.egress_cooldown,
+                    state.egress_cooldown_max,
+                );
             }
         }
+        let any_down = available.iter().any(|ok| !*ok);
+        next_wait = if any_down {
+            state.egress_probe_degraded_interval.min(period)
+        } else {
+            period
+        };
         let route = match available.iter().position(|ok| *ok) {
             None => EdgeRouteState::AllDown,
             Some(0) if state.egress_strategy == EgressStrategy::Ordered => {
@@ -737,8 +812,7 @@ async fn monitor_edge_egress(state: Arc<State>, period: Duration) {
                 }
             }
         };
-        // A single transient probe should not trigger an alert. Keep the live
-        // per-DC cooldowns independent from this DC2 observation.
+        // A single transient probe should not trigger an alert; require two consecutive matching observations.
         if previous == Some(route) && confirmed != Some(route) {
             confirmed = Some(route);
             if let Some(event) = EgressHealth::transition_route_state(
@@ -1464,6 +1538,10 @@ async fn main() -> Result<()> {
         egress_health: std::sync::Mutex::new(EgressHealth::new(egress_count)),
         egress_cooldown: Duration::from_millis(config.egress_cooldown_base_ms),
         egress_cooldown_max: Duration::from_millis(config.egress_cooldown_max_ms),
+        egress_probe_interval: Duration::from_secs(config.egress_probe_interval_secs),
+        egress_probe_degraded_interval: Duration::from_secs(
+            config.egress_probe_degraded_interval_secs,
+        ),
         client_hello: Duration::from_secs(config.client_hello_timeout_secs),
         handshake: Duration::from_secs(config.handshake_timeout_secs),
         idle: Duration::from_secs(config.idle_timeout_secs),
@@ -1553,8 +1631,10 @@ async fn main() -> Result<()> {
             }
         })
     });
-    let egress_monitor = (!state.egress_upstreams.is_empty())
-        .then(|| tokio::spawn(monitor_edge_egress(state.clone(), Duration::from_secs(30))));
+    let egress_monitor = (!state.egress_upstreams.is_empty()).then(|| {
+        let interval = state.egress_probe_interval;
+        tokio::spawn(monitor_edge_egress(state.clone(), interval))
+    });
     let (users_stop_tx, users_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let users_task = reload_config
         .map(|cfg| spawn_users_reloader(state.clone(), cfg, Duration::from_secs(1), users_stop_rx));
