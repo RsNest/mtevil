@@ -94,6 +94,8 @@ pub struct Counters {
     pub dc_self_check_ok: AtomicU64,
     pub dc_self_check_failed: AtomicU64,
     pub cover_dns_fail: AtomicU64,
+    pub egress_legacy_connections: AtomicU64,
+    pub egress_mtv3_connections: AtomicU64,
 }
 
 impl Counters {
@@ -156,6 +158,8 @@ impl Counters {
             "dc_self_check_ok": self.dc_self_check_ok.load(Ordering::Relaxed),
             "dc_self_check_failed": self.dc_self_check_failed.load(Ordering::Relaxed),
             "cover_dns_fail": self.cover_dns_fail.load(Ordering::Relaxed),
+            "egress_legacy_connections": self.egress_legacy_connections.load(Ordering::Relaxed),
+            "egress_mtv3_connections": self.egress_mtv3_connections.load(Ordering::Relaxed),
         })
     }
 
@@ -235,6 +239,28 @@ impl Counters {
             out,
             "mtevil_egress_failover_total {}",
             self.egress_failover_total.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_egress_legacy_connections_total Authenticated legacy MTV2 connections accepted by egress"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_egress_legacy_connections_total counter");
+        let _ = writeln!(
+            out,
+            "mtevil_egress_legacy_connections_total {}",
+            self.egress_legacy_connections.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_egress_mtv3_connections_total Authenticated MTV3 connections accepted by egress"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_egress_mtv3_connections_total counter");
+        let _ = writeln!(
+            out,
+            "mtevil_egress_mtv3_connections_total {}",
+            self.egress_mtv3_connections.load(Ordering::Relaxed)
         );
 
         let _ = writeln!(

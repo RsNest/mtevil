@@ -1983,6 +1983,24 @@ def run_status_command(deploy_dir: Path) -> int:
     print(f"  Состояние:         {health_status}")
     print(f"  Время работы:      {uptime_str}")
     print(f"  Версия для отката: {rollback_ver}")
+    if role == "egress":
+        accept_legacy = saved_cfg.get("egress_accept_legacy", True) is not False
+        proto_mode = "MTV3 + legacy MTV2 (переходный)" if accept_legacy else "MTV3 only (строгий)"
+        print(f"  Протокол egress:   {proto_mode}")
+        if running:
+            rstats = read_container_runtime_stats(base, svc)
+            if isinstance(rstats, dict):
+                mtv3_cnt = rstats.get("egress_mtv3_connections")
+                legacy_cnt = rstats.get("egress_legacy_connections")
+                if mtv3_cnt is not None or legacy_cnt is not None:
+                    print(
+                        f"  Подключения:       MTV3={int(mtv3_cnt or 0)}, legacy MTV2={int(legacy_cnt or 0)}"
+                    )
+        if accept_legacy:
+            print(
+                "  Подсказка MTV3:    после обновления всех edge выставите "
+                '"egress_accept_legacy": false в config.json и перезапустите egress.'
+            )
     if role == "edge" and running:
         alerts_proc = run(
             base + ["exec", "-T", svc, "/bin/cat", "/var/lib/mtevil/edge-alerts.jsonl"],
@@ -3263,7 +3281,8 @@ def main(argv: list[str] | None = None) -> int:
         print("\n" + heading("Что указать на входном сервере (edge)"))
         print(f"  Адрес выхода: {bind_ip}:{pub_port}")
         print("  Режим в мастере на edge: 2 (Расширенная настройка) -> 2 (edge)")
-        print(f"  Получить токен MTV2 безопасно: docker compose {compose_ref} exec -T {compose_service(base)} cat /var/lib/mtevil/egress-token")
+        print(f"  Получить токен безопасно: docker compose {compose_ref} exec -T {compose_service(base)} cat /var/lib/mtevil/egress-token")
+        print("  Миграция на MTV3: сначала обновите egress, затем все edge; после этого выставите \"egress_accept_legacy\": false в config.json egress.")
         print()
         print(f"Каталог установки: {deploy_dir}")
         print(f"Проверка статуса:  {status_cmd}")

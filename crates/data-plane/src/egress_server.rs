@@ -304,6 +304,7 @@ pub(crate) async fn egress_connection(
             security.record_auth_failure(peer_ip);
             bail!("egress MTV3 nonce replay detected");
         }
+        counters.egress_mtv3_connections.fetch_add(1, Relaxed);
         (parsed.dc, Some(parsed.dc_header))
     } else if magic == wire::EGRESS_MAGIC_V2 {
         if !security.cfg.accept_legacy {
@@ -328,6 +329,7 @@ pub(crate) async fn egress_connection(
             bail!("egress token mismatch");
         }
         let dc_id = i16::from_le_bytes([rest[0], rest[1]]);
+        counters.egress_legacy_connections.fetch_add(1, Relaxed);
         (dc_id, None)
     } else {
         security.record_auth_failure(peer_ip);

@@ -3306,6 +3306,8 @@ async fn metrics_endpoint_serves_prometheus_text_and_returns_404_on_other_paths(
     st.counters.replay_full.store(6, Relaxed);
     st.counters.replay_flush_failed.store(7, Relaxed);
     st.counters.forced_close.store(8, Relaxed);
+    st.counters.egress_legacy_connections.store(9, Relaxed);
+    st.counters.egress_mtv3_connections.store(10, Relaxed);
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -3337,6 +3339,8 @@ async fn metrics_endpoint_serves_prometheus_text_and_returns_404_on_other_paths(
         "mtevil_replay_full_total 6",
         "mtevil_replay_flush_failed_total 7",
         "mtevil_forced_close_total 8",
+        "mtevil_egress_legacy_connections_total 9",
+        "mtevil_egress_mtv3_connections_total 10",
         "mtevil_fd_limit 4096",
         "mtevil_fd_used ",
     ] {
