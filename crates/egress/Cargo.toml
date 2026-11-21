@@ -2,6 +2,7 @@
 name = "mtevil-egress"
 version = "0.1.0"
 edition.workspace = true
+license.workspace = true
 description = "Egress failover cooldown backoff and jitter primitives for mtevil"
 
 [dependencies]

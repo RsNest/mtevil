@@ -2,6 +2,7 @@
 name = "mtevil-harness"
 version = "0.1.0"
 edition.workspace = true
+license.workspace = true
 description = "Phase 0 harness: wire-корпус, генератор нагрузки, стенд, сбор, отчёты (docs/specs/phase-0.md)"
 
 [dependencies]

@@ -2,6 +2,7 @@
 name = "mtevil-guard"
 version = "0.1.0"
 edition.workspace = true
+license.workspace = true
 description = "Replay protection cache and admission guard primitives for mtevil"
 
 [dependencies]

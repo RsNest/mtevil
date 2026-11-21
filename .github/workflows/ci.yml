@@ -69,10 +69,15 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
 
       - name: Run fuzz targets
         run: |
+          if ! command -v cargo-fuzz >/dev/null 2>&1; then
+            cargo install cargo-fuzz --locked
+          fi
           for target in fuzz_client_hello fuzz_proxy_v2 fuzz_obfuscated2_init fuzz_egress_preface; do
             echo "=== Fuzzing ${target} (60s) ==="
             cargo +nightly fuzz run "${target}" -- -max_total_time=60
