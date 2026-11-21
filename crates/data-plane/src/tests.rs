@@ -3392,3 +3392,29 @@ async fn inv02_replay_flush_failure_increments_metric() -> Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
+
+#[tokio::test]
+async fn inv10_f29_graceful_shutdown_completes_within_drain_timeout() -> Result<()> {
+    let cover = cover_mock().await?;
+    let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
+    Arc::get_mut(&mut st).context("unique state")?.drain = Duration::from_millis(250);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let srv = tokio::spawn(serve(listener, st.clone(), 16, async move {
+        let _ = stop_rx.await;
+    }));
+
+    let _held = TcpStream::connect(addr).await?;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    let t0 = Instant::now();
+    let _ = stop_tx.send(());
+    timeout(Duration::from_secs(2), srv).await???;
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed <= Duration::from_millis(900),
+        "serve() shutdown exceeded drain_timeout=250ms: {elapsed:?}"
+    );
+    Ok(())
+}

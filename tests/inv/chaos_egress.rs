@@ -548,3 +548,45 @@ async fn inv10_f15_f29_process_survives_aborted_accepts_and_metrics_live() -> Re
     dc_task.abort();
     Ok(())
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inv10_f29_graceful_shutdown_sigterm_within_drain_timeout() -> Result<()> {
+    let tmp = TempDirGuard::new("chaos-f29-sigterm")?;
+    let secret_path = tmp.0.join("secret");
+    std::fs::write(&secret_path, "000102030405060708090a0b0c0d0e0f\n")?;
+
+    let (dc_addr, dc_task) = spawn_mock_telegram_dc().await?;
+    let proxy_addr = reserve_local_port().await?;
+
+    let cfg_path = tmp.0.join("direct-drain.json");
+    let cfg = serde_json::json!({
+        "role": "direct",
+        "listen": proxy_addr.to_string(),
+        "secret_file": secret_path.to_string_lossy(),
+        "sni": "example.com",
+        "cover": dc_addr.to_string(),
+        "dc": [format!("2={dc_addr}")],
+        "drain_timeout_secs": 1
+    });
+    std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg)?)?;
+
+    let mut proc = spawn_mtevil_with_config(&cfg_path)?;
+    wait_port_ready(proxy_addr, Duration::from_secs(3)).await?;
+
+    let _held = TcpStream::connect(proxy_addr).await?;
+    let pid = proc.0.id().to_string();
+    let t0 = std::time::Instant::now();
+    let status = Command::new("kill").args(["-TERM", &pid]).status()?;
+    assert!(status.success(), "kill -TERM failed");
+
+    let exit = tokio::task::spawn_blocking(move || proc.0.wait()).await??;
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed <= Duration::from_millis(2500),
+        "graceful SIGTERM shutdown exceeded drain_timeout=1s: {elapsed:?}"
+    );
+    let _ = exit;
+    dc_task.abort();
+    Ok(())
+}
