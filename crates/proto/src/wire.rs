@@ -465,14 +465,13 @@ pub fn authenticate_with_record_version(
                 let n = list.u16()?;
                 let name = list.take(n)?;
                 if ty == 0 {
-                    sni_ok = !name.is_empty()
-                        && sni
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .any(|allowed| {
-                                allowed == "*" || name.eq_ignore_ascii_case(allowed.as_bytes())
-                            });
+                    sni_ok =
+                        !name.is_empty()
+                            && sni.split(',').map(str::trim).filter(|s| !s.is_empty()).any(
+                                |allowed| {
+                                    allowed == "*" || name.eq_ignore_ascii_case(allowed.as_bytes())
+                                },
+                            );
                 }
             }
         } else if kind == 0x2b {
@@ -743,7 +742,10 @@ pub fn verify_server_flight(
 ) -> Result<()> {
     ensure!(flight.len() >= 138, "server flight too short");
     ensure!(flight[0] == 0x16, "first server record is not Handshake");
-    ensure!(&flight[44..76] == client_session, "server session id mismatch");
+    ensure!(
+        &flight[44..76] == client_session,
+        "server session id mismatch"
+    );
     let received: [u8; 32] = flight[11..43].try_into()?;
     let mut zeroed = flight.to_vec();
     zeroed[11..43].fill(0);
@@ -777,9 +779,7 @@ pub fn build_client_init(secret: &[u8; 16], dc: i16) -> Result<([u8; 64], AesCtr
             &[0xdd; 4],
             &[0x16, 3, 1, 2],
         ];
-        if plain[0] != 0xef
-            && plain[4..8] != [0; 4]
-            && !forbidden.iter().any(|v| plain[..4] == **v)
+        if plain[0] != 0xef && plain[4..8] != [0; 4] && !forbidden.iter().any(|v| plain[..4] == **v)
         {
             break;
         }
@@ -800,6 +800,85 @@ pub const MAX_PROXY_V2_PAYLOAD: usize = 1024;
 const PROXY_V2_SIG: [u8; 12] = [
     0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a,
 ];
+
+pub const EGRESS_MAGIC_V2: [u8; 4] = *b"MTV2";
+pub const EGRESS_MAGIC_V3: [u8; 4] = *b"MTV3";
+pub const EGRESS_PREFACE_V2_LEN: usize = 88;
+pub const EGRESS_PREFACE_V3_LEN: usize = 126;
+pub const EGRESS_V3_MAX_SKEW_SECS: u64 = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EgressPrefaceV3 {
+    pub dc: i16,
+    pub timestamp: u64,
+    pub nonce: [u8; 16],
+    pub dc_header: [u8; 64],
+}
+
+pub fn build_egress_preface_v3(
+    token: &[u8; 16],
+    dc: i16,
+    timestamp: u64,
+    nonce: &[u8; 16],
+    dc_header: &[u8; 64],
+) -> Result<[u8; EGRESS_PREFACE_V3_LEN]> {
+    let mut signed = [0u8; 94];
+    signed[..4].copy_from_slice(&EGRESS_MAGIC_V3);
+    signed[4..6].copy_from_slice(&dc.to_le_bytes());
+    signed[6..14].copy_from_slice(&timestamp.to_le_bytes());
+    signed[14..30].copy_from_slice(nonce);
+    signed[30..94].copy_from_slice(dc_header);
+    let tag = mac(token, &signed)?;
+    let mut out = [0u8; EGRESS_PREFACE_V3_LEN];
+    out[..30].copy_from_slice(&signed[..30]);
+    out[30..62].copy_from_slice(&tag);
+    out[62..126].copy_from_slice(dc_header);
+    Ok(out)
+}
+
+pub fn verify_egress_preface_v3(
+    preface: &[u8; EGRESS_PREFACE_V3_LEN],
+    token: &[u8; 16],
+    now_secs: u64,
+    max_skew_secs: u64,
+) -> Result<EgressPrefaceV3> {
+    ensure!(preface[..4] == EGRESS_MAGIC_V3, "invalid MTV3 magic");
+    let dc = i16::from_le_bytes([preface[4], preface[5]]);
+    let timestamp = u64::from_le_bytes([
+        preface[6],
+        preface[7],
+        preface[8],
+        preface[9],
+        preface[10],
+        preface[11],
+        preface[12],
+        preface[13],
+    ]);
+    let mut nonce = [0u8; 16];
+    nonce.copy_from_slice(&preface[14..30]);
+    let received_tag = &preface[30..62];
+    let mut dc_header = [0u8; 64];
+    dc_header.copy_from_slice(&preface[62..126]);
+
+    let mut signed = [0u8; 94];
+    signed[..30].copy_from_slice(&preface[..30]);
+    signed[30..94].copy_from_slice(&dc_header);
+    let expected_tag = mac(token, &signed)?;
+    ensure!(
+        bool::from(received_tag.ct_eq(&expected_tag)),
+        "egress MTV3 HMAC mismatch"
+    );
+    ensure!(
+        now_secs.abs_diff(timestamp) <= max_skew_secs,
+        "egress MTV3 timestamp out of window"
+    );
+    Ok(EgressPrefaceV3 {
+        dc,
+        timestamp,
+        nonce,
+        dc_header,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProxyV2Header {
@@ -1127,6 +1206,39 @@ mod tests {
         hdr[14..16].copy_from_slice(&8u16.to_be_bytes());
         let short = parse_proxy_v2_header(&hdr)?;
         assert!(parse_proxy_v2_payload(&short, &[0u8; 8]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn egress_preface_v3_builds_verifies_and_rejects_hmac_tampering_or_skew() -> Result<()> {
+        let token = [0x42u8; 16];
+        let nonce = [0x99u8; 16];
+        let dc_hdr = [0xaau8; 64];
+        let now = 1_700_000_000u64;
+        let preface = build_egress_preface_v3(&token, -2, now, &nonce, &dc_hdr)?;
+        assert_eq!(&preface[..4], b"MTV3");
+        let parsed = verify_egress_preface_v3(&preface, &token, now + 30, EGRESS_V3_MAX_SKEW_SECS)?;
+        assert_eq!(parsed.dc, -2);
+        assert_eq!(parsed.timestamp, now);
+        assert_eq!(parsed.nonce, nonce);
+        assert_eq!(parsed.dc_header, dc_hdr);
+
+        // Wrong token
+        assert!(
+            verify_egress_preface_v3(&preface, &[0x43u8; 16], now, EGRESS_V3_MAX_SKEW_SECS)
+                .is_err()
+        );
+        // Timestamp outside ±30s window
+        assert!(
+            verify_egress_preface_v3(&preface, &token, now + 31, EGRESS_V3_MAX_SKEW_SECS).is_err()
+        );
+        assert!(
+            verify_egress_preface_v3(&preface, &token, now - 31, EGRESS_V3_MAX_SKEW_SECS).is_err()
+        );
+        // Tampered dc_header
+        let mut tampered = preface;
+        tampered[125] ^= 0x01;
+        assert!(verify_egress_preface_v3(&tampered, &token, now, EGRESS_V3_MAX_SKEW_SECS).is_err());
         Ok(())
     }
 }

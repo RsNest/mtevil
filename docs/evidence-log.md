@@ -983,3 +983,11 @@ wire-точность. Перебор высоких портов сгорает
   - В `Config` и CLI добавлен `egress_hedge_ms` (default `400`, `0` = выкл, `0..=30000`).
   - В режиме `ordered`, если основной `egress` не прислал ACK за `egress_hedge_ms`, параллельно запускается подключение к следующему доступному узлу (не более одного хеджа на соединение); побеждает первый полученный ACK, проигравшая попытка отменяется и закрывает сокет.
   - В `Counters` добавлены счётчики `hedge_started` и `hedge_won_by_backup`. Тест `hedged_connect_starts_backup_after_hedge_ms_and_tracks_metrics` зелёный.
+
+
+## 2026-11-22 · Фаза 2 / T8: Протокол egress `MTV3` и защита `egress` (`F-31`)
+
+- В `crates/proto/src/wire.rs` добавлен протокол `MTV3` (`126` байт): `magic ("MTV3") | dc (i16 LE) | timestamp (u64 LE) | nonce (16B) | HMAC-SHA256(token, magic||dc||timestamp||nonce||dc_header) (32B) | dc_header (64B)` с constant-time проверкой (`subtle::ConstantTimeEq`) и окном `±30 с` (`EGRESS_V3_MAX_SKEW_SECS`).
+- В `Config` и CLI добавлены `egress_accept_legacy` (default `true`, сохраняет приём `MTV2` при обновлении `egress` до `edge`), `egress_use_mtv3` (default `true`), `egress_allow_from` (список CIDR, default пусто) и `egress_max_failed_per_ip` (default `16`, окно 60 с).
+- На `egress` добавлены: replay-кэш `nonce` (`16384` записи, TTL `65 с`), фильтрация источников по `egress_allow_from`, sliding-window лимит неудачных handshake на IP, отдельный семафор одновременных незавершённых handshake (`(effective_max / 4).clamp(4, 128)`) и событие `egress_public_listen_warning` при привязке не к loopback/приватному/CGNAT адресу.
+- Тесты `egress_preface_v3_builds_verifies_and_rejects_hmac_tampering_or_skew` и `egress_mtv3_verifies_hmac_rejects_replay_skew_legacy_toggle_and_security_limits` зелёные (78/78 тестов workspace).

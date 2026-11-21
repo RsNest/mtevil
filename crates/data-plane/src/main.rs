@@ -34,7 +34,7 @@ const BUILD_VERSION: &str = match option_env!("MTEVIL_BUILD_VERSION") {
 struct Args {
     #[command(subcommand)]
     command: Option<Action>,
-    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms","egress_probe_interval_secs","egress_probe_degraded_interval_secs","egress_hedge_ms"])]
+    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms","egress_probe_interval_secs","egress_probe_degraded_interval_secs","egress_hedge_ms","egress_accept_legacy","egress_use_mtv3","egress_allow_from","egress_max_failed_per_ip"])]
     config: Option<PathBuf>,
     #[arg(long)]
     check_config: bool,
@@ -104,6 +104,18 @@ struct Args {
     /// Hedged connect delay in milliseconds for ordered egress strategy (0 = disabled).
     #[arg(long)]
     egress_hedge_ms: Option<u64>,
+    /// Whether egress accepts legacy MTV2 prefaces alongside MTV3.
+    #[arg(long)]
+    egress_accept_legacy: Option<bool>,
+    /// Whether edge uses MTV3 when dialing egress.
+    #[arg(long)]
+    egress_use_mtv3: Option<bool>,
+    /// Optional CIDR source allowlist on egress.
+    #[arg(long)]
+    egress_allow_from: Vec<String>,
+    /// Maximum failed authentication attempts per source IP within a 60s sliding window on egress.
+    #[arg(long)]
+    egress_max_failed_per_ip: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -227,6 +239,16 @@ impl Args {
             egress_hedge_ms: self
                 .egress_hedge_ms
                 .unwrap_or_else(config::default_egress_hedge_ms),
+            egress_accept_legacy: self
+                .egress_accept_legacy
+                .unwrap_or_else(config::default_egress_accept_legacy),
+            egress_use_mtv3: self
+                .egress_use_mtv3
+                .unwrap_or_else(config::default_egress_use_mtv3),
+            egress_allow_from: self.egress_allow_from,
+            egress_max_failed_per_ip: self
+                .egress_max_failed_per_ip
+                .unwrap_or_else(config::default_egress_max_failed_per_ip),
         };
         config.validate()?;
         Ok(config)
@@ -600,6 +622,7 @@ struct State {
     egress_probe_interval: Duration,
     egress_probe_degraded_interval: Duration,
     egress_hedge_ms: u64,
+    egress_use_mtv3: bool,
     client_hello: Duration,
     handshake: Duration,
     idle: Duration,
@@ -770,11 +793,12 @@ async fn monitor_edge_egress(state: Arc<State>, period: Duration) {
         let mut probes = tokio::task::JoinSet::new();
         for (idx, &address) in state.egress_upstreams.iter().enumerate() {
             let token = state.egress_token;
+            let use_mtv3 = state.egress_use_mtv3;
             probes.spawn(async move {
                 let limit = Duration::from_secs(4);
                 let available = timeout(
                     limit,
-                    probe_egress_endpoint(address, probe_dc, &token, limit),
+                    probe_egress_endpoint_proto(address, probe_dc, &token, limit, use_mtv3),
                 )
                 .await
                 .is_ok_and(|probe| probe.dc_reachable);
@@ -1362,7 +1386,14 @@ async fn main() -> Result<()> {
                 let mut results = Vec::with_capacity(config.egress_upstreams.len());
                 let mut all_ok = true;
                 for addr in &config.egress_upstreams {
-                    let probe = probe_egress_endpoint(*addr, dc, &token, per_try).await;
+                    let probe = probe_egress_endpoint_proto(
+                        *addr,
+                        dc,
+                        &token,
+                        per_try,
+                        config.egress_use_mtv3,
+                    )
+                    .await;
                     if !probe.dc_reachable {
                         all_ok = false;
                     }
@@ -1453,18 +1484,33 @@ async fn main() -> Result<()> {
         let rlimit_nofile = detect_rlimit_nofile();
         let effective_max =
             compute_effective_max_connections(config.max_connections, rlimit_nofile)?;
+        let allow_from = config.parsed_egress_allow_from()?;
         let listener = bind_listener(config.listen, None)?;
+        let local_addr = listener.local_addr()?;
+        if !config::is_loopback_or_private_ip(local_addr.ip()) {
+            telemetry::event(
+                "egress_public_listen_warning",
+                0,
+                json!({
+                    "listen": local_addr.to_string(),
+                    "allowlist_empty": allow_from.is_empty(),
+                    "warning": "egress listener is bound to a non-private/non-loopback address"
+                }),
+            );
+        }
         telemetry::event(
             "startup",
             0,
             json!({
                 "version":BUILD_VERSION,
                 "role":"egress",
-                "listen":listener.local_addr()?.to_string(),
+                "listen":local_addr.to_string(),
                 "max_connections":config.max_connections,
                 "effective_max_connections":effective_max,
                 "rlimit_nofile":rlimit_nofile,
                 "authenticated":config.egress_token_file.is_some(),
+                "accept_legacy_mtv2":config.egress_accept_legacy,
+                "allow_from_cidrs":allow_from.len(),
                 "test_only":true
             }),
         );
@@ -1478,10 +1524,17 @@ async fn main() -> Result<()> {
             Duration::from_millis(500),
             stats_stop_rx,
         );
+        let security = EgressSecurityConfig {
+            accept_legacy: config.egress_accept_legacy,
+            allow_from,
+            max_failed_per_ip: config.egress_max_failed_per_ip,
+            failed_window: Duration::from_secs(60),
+            max_unauth_handshakes: (effective_max / 4).clamp(4, 128),
+        };
         #[cfg(unix)]
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let res = serve_egress(
+        let res = serve_egress_with_security(
             listener,
             Arc::new(dcs),
             egress_token,
@@ -1490,6 +1543,7 @@ async fn main() -> Result<()> {
             Duration::from_secs(config.idle_timeout_secs),
             Duration::from_secs(config.drain_timeout_secs),
             counters,
+            security,
             async {
                 #[cfg(unix)]
                 tokio::select! {
@@ -1550,6 +1604,7 @@ async fn main() -> Result<()> {
             config.egress_probe_degraded_interval_secs,
         ),
         egress_hedge_ms: config.egress_hedge_ms,
+        egress_use_mtv3: config.egress_use_mtv3,
         client_hello: Duration::from_secs(config.client_hello_timeout_secs),
         handshake: Duration::from_secs(config.handshake_timeout_secs),
         idle: Duration::from_secs(config.idle_timeout_secs),
@@ -3143,11 +3198,45 @@ struct EgressProbe {
     detail: String,
 }
 
+fn build_egress_wire_preface(
+    token: &[u8; 16],
+    dc_id: i16,
+    dc_header: &[u8; 64],
+    use_mtv3: bool,
+) -> Result<Vec<u8>> {
+    if use_mtv3 {
+        use rand::RngCore;
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let mut nonce = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let preface = wire::build_egress_preface_v3(token, dc_id, now_secs, &nonce, dc_header)?;
+        Ok(preface.to_vec())
+    } else {
+        let mut preface = vec![0u8; wire::EGRESS_PREFACE_V2_LEN];
+        preface[..4].copy_from_slice(&EGRESS_MAGIC);
+        preface[4..6].copy_from_slice(&dc_id.to_le_bytes());
+        preface[8..24].copy_from_slice(token);
+        preface[24..88].copy_from_slice(dc_header);
+        Ok(preface)
+    }
+}
+
+#[cfg(test)]
 async fn probe_egress_endpoint(
     addr: SocketAddr,
     dc_id: i16,
     token: &[u8; 16],
     limit: Duration,
+) -> EgressProbe {
+    probe_egress_endpoint_proto(addr, dc_id, token, limit, false).await
+}
+
+async fn probe_egress_endpoint_proto(
+    addr: SocketAddr,
+    dc_id: i16,
+    token: &[u8; 16],
+    limit: Duration,
+    use_mtv3: bool,
 ) -> EgressProbe {
     let mut stream = match timeout(limit, TcpStream::connect(addr)).await {
         Ok(Ok(s)) => s,
@@ -3179,11 +3268,17 @@ async fn probe_egress_endpoint(
             };
         }
     };
-    let mut preface = [0u8; 88];
-    preface[..4].copy_from_slice(&EGRESS_MAGIC);
-    preface[4..6].copy_from_slice(&dc_id.to_le_bytes());
-    preface[8..24].copy_from_slice(token);
-    preface[24..88].copy_from_slice(&dc.header);
+    let preface = match build_egress_wire_preface(token, dc_id, &dc.header, use_mtv3) {
+        Ok(p) => p,
+        Err(err) => {
+            return EgressProbe {
+                tcp_reachable: true,
+                token_status: "unknown",
+                dc_reachable: false,
+                detail: format!("preface_build_error: {err:#}"),
+            };
+        }
+    };
     if let Err(err) = timeout(limit, stream.write_all(&preface)).await {
         return EgressProbe {
             tcp_reachable: true,
@@ -3310,14 +3405,17 @@ async fn probe_telegram_e2e(
             let mut stream = TcpStream::connect(addr)
                 .await
                 .with_context(|| format!("connecting to egress {addr}"))?;
-            let mut preface = [0u8; 88];
-            preface[..4].copy_from_slice(&EGRESS_MAGIC);
-            preface[4..6].copy_from_slice(&dc_id.to_le_bytes());
-            preface[8..24].copy_from_slice(&token);
-            preface[24..88].copy_from_slice(&dc.header);
-            stream.write_all(&preface).await.context("writing MTV2 preface")?;
+            let preface =
+                build_egress_wire_preface(&token, dc_id, &dc.header, cfg.egress_use_mtv3)?;
+            stream
+                .write_all(&preface)
+                .await
+                .context("writing egress preface")?;
             let mut ack = [0u8; 1];
-            stream.read_exact(&mut ack).await.context("reading MTV2 ACK")?;
+            stream
+                .read_exact(&mut ack)
+                .await
+                .context("reading egress ACK")?;
             ensure!(ack[0] == EGRESS_ACK_OK, "egress returned negative ACK for DC {dc_id}");
             wire::crypt(&mut dc.encrypt, &mut req_frame);
             stream.write_all(&req_frame).await.context("sending req_pq_multi")?;
@@ -3503,11 +3601,9 @@ async fn dial_egress_candidate(
             .await
             .map_err(|e| EgressAttemptErr::Node(e.into()))?;
         configure_tcp_socket(&upstream).map_err(EgressAttemptErr::Node)?;
-        let mut preface = [0u8; 88];
-        preface[..4].copy_from_slice(&EGRESS_MAGIC);
-        preface[4..6].copy_from_slice(&dc_id.to_le_bytes());
-        preface[8..24].copy_from_slice(&state.egress_token);
-        preface[24..88].copy_from_slice(dc_header);
+        let preface =
+            build_egress_wire_preface(&state.egress_token, dc_id, dc_header, state.egress_use_mtv3)
+                .map_err(EgressAttemptErr::Node)?;
         upstream
             .write_all(&preface)
             .await
@@ -3872,9 +3968,140 @@ async fn connect_upstream(
     .context("egress_budget_timeout")?
 }
 
+#[derive(Clone)]
+struct EgressSecurityConfig {
+    accept_legacy: bool,
+    allow_from: Vec<config::IpCidr>,
+    max_failed_per_ip: usize,
+    failed_window: Duration,
+    max_unauth_handshakes: usize,
+}
+
+impl EgressSecurityConfig {
+    #[cfg(test)]
+    fn default_for(max_connections: usize) -> Self {
+        Self {
+            accept_legacy: true,
+            allow_from: Vec::new(),
+            max_failed_per_ip: config::default_egress_max_failed_per_ip(),
+            failed_window: Duration::from_secs(60),
+            max_unauth_handshakes: (max_connections / 4).clamp(4, 128),
+        }
+    }
+
+    fn allows_ip(&self, ip: std::net::IpAddr) -> bool {
+        self.allow_from.is_empty() || self.allow_from.iter().any(|cidr| cidr.contains(ip))
+    }
+}
+
+struct IpFailureTracker {
+    entries: HashMap<std::net::IpAddr, std::collections::VecDeque<Instant>>,
+    window: Duration,
+    max_failed: usize,
+}
+
+impl IpFailureTracker {
+    fn new(window: Duration, max_failed: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            window,
+            max_failed,
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        let window = self.window;
+        self.entries.retain(|_, q| {
+            while let Some(&front) = q.front() {
+                if now.duration_since(front) >= window {
+                    q.pop_front();
+                } else {
+                    break;
+                }
+            }
+            !q.is_empty()
+        });
+    }
+
+    fn is_rate_limited(&mut self, ip: std::net::IpAddr, now: Instant) -> bool {
+        let window = self.window;
+        if let Some(q) = self.entries.get_mut(&ip) {
+            while let Some(&front) = q.front() {
+                if now.duration_since(front) >= window {
+                    q.pop_front();
+                } else {
+                    break;
+                }
+            }
+            return q.len() >= self.max_failed;
+        }
+        false
+    }
+
+    fn record_failure(&mut self, ip: std::net::IpAddr, now: Instant) {
+        if self.entries.len() >= 4096 {
+            self.prune(now);
+        }
+        if self.entries.len() >= 4096 && !self.entries.contains_key(&ip) {
+            return;
+        }
+        let window = self.window;
+        let q = self.entries.entry(ip).or_default();
+        while let Some(&front) = q.front() {
+            if now.duration_since(front) >= window {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+        if q.len() < self.max_failed.saturating_add(1) {
+            q.push_back(now);
+        }
+    }
+}
+
+struct EgressRuntimeSecurity {
+    cfg: EgressSecurityConfig,
+    unauth_permits: Semaphore,
+    nonce_replay: Mutex<ReplayCache>,
+    failed_by_ip: std::sync::Mutex<IpFailureTracker>,
+}
+
+impl EgressRuntimeSecurity {
+    fn new(cfg: EgressSecurityConfig) -> Self {
+        let max_unauth = cfg.max_unauth_handshakes.max(1);
+        let failed_tracker = IpFailureTracker::new(cfg.failed_window, cfg.max_failed_per_ip);
+        Self {
+            cfg,
+            unauth_permits: Semaphore::new(max_unauth),
+            nonce_replay: Mutex::new(ReplayCache::new(16384, Duration::from_secs(65))),
+            failed_by_ip: std::sync::Mutex::new(failed_tracker),
+        }
+    }
+
+    fn check_peer_allowed(&self, ip: std::net::IpAddr) -> Result<()> {
+        ensure!(
+            self.cfg.allows_ip(ip),
+            "egress source IP not in egress_allow_from"
+        );
+        let mut tracker = self.failed_by_ip.lock().unwrap_or_else(|e| e.into_inner());
+        ensure!(
+            !tracker.is_rate_limited(ip, Instant::now()),
+            "egress source IP rate-limited due to failed handshakes"
+        );
+        Ok(())
+    }
+
+    fn record_auth_failure(&self, ip: std::net::IpAddr) {
+        let mut tracker = self.failed_by_ip.lock().unwrap_or_else(|e| e.into_inner());
+        tracker.record_failure(ip, Instant::now());
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn serve_egress(
-    mut listener: impl Acceptor,
+    listener: impl Acceptor,
     dcs: Arc<HashMap<i16, SocketAddr>>,
     egress_token: [u8; 16],
     max_connections: usize,
@@ -3884,7 +4111,36 @@ async fn serve_egress(
     counters: Arc<telemetry::Counters>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
+    serve_egress_with_security(
+        listener,
+        dcs,
+        egress_token,
+        max_connections,
+        handshake,
+        idle,
+        drain,
+        counters,
+        EgressSecurityConfig::default_for(max_connections),
+        shutdown,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_egress_with_security(
+    mut listener: impl Acceptor,
+    dcs: Arc<HashMap<i16, SocketAddr>>,
+    egress_token: [u8; 16],
+    max_connections: usize,
+    handshake: Duration,
+    idle: Duration,
+    drain: Duration,
+    counters: Arc<telemetry::Counters>,
+    security: EgressSecurityConfig,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()> {
     let permits = Arc::new(Semaphore::new(max_connections));
+    let runtime_sec = Arc::new(EgressRuntimeSecurity::new(security));
     let mut tasks = tokio::task::JoinSet::new();
     let mut accept_state = AcceptLoopState::default();
     tokio::pin!(shutdown);
@@ -3898,21 +4154,31 @@ async fn serve_egress(
             accepted = listener.accept_conn() => accepted,
             _ = &mut shutdown => break,
         };
-        let mut edge = match accept_state
+        let (mut edge, peer_addr) = match accept_state
             .handle_result(accepted, &counters, &mut shutdown)
             .await?
         {
-            AcceptDecision::Accepted((socket, _)) => socket,
+            AcceptDecision::Accepted(pair) => pair,
             AcceptDecision::Retry => continue,
             AcceptDecision::Shutdown => break,
         };
         let dcs = dcs.clone();
         let counters = counters.clone();
+        let runtime_sec = runtime_sec.clone();
         tasks.spawn(async move {
             let _permit = permit;
             let mut session = telemetry::Session::new(&counters);
-            let res =
-                egress_connection(&mut edge, &dcs, &egress_token, handshake, idle, &counters).await;
+            let res = egress_connection(
+                &mut edge,
+                peer_addr.ip(),
+                &dcs,
+                &egress_token,
+                handshake,
+                idle,
+                &counters,
+                &runtime_sec,
+            )
+            .await;
             session.finish(&res);
         });
     }
@@ -3926,37 +4192,120 @@ async fn serve_egress(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn egress_connection(
     edge: &mut TcpStream,
+    peer_ip: std::net::IpAddr,
     dcs: &HashMap<i16, SocketAddr>,
     expected_token: &[u8; 16],
     handshake: Duration,
     idle: Duration,
     counters: &telemetry::Counters,
+    security: &EgressRuntimeSecurity,
 ) -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
+    security.check_peer_allowed(peer_ip)?;
+    let Ok(unauth_permit) = security.unauth_permits.try_acquire() else {
+        bail!("egress unauthenticated handshake limit reached");
+    };
     configure_tcp_socket(edge)?;
-    let mut hdr = [0u8; 24];
-    timeout(handshake, edge.read_exact(&mut hdr))
+    let mut magic = [0u8; 4];
+    if let Err(err) = timeout(handshake, edge.read_exact(&mut magic))
         .await
-        .context("egress_header_timeout")?
-        .context("egress_header_eof")?;
+        .context("egress_header_timeout")
+        .and_then(|r| r.context("egress_header_eof"))
+    {
+        security.record_auth_failure(peer_ip);
+        return Err(err);
+    }
     counters
         .downstream_rx_bytes
-        .fetch_add(hdr.len() as u64, Relaxed);
-    ensure!(hdr[..4] == EGRESS_MAGIC, "invalid egress magic");
-    let token: [u8; 16] = hdr[8..24].try_into()?;
-    ensure!(ct_eq_16(&token, expected_token), "egress token mismatch");
-    let raw_dc_id = i16::from_le_bytes([hdr[4], hdr[5]]);
-    if raw_dc_id == 0 {
-        let mut tail = [0u8; 64];
-        timeout(handshake, edge.read_exact(&mut tail))
+        .fetch_add(magic.len() as u64, Relaxed);
+
+    let (raw_dc_id, mtv3_dc_header) = if magic == wire::EGRESS_MAGIC_V3 {
+        let mut rest = [0u8; wire::EGRESS_PREFACE_V3_LEN - 4];
+        if let Err(err) = timeout(handshake, edge.read_exact(&mut rest))
             .await
-            .context("egress_ping_tail_timeout")?
-            .context("egress_ping_tail_eof")?;
+            .context("egress_v3_header_timeout")
+            .and_then(|r| r.context("egress_v3_header_eof"))
+        {
+            security.record_auth_failure(peer_ip);
+            return Err(err);
+        }
         counters
             .downstream_rx_bytes
-            .fetch_add(tail.len() as u64, Relaxed);
+            .fetch_add(rest.len() as u64, Relaxed);
+        let mut full = [0u8; wire::EGRESS_PREFACE_V3_LEN];
+        full[..4].copy_from_slice(&magic);
+        full[4..].copy_from_slice(&rest);
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let parsed = match wire::verify_egress_preface_v3(
+            &full,
+            expected_token,
+            now_secs,
+            wire::EGRESS_V3_MAX_SKEW_SECS,
+        ) {
+            Ok(p) => p,
+            Err(err) => {
+                security.record_auth_failure(peer_ip);
+                return Err(err);
+            }
+        };
+        let mut replay_key = [0u8; 32];
+        replay_key[..8].copy_from_slice(&parsed.timestamp.to_le_bytes());
+        replay_key[8..24].copy_from_slice(&parsed.nonce);
+        replay_key[24..26].copy_from_slice(&parsed.dc.to_le_bytes());
+        let decision = security
+            .nonce_replay
+            .lock()
+            .await
+            .check_and_insert(replay_key, Instant::now());
+        if decision != Decision::Fresh {
+            security.record_auth_failure(peer_ip);
+            bail!("egress MTV3 nonce replay detected");
+        }
+        (parsed.dc, Some(parsed.dc_header))
+    } else if magic == wire::EGRESS_MAGIC_V2 {
+        if !security.cfg.accept_legacy {
+            security.record_auth_failure(peer_ip);
+            bail!("egress legacy MTV2 disabled");
+        }
+        let mut rest = [0u8; 20];
+        if let Err(err) = timeout(handshake, edge.read_exact(&mut rest))
+            .await
+            .context("egress_v2_header_timeout")
+            .and_then(|r| r.context("egress_v2_header_eof"))
+        {
+            security.record_auth_failure(peer_ip);
+            return Err(err);
+        }
+        counters
+            .downstream_rx_bytes
+            .fetch_add(rest.len() as u64, Relaxed);
+        let token: [u8; 16] = rest[4..20].try_into()?;
+        if !ct_eq_16(&token, expected_token) {
+            security.record_auth_failure(peer_ip);
+            bail!("egress token mismatch");
+        }
+        let dc_id = i16::from_le_bytes([rest[0], rest[1]]);
+        (dc_id, None)
+    } else {
+        security.record_auth_failure(peer_ip);
+        bail!("invalid egress magic");
+    };
+    drop(unauth_permit);
+
+    if raw_dc_id == 0 {
+        if mtv3_dc_header.is_none() {
+            let mut tail = [0u8; 64];
+            timeout(handshake, edge.read_exact(&mut tail))
+                .await
+                .context("egress_ping_tail_timeout")?
+                .context("egress_ping_tail_eof")?;
+            counters
+                .downstream_rx_bytes
+                .fetch_add(tail.len() as u64, Relaxed);
+        }
         timeout(handshake, edge.write_all(&[EGRESS_ACK_OK])).await??;
         counters.downstream_tx_bytes.fetch_add(1, Relaxed);
         let _ = edge.shutdown().await;
@@ -3981,6 +4330,23 @@ async fn egress_connection(
             bail!("dc_connect_failed");
         }
     };
+    if let Some(dc_hdr) = mtv3_dc_header {
+        if timeout(handshake, dc.write_all(&dc_hdr))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r.map_err(anyhow::Error::from))
+            .is_err()
+        {
+            if edge.write_all(&[EGRESS_ACK_ERR]).await.is_ok() {
+                counters.downstream_tx_bytes.fetch_add(1, Relaxed);
+            }
+            let _ = edge.shutdown().await;
+            bail!("dc_header_write_failed");
+        }
+        counters
+            .upstream_tx_bytes
+            .fetch_add(dc_hdr.len() as u64, Relaxed);
+    }
     timeout(handshake, edge.write_all(&[EGRESS_ACK_OK])).await??;
     counters.downstream_tx_bytes.fetch_add(1, Relaxed);
     let edge_fd = stream_raw_fd(edge);

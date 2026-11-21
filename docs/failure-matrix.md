@@ -42,7 +42,7 @@ Phase 0 (F1–F10 в phase-0.md §9) — подмножество; столбе�
 | F-28 | Cover backend replacement | PreAuth | новые relay-соединения на новый бэкенд; старые доживают | cover_backend_swaps | §8 | нагрузка |
 | F-29 | Upgrade процесса под нагрузкой | обе | zero accept-pause (REUSEPORT/SCM_RIGHTS); drain по deadline; forced close **с подсчётом** | accept_pause_ms, drained_sessions, forced_close_ratio | §9, INV-10 | F7 |
 | F-30 | Watchdog kill (OOM/kill -9) | обе | supervisor restart; сессии теряются честно | process_restarts | INV-10 | chaos |
-| F-31 | Guard: подозрительный источник (suspect) | PreAuth | shadow-ban → cover; canary-валидация исключений | suspects_shadow_banned | guard | нагрузка |
+| F-31 | Guard: подозрительный источник (suspect) / защита `egress` (`MTV3`) | PreAuth | shadow-ban → cover; на `egress`: `MTV3` HMAC-SHA256 + `±30 с` окно + replay-кэш `nonce`, `egress_allow_from` CIDR, лимит неудачных попыток на IP (`egress_max_failed_per_ip`) и отдельный лимит незавершённых handshake | suspects_shadow_banned | guard | нагрузка |
 | F-32 | Half-close (client SHUT_WR) | PostCommit | дожитие в drain-семантике §5.5, без преждевременного close | close_reasons | INV-04 | N/A (probe) |
 | F-33 | TCP zero window клиента | PostCommit | backpressure по outbound, deadline → graceful close | budget_stall_timeout | INV-03 | netem |
 | F-34 | Reordering/dup на пути | обе | корректность FIFO per-client сохраняется | fifo_violations (должно быть 0) | INV-05 | netem |

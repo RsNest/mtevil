@@ -77,6 +77,7 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
             config::default_egress_probe_degraded_interval_secs(),
         ),
         egress_hedge_ms: config::default_egress_hedge_ms(),
+        egress_use_mtv3: false,
         client_hello: Duration::from_millis(150),
         handshake: Duration::from_millis(150),
         idle: Duration::from_millis(300),
@@ -1257,6 +1258,10 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         egress_probe_interval_secs: config::default_egress_probe_interval_secs(),
         egress_probe_degraded_interval_secs: config::default_egress_probe_degraded_interval_secs(),
         egress_hedge_ms: config::default_egress_hedge_ms(),
+        egress_accept_legacy: config::default_egress_accept_legacy(),
+        egress_use_mtv3: config::default_egress_use_mtv3(),
+        egress_allow_from: Vec::new(),
+        egress_max_failed_per_ip: config::default_egress_max_failed_per_ip(),
     };
 
     let mut proxy_state = state(cover.addr, dc_addr);
@@ -1688,6 +1693,10 @@ async fn probe_telegram_e2e_verifies_handshake_and_res_pq_reply() -> Result<()> 
         egress_probe_interval_secs: config::default_egress_probe_interval_secs(),
         egress_probe_degraded_interval_secs: config::default_egress_probe_degraded_interval_secs(),
         egress_hedge_ms: config::default_egress_hedge_ms(),
+        egress_accept_legacy: config::default_egress_accept_legacy(),
+        egress_use_mtv3: config::default_egress_use_mtv3(),
+        egress_allow_from: Vec::new(),
+        egress_max_failed_per_ip: config::default_egress_max_failed_per_ip(),
     };
 
     let rtt_ms = probe_telegram_e2e(&cfg, proxy_addr, 2, Duration::from_secs(3)).await?;
@@ -2088,6 +2097,10 @@ async fn allowed_sni_file_accepts_previous_and_current_sni_without_breaking_link
         egress_probe_interval_secs: config::default_egress_probe_interval_secs(),
         egress_probe_degraded_interval_secs: config::default_egress_probe_degraded_interval_secs(),
         egress_hedge_ms: config::default_egress_hedge_ms(),
+        egress_accept_legacy: config::default_egress_accept_legacy(),
+        egress_use_mtv3: config::default_egress_use_mtv3(),
+        egress_allow_from: Vec::new(),
+        egress_max_failed_per_ip: config::default_egress_max_failed_per_ip(),
     };
     assert_eq!(cfg.allowed_snis(), "ya.ru,example.com,vk.com");
 
@@ -2804,5 +2817,217 @@ async fn hedged_connect_starts_backup_after_hedge_ms_and_tracks_metrics() -> Res
 
     p_task.abort();
     b_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn egress_mtv3_verifies_hmac_rejects_replay_skew_legacy_toggle_and_security_limits(
+) -> Result<()> {
+    let cover = cover_mock().await?;
+    let dc = TcpListener::bind("127.0.0.1:0").await?;
+    let dc_addr = dc.local_addr()?;
+    let token = [0x9au8; 16];
+
+    let dc_task = tokio::spawn(async move {
+        while let Ok((mut peer, _)) = dc.accept().await {
+            tokio::spawn(async move {
+                let mut header = [0u8; 64];
+                if peer.read_exact(&mut header).await.is_err() {
+                    return;
+                }
+                let mut decode = match AesCtr::new_from_slices(&header[8..40], &header[40..56]) {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                let mut plain = header;
+                wire::crypt(&mut decode, &mut plain);
+                let mut payload = vec![0; CLIENT_PAYLOAD.len()];
+                if peer.read_exact(&mut payload).await.is_ok() {
+                    wire::crypt(&mut decode, &mut payload);
+                    if payload == CLIENT_PAYLOAD {
+                        let reversed: Vec<_> = header[8..56].iter().rev().copied().collect();
+                        if let Ok(mut encode) =
+                            AesCtr::new_from_slices(&reversed[..32], &reversed[32..])
+                        {
+                            let mut reply = DC_REPLY.to_vec();
+                            wire::crypt(&mut encode, &mut reply);
+                            let _ = peer.write_all(&reply).await;
+                            let _ = peer.shutdown().await;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // 1. Start egress with MTV3 required (`accept_legacy = false`), `allow_from = ["127.0.0.1/32"]`,
+    //    `max_failed_per_ip = 4`, `max_unauth_handshakes = 2`.
+    let egress_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let egress_addr = egress_listener.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let sec_cfg = EgressSecurityConfig {
+        accept_legacy: false,
+        allow_from: vec![config::IpCidr::parse("127.0.0.1/32")?],
+        max_failed_per_ip: 4,
+        failed_window: Duration::from_secs(60),
+        max_unauth_handshakes: 2,
+    };
+    let egress_task = tokio::spawn(serve_egress_with_security(
+        egress_listener,
+        Arc::new(HashMap::from([(2, dc_addr)])),
+        token,
+        16,
+        Duration::from_millis(400),
+        Duration::from_secs(1),
+        Duration::from_millis(50),
+        Arc::new(telemetry::Counters::default()),
+        sec_cfg,
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    // 2. End-to-end relay over MTV3 (`egress_use_mtv3 = true`) succeeds!
+    let mut edge_state = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut edge_state).context("unique state")?;
+        sm.dcs.clear();
+        sm.egress_upstreams = vec![egress_addr];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_token = token;
+        sm.egress_use_mtv3 = true;
+        sm.handshake = Duration::from_secs(1);
+    }
+    let (mut client, task) = proxy(edge_state.clone()).await?;
+    let raw = hello()?;
+    client.write_all(&raw).await?;
+    flight(&mut client, &raw).await?;
+    let mut bytes = fixture("init")?;
+    bytes.extend_from_slice(&fixture("payload")?);
+    client.write_all(&wire::record(0x17, &bytes)?).await?;
+    client.shutdown().await?;
+    let mut reply = Vec::new();
+    while reply.len() < DC_REPLY.len() {
+        let (kind, part) = read_record(&mut client).await?;
+        assert_eq!(kind, 0x17);
+        reply.extend_from_slice(&part);
+    }
+    assert_eq!(reply, fixture("reply")?);
+    timeout(Duration::from_secs(2), task).await???;
+    assert_eq!(
+        edge_state
+            .counters
+            .upstream_tx_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        (wire::EGRESS_PREFACE_V3_LEN + CLIENT_PAYLOAD.len()) as u64
+    );
+
+    // 3. Valid MTV3 ping (`dc = 0`) succeeds once, and replaying the exact same preface (same nonce) is rejected!
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let replay_nonce = [0x77u8; 16];
+    let ping_preface =
+        wire::build_egress_preface_v3(&token, 0, now_secs, &replay_nonce, &[0u8; 64])?;
+    {
+        let mut s1 = TcpStream::connect(egress_addr).await?;
+        s1.write_all(&ping_preface).await?;
+        let mut ack = [0u8; 1];
+        s1.read_exact(&mut ack).await?;
+        assert_eq!(ack[0], EGRESS_ACK_OK);
+    }
+    // Replay of identical MTV3 preface -> rejected (EOF before ACK)! (Failure #1 for 127.0.0.1)
+    {
+        let mut s_replay = TcpStream::connect(egress_addr).await?;
+        let _ = s_replay.write_all(&ping_preface).await;
+        assert_eq!(s_replay.read(&mut [0u8; 1]).await.unwrap_or(0), 0);
+    }
+
+    // 4. Wrong HMAC token -> rejected! (Failure #2 for 127.0.0.1)
+    {
+        let bad_hmac =
+            wire::build_egress_preface_v3(&[0x11u8; 16], 0, now_secs, &[0x88u8; 16], &[0u8; 64])?;
+        let mut s_bad = TcpStream::connect(egress_addr).await?;
+        let _ = s_bad.write_all(&bad_hmac).await;
+        assert_eq!(s_bad.read(&mut [0u8; 1]).await.unwrap_or(0), 0);
+    }
+
+    // 5. Expired timestamp (now - 45s, outside ±30s window) -> rejected! (Failure #3 for 127.0.0.1)
+    {
+        let expired = wire::build_egress_preface_v3(
+            &token,
+            0,
+            now_secs.saturating_sub(45),
+            &[0x89u8; 16],
+            &[0u8; 64],
+        )?;
+        let mut s_exp = TcpStream::connect(egress_addr).await?;
+        let _ = s_exp.write_all(&expired).await;
+        assert_eq!(s_exp.read(&mut [0u8; 1]).await.unwrap_or(0), 0);
+    }
+
+    // 6. Legacy MTV2 when `accept_legacy = false` -> rejected! (Failure #4 for 127.0.0.1 -> hits max_failed_per_ip = 4)
+    {
+        let legacy = build_egress_wire_preface(&token, 0, &[0u8; 64], false)?;
+        let mut s_leg = TcpStream::connect(egress_addr).await?;
+        let _ = s_leg.write_all(&legacy).await;
+        assert_eq!(s_leg.read(&mut [0u8; 1]).await.unwrap_or(0), 0);
+    }
+
+    // 7. Per-IP sliding window rate limit (`max_failed_per_ip = 4` reached):
+    //    Even a fresh valid MTV3 preface from 127.0.0.1 is now rejected immediately!
+    {
+        let valid_after_limit =
+            wire::build_egress_preface_v3(&token, 0, now_secs, &[0x90u8; 16], &[0u8; 64])?;
+        let mut s_limited = TcpStream::connect(egress_addr).await?;
+        let _ = s_limited.write_all(&valid_after_limit).await;
+        assert_eq!(s_limited.read(&mut [0u8; 1]).await.unwrap_or(0), 0);
+    }
+
+    // 8. Check CIDR allowlist rejection (`allow_from = ["10.203.0.0/24"]` rejects 127.0.0.1)
+    //    and unauthenticated handshake concurrency limit (`max_unauth_handshakes = 1`).
+    let egress2_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let egress2_addr = egress2_listener.local_addr()?;
+    let (shutdown2_tx, shutdown2_rx) = tokio::sync::oneshot::channel::<()>();
+    let sec_cfg_deny = EgressSecurityConfig {
+        accept_legacy: true,
+        allow_from: vec![config::IpCidr::parse("10.203.0.0/24")?],
+        max_failed_per_ip: 16,
+        failed_window: Duration::from_secs(60),
+        max_unauth_handshakes: 1,
+    };
+    let egress2_task = tokio::spawn(serve_egress_with_security(
+        egress2_listener,
+        Arc::new(HashMap::from([(2, dc_addr)])),
+        token,
+        16,
+        Duration::from_millis(400),
+        Duration::from_secs(1),
+        Duration::from_millis(50),
+        Arc::new(telemetry::Counters::default()),
+        sec_cfg_deny,
+        async move {
+            let _ = shutdown2_rx.await;
+        },
+    ));
+    {
+        let fresh = wire::build_egress_preface_v3(&token, 0, now_secs, &[0x91u8; 16], &[0u8; 64])?;
+        let mut s_denied = TcpStream::connect(egress2_addr).await?;
+        let _ = s_denied.write_all(&fresh).await;
+        assert_eq!(s_denied.read(&mut [0u8; 1]).await.unwrap_or(0), 0);
+    }
+
+    // 9. Public listen warning helper classification:
+    assert!(config::is_loopback_or_private_ip("127.0.0.1".parse()?));
+    assert!(config::is_loopback_or_private_ip("10.203.0.1".parse()?));
+    assert!(config::is_loopback_or_private_ip("100.64.0.1".parse()?));
+    assert!(config::is_loopback_or_private_ip("::1".parse()?));
+    assert!(config::is_loopback_or_private_ip("fd00::1".parse()?));
+    assert!(!config::is_loopback_or_private_ip("203.0.113.10".parse()?));
+    assert!(!config::is_loopback_or_private_ip("0.0.0.0".parse()?));
+
+    let _ = shutdown_tx.send(());
+    let _ = shutdown2_tx.send(());
+    timeout(Duration::from_secs(2), egress_task).await???;
+    timeout(Duration::from_secs(2), egress2_task).await???;
+    dc_task.abort();
     Ok(())
 }

@@ -2,10 +2,96 @@ use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
 use zeroize::Zeroizing;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpCidr {
+    V4 { net: u32, mask: u32 },
+    V6 { net: u128, mask: u128 },
+}
+
+impl IpCidr {
+    pub fn parse(text: &str) -> Result<Self> {
+        let trimmed = text.trim();
+        let (ip_str, prefix_opt) = match trimmed.split_once('/') {
+            Some((ip_part, p_part)) => (ip_part, Some(p_part)),
+            None => (trimmed, None),
+        };
+        let ip: IpAddr = ip_str
+            .parse()
+            .with_context(|| format!("invalid CIDR IP '{ip_str}'"))?;
+        match ip {
+            IpAddr::V4(v4) => {
+                let prefix: u8 = match prefix_opt {
+                    Some(p) => p.parse().context("invalid IPv4 CIDR prefix")?,
+                    None => 32,
+                };
+                ensure!(prefix <= 32, "IPv4 CIDR prefix must be 0..=32");
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
+                let net = u32::from_be_bytes(v4.octets()) & mask;
+                Ok(Self::V4 { net, mask })
+            }
+            IpAddr::V6(v6) => {
+                let prefix: u8 = match prefix_opt {
+                    Some(p) => p.parse().context("invalid IPv6 CIDR prefix")?,
+                    None => 128,
+                };
+                ensure!(prefix <= 128, "IPv6 CIDR prefix must be 0..=128");
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix)
+                };
+                let net = u128::from_be_bytes(v6.octets()) & mask;
+                Ok(Self::V6 { net, mask })
+            }
+        }
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let canonical = match ip {
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6(v6),
+            },
+            v4 => v4,
+        };
+        match (*self, canonical) {
+            (Self::V4 { net, mask }, IpAddr::V4(v4)) => {
+                (u32::from_be_bytes(v4.octets()) & mask) == net
+            }
+            (Self::V6 { net, mask }, IpAddr::V6(v6)) => {
+                (u128::from_be_bytes(v6.octets()) & mask) == net
+            }
+            _ => false,
+        }
+    }
+}
+
+pub fn is_loopback_or_private_ip(ip: IpAddr) -> bool {
+    let canonical = match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    };
+    match canonical {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            let is_cgnat = octets[0] == 100 && (64..=127).contains(&octets[1]);
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || is_cgnat
+        }
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
+    }
+}
 
 #[derive(Deserialize, clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -104,6 +190,18 @@ pub struct Config {
     /// Hedged connect delay in milliseconds for ordered egress strategy (0 = disabled).
     #[serde(default = "default_egress_hedge_ms")]
     pub egress_hedge_ms: u64,
+    /// Whether egress accepts legacy MTV2 prefaces alongside MTV3.
+    #[serde(default = "default_egress_accept_legacy")]
+    pub egress_accept_legacy: bool,
+    /// Whether edge uses MTV3 (HMAC-SHA256 + timestamp + nonce) when dialing egress.
+    #[serde(default = "default_egress_use_mtv3")]
+    pub egress_use_mtv3: bool,
+    /// Optional CIDR source allowlist on egress (empty = allow any source IP).
+    #[serde(default)]
+    pub egress_allow_from: Vec<String>,
+    /// Maximum failed authentication attempts per source IP within a 60s sliding window on egress.
+    #[serde(default = "default_egress_max_failed_per_ip")]
+    pub egress_max_failed_per_ip: usize,
 }
 fn default_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 24443))
@@ -143,6 +241,15 @@ pub fn default_egress_probe_degraded_interval_secs() -> u64 {
 }
 pub fn default_egress_hedge_ms() -> u64 {
     400
+}
+pub fn default_egress_accept_legacy() -> bool {
+    true
+}
+pub fn default_egress_use_mtv3() -> bool {
+    true
+}
+pub fn default_egress_max_failed_per_ip() -> usize {
+    16
 }
 
 impl Config {
@@ -211,6 +318,11 @@ impl Config {
             self.egress_hedge_ms <= 30_000,
             "egress_hedge_ms must be 0..=30000"
         );
+        ensure!(
+            (1..=4096).contains(&self.egress_max_failed_per_ip),
+            "egress_max_failed_per_ip must be 1..=4096"
+        );
+        self.parsed_egress_allow_from()?;
         mtevil_proto::ServerFlightProfile {
             cert_bytes: self.fake_tls_cert_bytes,
             jitter: self.fake_tls_cert_jitter,
@@ -328,6 +440,14 @@ impl Config {
         }
     }
 
+    pub fn parsed_egress_allow_from(&self) -> Result<Vec<IpCidr>> {
+        let mut cidrs = Vec::with_capacity(self.egress_allow_from.len());
+        for raw in &self.egress_allow_from {
+            cidrs.push(IpCidr::parse(raw)?);
+        }
+        Ok(cidrs)
+    }
+
     pub fn allowed_sni_file(&self) -> Option<PathBuf> {
         self.secret_file
             .as_ref()
@@ -401,6 +521,10 @@ mod tests {
         assert_eq!(c.egress_probe_interval_secs, 30);
         assert_eq!(c.egress_probe_degraded_interval_secs, 5);
         assert_eq!(c.egress_hedge_ms, 400);
+        assert!(c.egress_accept_legacy);
+        assert!(c.egress_use_mtv3);
+        assert!(c.egress_allow_from.is_empty());
+        assert_eq!(c.egress_max_failed_per_ip, 16);
         assert!(serde_json::from_str::<Config>(r#"{"secret_file":"secret","sni":"example.com","cover":"example.com:443","dc":[],"max_conections":100}"#).is_err());
         Ok(())
     }
@@ -473,6 +597,19 @@ mod tests {
         assert!(c.validate().is_err());
         let mut c = config()?;
         c.egress_hedge_ms = 30_001;
+        assert!(c.validate().is_err());
+        let mut c = config()?;
+        c.egress_max_failed_per_ip = 0;
+        assert!(c.validate().is_err());
+        let mut c = config()?;
+        c.egress_allow_from = vec!["10.203.0.0/24".into(), "2001:db8::/32".into()];
+        c.validate()?;
+        let cidrs = c.parsed_egress_allow_from()?;
+        assert!(cidrs[0].contains("10.203.0.42".parse()?));
+        assert!(!cidrs[0].contains("10.203.1.1".parse()?));
+        assert!(cidrs[1].contains("2001:db8::1".parse()?));
+        let mut c = config()?;
+        c.egress_allow_from = vec!["10.203.0.0/33".into()];
         assert!(c.validate().is_err());
 
         let edge: Config = serde_json::from_str(
