@@ -94,6 +94,7 @@ impl ReplayCache {
                 Ok(bytes) if bytes.len().is_multiple_of(RECORD_BYTES) => {
                     let now_mono = Instant::now();
                     let now_unix = unix_now_secs();
+                    let mut loaded: Vec<([u8; 32], Instant, u64)> = Vec::new();
                     for chunk in bytes.as_chunks::<RECORD_BYTES>().0 {
                         let Ok(key): std::result::Result<[u8; 32], _> = chunk[..32].try_into()
                         else {
@@ -110,11 +111,18 @@ impl ReplayCache {
                         }
                         let rem = Duration::from_secs((exp_unix - now_unix).min(ttl.as_secs()));
                         let exp_mono = now_mono + rem;
+                        loaded.push((key, exp_mono, exp_unix));
+                    }
+                    // Sort ascending by expiry so front-of-queue lazy sweep never gets blocked
+                    // behind a longer-lived entry loaded earlier from HashMap iteration order.
+                    loaded.sort_unstable_by_key(|(_, exp_mono, _)| *exp_mono);
+                    for (key, exp_mono, exp_unix) in loaded {
                         if cache.entries.len() >= capacity {
                             break;
                         }
-                        cache.entries.insert(key, (exp_mono, exp_unix));
-                        cache.expiry.push_back((key, exp_mono));
+                        if cache.entries.insert(key, (exp_mono, exp_unix)).is_none() {
+                            cache.expiry.push_back((key, exp_mono));
+                        }
                     }
                     ReplayLoadStatus::Loaded(cache.entries.len())
                 }
@@ -303,6 +311,33 @@ mod tests {
         assert_eq!(status_after_flush, ReplayLoadStatus::Loaded(1));
 
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn inv02_loaded_expiry_queue_is_sorted_by_expiry_time() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "mtevil-replay-sort-{}-{}.bin",
+            std::process::id(),
+            unix_now_secs()
+        ));
+        let now_unix = unix_now_secs();
+        let key_a = [0x0au8; 32];
+        let key_b = [0x0bu8; 32];
+        let key_c = [0x0cu8; 32];
+        // Deliberately write A (expires in 120s) BEFORE B (expires in 1s).
+        let items: Vec<SnapshotEntry> = vec![(key_a, now_unix + 120), (key_b, now_unix + 1)];
+        write_snapshot_items(&path, &items)?;
+
+        let (mut cache, status) =
+            ReplayCache::load_with_status(path.clone(), 2, Duration::from_secs(120));
+        assert_eq!(status, ReplayLoadStatus::Loaded(2));
+
+        // After 2 seconds, B has expired while A is still live; inserting C MUST succeed (Fresh).
+        let later = Instant::now() + Duration::from_secs(2);
+        assert_eq!(cache.check_and_insert(key_c, later), Decision::Fresh);
+        assert_eq!(cache.check_and_insert(key_a, later), Decision::Duplicate);
+        let _ = fs::remove_file(&path);
         Ok(())
     }
 }
