@@ -97,6 +97,7 @@ pub struct Counters {
     pub egress_legacy_connections: AtomicU64,
     pub egress_mtv3_connections: AtomicU64,
     pub egress_preface_aborted: AtomicU64,
+    pub egress_nonce_cache_full: AtomicU64,
 }
 
 impl Counters {
@@ -162,6 +163,7 @@ impl Counters {
             "egress_legacy_connections": self.egress_legacy_connections.load(Ordering::Relaxed),
             "egress_mtv3_connections": self.egress_mtv3_connections.load(Ordering::Relaxed),
             "egress_preface_aborted": self.egress_preface_aborted.load(Ordering::Relaxed),
+            "egress_nonce_cache_full": self.egress_nonce_cache_full.load(Ordering::Relaxed),
         })
     }
 
@@ -274,6 +276,17 @@ impl Counters {
             out,
             "mtevil_egress_preface_aborted_total {}",
             self.egress_preface_aborted.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_egress_nonce_cache_full_total Authenticated MTV3 connections accepted while nonce replay cache was saturated"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_egress_nonce_cache_full_total counter");
+        let _ = writeln!(
+            out,
+            "mtevil_egress_nonce_cache_full_total {}",
+            self.egress_nonce_cache_full.load(Ordering::Relaxed)
         );
 
         let _ = writeln!(

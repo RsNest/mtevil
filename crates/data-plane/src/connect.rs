@@ -337,6 +337,7 @@ pub(crate) fn default_media_override_map() -> HashMap<i16, Vec<SocketAddr>> {
         egress_use_mtv3: config::default_egress_use_mtv3(),
         egress_allow_from: Vec::new(),
         egress_max_failed_per_ip: config::default_egress_max_failed_per_ip(),
+        egress_nonce_cache_capacity: None,
         dc_media_override: config::default_dc_media_override(),
         dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),

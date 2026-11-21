@@ -202,6 +202,9 @@ pub struct Config {
     /// Maximum failed authentication attempts per source IP within a 60s sliding window on egress.
     #[serde(default = "default_egress_max_failed_per_ip")]
     pub egress_max_failed_per_ip: usize,
+    /// Optional capacity of the egress MTV3 nonce replay cache (default: derived from max_connections).
+    #[serde(default)]
+    pub egress_nonce_cache_capacity: Option<usize>,
     /// Configurable media/alternate DC candidate overrides (`ID=IP:PORT`, multiple entries per ID allowed).
     #[serde(default = "default_dc_media_override")]
     pub dc_media_override: Vec<String>,
@@ -265,6 +268,9 @@ pub fn default_egress_use_mtv3() -> bool {
 }
 pub fn default_egress_max_failed_per_ip() -> usize {
     16
+}
+pub fn default_egress_nonce_cache_capacity(max_connections: usize) -> usize {
+    max_connections.saturating_mul(64).clamp(16_384, 262_144)
 }
 pub fn default_dc_media_override() -> Vec<String> {
     vec![
@@ -353,6 +359,12 @@ impl Config {
             (1..=4096).contains(&self.egress_max_failed_per_ip),
             "egress_max_failed_per_ip must be 1..=4096"
         );
+        if let Some(cap) = self.egress_nonce_cache_capacity {
+            ensure!(
+                (1024..=1_000_000).contains(&cap),
+                "egress_nonce_cache_capacity must be 1024..=1000000"
+            );
+        }
         ensure!(
             self.dc_probe_interval_secs <= 86400,
             "dc_probe_interval_secs must be 0..=86400"

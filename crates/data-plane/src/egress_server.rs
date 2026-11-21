@@ -7,6 +7,7 @@ pub(crate) struct EgressSecurityConfig {
     pub(crate) max_failed_per_ip: usize,
     pub(crate) failed_window: Duration,
     pub(crate) max_unauth_handshakes: usize,
+    pub(crate) nonce_cache_capacity: usize,
     pub(crate) dc_media_overrides: HashMap<i16, Vec<SocketAddr>>,
 }
 
@@ -19,6 +20,7 @@ impl EgressSecurityConfig {
             max_failed_per_ip: config::default_egress_max_failed_per_ip(),
             failed_window: Duration::from_secs(60),
             max_unauth_handshakes: (max_connections / 4).clamp(4, 128),
+            nonce_cache_capacity: config::default_egress_nonce_cache_capacity(max_connections),
             dc_media_overrides: default_media_override_map(),
         }
     }
@@ -104,11 +106,12 @@ pub(crate) struct EgressRuntimeSecurity {
 impl EgressRuntimeSecurity {
     pub(crate) fn new(cfg: EgressSecurityConfig) -> Self {
         let max_unauth = cfg.max_unauth_handshakes.max(1);
+        let nonce_cap = cfg.nonce_cache_capacity.max(1024);
         let failed_tracker = IpFailureTracker::new(cfg.failed_window, cfg.max_failed_per_ip);
         Self {
             cfg,
             unauth_permits: Semaphore::new(max_unauth),
-            nonce_replay: Mutex::new(ReplayCache::new(16384, Duration::from_secs(65))),
+            nonce_replay: Mutex::new(ReplayCache::new(nonce_cap, Duration::from_secs(65))),
             failed_by_ip: std::sync::Mutex::new(failed_tracker),
         }
     }
@@ -300,9 +303,25 @@ pub(crate) async fn egress_connection(
             .lock()
             .await
             .check_and_insert(replay_key, Instant::now());
-        if decision != Decision::Fresh {
-            security.record_auth_failure(peer_ip);
-            bail!("egress MTV3 nonce replay detected");
+        match decision {
+            Decision::Fresh => {}
+            Decision::Duplicate => {
+                security.record_auth_failure(peer_ip);
+                bail!("egress MTV3 nonce replay detected");
+            }
+            Decision::Full => {
+                let prev = counters.egress_nonce_cache_full.fetch_add(1, Relaxed);
+                if prev == 0 || prev.is_multiple_of(1024) {
+                    telemetry::event(
+                        "egress_nonce_cache_full",
+                        0,
+                        json!({
+                            "capacity": security.cfg.nonce_cache_capacity,
+                            "accepted_while_full": prev + 1
+                        }),
+                    );
+                }
+            }
         }
         counters.egress_mtv3_connections.fetch_add(1, Relaxed);
         (parsed.dc, Some(parsed.dc_header))

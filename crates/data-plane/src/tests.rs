@@ -1267,6 +1267,7 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         egress_use_mtv3: config::default_egress_use_mtv3(),
         egress_allow_from: Vec::new(),
         egress_max_failed_per_ip: config::default_egress_max_failed_per_ip(),
+        egress_nonce_cache_capacity: None,
         dc_media_override: config::default_dc_media_override(),
         dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
@@ -1707,6 +1708,7 @@ async fn probe_telegram_e2e_verifies_handshake_and_res_pq_reply() -> Result<()> 
         egress_use_mtv3: config::default_egress_use_mtv3(),
         egress_allow_from: Vec::new(),
         egress_max_failed_per_ip: config::default_egress_max_failed_per_ip(),
+        egress_nonce_cache_capacity: None,
         dc_media_override: config::default_dc_media_override(),
         dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
@@ -2116,6 +2118,7 @@ async fn allowed_sni_file_accepts_previous_and_current_sni_without_breaking_link
         egress_use_mtv3: config::default_egress_use_mtv3(),
         egress_allow_from: Vec::new(),
         egress_max_failed_per_ip: config::default_egress_max_failed_per_ip(),
+        egress_nonce_cache_capacity: None,
         dc_media_override: config::default_dc_media_override(),
         dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
@@ -2892,6 +2895,7 @@ async fn egress_mtv3_verifies_hmac_rejects_replay_skew_legacy_toggle_and_securit
         failed_window: Duration::from_secs(60),
         max_unauth_handshakes: 2,
         dc_media_overrides: default_media_override_map(),
+        nonce_cache_capacity: 16_384,
     };
     let egress_task = tokio::spawn(serve_egress_with_security(
         egress_listener,
@@ -3015,6 +3019,7 @@ async fn egress_mtv3_verifies_hmac_rejects_replay_skew_legacy_toggle_and_securit
         failed_window: Duration::from_secs(60),
         max_unauth_handshakes: 1,
         dc_media_overrides: default_media_override_map(),
+        nonce_cache_capacity: 16_384,
     };
     let egress2_task = tokio::spawn(serve_egress_with_security(
         egress2_listener,
@@ -3695,5 +3700,84 @@ async fn inv10_f31_egress_aborted_prefaces_never_rate_limit_but_bad_hmac_does() 
     let _ = stop_tx.send(());
     let _ = timeout(Duration::from_secs(2), srv).await;
     dc_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn inv10_f31_egress_nonce_cache_30000_valid_hmacs_zero_rejections_and_duplicate_penalized(
+) -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let token = [0x55u8; 16];
+    let peer_ip: std::net::IpAddr = "127.0.0.1".parse()?;
+    let mut cfg = EgressSecurityConfig::default_for(256);
+    cfg.nonce_cache_capacity = 16_384;
+    let sec = EgressRuntimeSecurity::new(cfg);
+    let counters = telemetry::Counters::default();
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let base_instant = Instant::now();
+
+    let t0 = Instant::now();
+    let mut first_key = [0u8; 32];
+    for i in 0..30_000u32 {
+        let mut nonce = [0u8; 16];
+        nonce[..4].copy_from_slice(&i.to_le_bytes());
+        let preface = wire::build_egress_preface_v3(&token, 2, now_secs, &nonce, &[0x33; 64])?;
+        let parsed = wire::verify_egress_preface_v3(
+            &preface,
+            &token,
+            now_secs,
+            wire::EGRESS_V3_MAX_SKEW_SECS,
+        )?;
+        let mut replay_key = [0u8; 32];
+        replay_key[..8].copy_from_slice(&parsed.timestamp.to_le_bytes());
+        replay_key[8..24].copy_from_slice(&parsed.nonce);
+        replay_key[24..26].copy_from_slice(&parsed.dc.to_le_bytes());
+        if i == 0 {
+            first_key = replay_key;
+        }
+        let decision = sec
+            .nonce_replay
+            .lock()
+            .await
+            .check_and_insert(replay_key, base_instant);
+        match decision {
+            Decision::Fresh => {}
+            Decision::Full => {
+                counters.egress_nonce_cache_full.fetch_add(1, Relaxed);
+            }
+            Decision::Duplicate => bail!("unexpected duplicate at {i}"),
+        }
+    }
+    assert!(
+        t0.elapsed() < Duration::from_secs(10),
+        "30000 valid MTV3 verifications took too long: {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(
+        counters.egress_nonce_cache_full.load(Relaxed),
+        30_000 - 16_384
+    );
+    assert!(
+        sec.check_peer_allowed(peer_ip).is_ok(),
+        "valid connections while nonce cache full must never penalize IP"
+    );
+
+    // Real duplicate of an active cached nonce MUST be rejected and penalize IP.
+    let dup = sec
+        .nonce_replay
+        .lock()
+        .await
+        .check_and_insert(first_key, base_instant);
+    assert_eq!(dup, Decision::Duplicate);
+    sec.record_auth_failure(peer_ip);
+    assert_eq!(
+        sec.failed_by_ip
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .get(&peer_ip)
+            .map(|q| q.len()),
+        Some(1)
+    );
     Ok(())
 }

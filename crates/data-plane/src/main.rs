@@ -282,6 +282,7 @@ impl Args {
             egress_max_failed_per_ip: self
                 .egress_max_failed_per_ip
                 .unwrap_or_else(config::default_egress_max_failed_per_ip),
+            egress_nonce_cache_capacity: None,
             dc_media_override: if self.dc_media_override.is_empty() {
                 config::default_dc_media_override()
             } else {
@@ -895,6 +896,9 @@ async fn main() -> Result<()> {
             max_failed_per_ip: config.egress_max_failed_per_ip,
             failed_window: Duration::from_secs(60),
             max_unauth_handshakes: (effective_max / 4).clamp(4, 128),
+            nonce_cache_capacity: config
+                .egress_nonce_cache_capacity
+                .unwrap_or_else(|| config::default_egress_nonce_cache_capacity(effective_max)),
             dc_media_overrides: dc_media_overrides.clone(),
         };
         let dcs_arc = Arc::new(dcs);
