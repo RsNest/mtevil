@@ -3987,3 +3987,101 @@ async fn inv10_f24_background_probe_separates_transport_negative_ack_and_positiv
     assert!(EgressHealth::try_claim(&health, 0, -2, now2).is_none());
     Ok(())
 }
+
+#[tokio::test]
+async fn inv10_f23_round_robin_hedge_adaptive_per_try_and_parallel_node_down_signal() -> Result<()>
+{
+    use std::sync::atomic::Ordering::Relaxed;
+    let cover = cover_mock().await?;
+
+    // 1. Adaptive per_try calculation: empty -> max; median 10ms -> 300ms min; median 400ms -> 1200ms; median 900ms -> 2000ms max.
+    let h = std::sync::Mutex::new(EgressHealth::new(2));
+    assert_eq!(
+        EgressHealth::adaptive_per_try(&h, Duration::from_secs(2)),
+        Duration::from_secs(2)
+    );
+    for _ in 0..5 {
+        EgressHealth::record_ack_latency(&h, Duration::from_millis(10));
+    }
+    assert_eq!(
+        EgressHealth::adaptive_per_try(&h, Duration::from_secs(2)),
+        Duration::from_millis(300)
+    );
+    let h2 = std::sync::Mutex::new(EgressHealth::new(2));
+    for _ in 0..5 {
+        EgressHealth::record_ack_latency(&h2, Duration::from_millis(400));
+    }
+    assert_eq!(
+        EgressHealth::adaptive_per_try(&h2, Duration::from_secs(2)),
+        Duration::from_millis(1200)
+    );
+
+    // 2. Round-robin with 1 blackhole node and 1 healthy node: 30 parallel connections finish well under 700ms p95!
+    let l_blackhole = TcpListener::bind("127.0.0.1:0").await?;
+    let a_blackhole = l_blackhole.local_addr()?;
+    let t_bh = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = l_blackhole.accept().await {
+            held.push(s); // Accept and never send ACK (blackhole)
+        }
+    });
+
+    let l_live = TcpListener::bind("127.0.0.1:0").await?;
+    let a_live = l_live.local_addr()?;
+    let t_live = tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l_live.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 88];
+                if s.read_exact(&mut buf).await.is_ok() {
+                    let _ = s.write_all(&[EGRESS_ACK_OK]).await;
+                }
+            });
+        }
+    });
+
+    let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut st).context("unique state")?;
+        sm.egress_upstreams = vec![a_blackhole, a_live];
+        sm.egress_strategy = EgressStrategy::RoundRobin;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+        sm.egress_hedge_ms = 200;
+        sm.egress_use_mtv3 = false;
+        sm.handshake = Duration::from_secs(5);
+    }
+    // Seed adaptive ACK latency from healthy baseline (~5ms -> adaptive per_try = 300ms).
+    EgressHealth::record_ack_latency(&st.egress_health, Duration::from_millis(5));
+
+    let mut joins = Vec::with_capacity(30);
+    for _ in 0..30 {
+        let st_c = st.clone();
+        joins.push(tokio::spawn(async move {
+            let t0 = Instant::now();
+            let res = connect_upstream(&st_c, 2, &[0x44; 64]).await;
+            (res.is_ok(), t0.elapsed())
+        }));
+    }
+    let mut lats = Vec::with_capacity(30);
+    for j in joins {
+        let (ok, d) = j.await?;
+        assert!(ok, "round-robin failover connection must succeed");
+        lats.push(d);
+    }
+    lats.sort_unstable();
+    let p95 = lats[28];
+    assert!(
+        p95 <= Duration::from_millis(700),
+        "round-robin first-wave p95 must be <= 700ms (got {p95:?})"
+    );
+    assert!(
+        st.counters.hedge_started.load(Relaxed) >= 1,
+        "round-robin must start hedge when first node stalls"
+    );
+
+    t_bh.abort();
+    t_live.abort();
+    Ok(())
+}

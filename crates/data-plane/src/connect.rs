@@ -583,7 +583,13 @@ pub(crate) async fn dial_egress_candidate(
 ) -> std::result::Result<TcpStream, EgressAttemptErr> {
     use std::sync::atomic::Ordering::Relaxed;
     let addr = state.egress_upstreams[idx];
-    match timeout(per_try, async {
+    let notifier = EgressHealth::node_down_notifier(&state.egress_health, idx);
+    let node_down = notifier.notified();
+    tokio::pin!(node_down);
+    node_down.as_mut().enable();
+    let t0 = Instant::now();
+
+    let attempt = timeout(per_try, async {
         let mut upstream = TcpStream::connect(addr)
             .await
             .map_err(|e| EgressAttemptErr::Node(e.into()))?;
@@ -609,6 +615,7 @@ pub(crate) async fn dial_egress_candidate(
             .upstream_rx_bytes
             .fetch_add(ack.len() as u64, Relaxed);
         if ack[0] == EGRESS_ACK_OK {
+            EgressHealth::record_ack_latency(&state.egress_health, t0.elapsed());
             Ok(upstream)
         } else if ack[0] == EGRESS_ACK_ERR {
             Err(EgressAttemptErr::Dc(anyhow::anyhow!(
@@ -619,13 +626,15 @@ pub(crate) async fn dial_egress_candidate(
                 "egress upstream invalid ACK byte"
             )))
         }
-    })
-    .await
-    {
-        Ok(res) => res,
-        Err(_) => Err(EgressAttemptErr::Node(anyhow::anyhow!(
-            "egress_connect_timeout"
-        ))),
+    });
+
+    tokio::select! {
+        biased;
+        res = attempt => match res {
+            Ok(inner) => inner,
+            Err(_) => Err(EgressAttemptErr::Node(anyhow::anyhow!("egress_connect_timeout"))),
+        },
+        () = &mut node_down => Err(EgressAttemptErr::Node(anyhow::anyhow!("egress_node_signaled_down"))),
     }
 }
 
@@ -703,6 +712,7 @@ pub(crate) fn finalize_egress_error(
         }
         EgressAttemptErr::Node(e) => {
             claim.record_node_failure(state.egress_cooldown, state.egress_cooldown_max);
+            EgressHealth::notify_node_down(&state.egress_health, idx);
             e
         }
     }
@@ -731,13 +741,14 @@ pub(crate) async fn connect_upstream(
         EgressStrategy::Ordered => 0,
         EgressStrategy::RoundRobin => state.egress_rr.fetch_add(1, Relaxed),
     };
-    let per_try = (state.handshake / (count as u32).max(1))
+    let max_per_try = (state.handshake / (count as u32).max(1))
         .max(Duration::from_millis(150))
         .min(Duration::from_secs(2));
+    let per_try = EgressHealth::adaptive_per_try(&state.egress_health, max_per_try);
     let dc_abs = dc_id.abs();
     let dc_key = dc_id;
     let ordered = state.egress_strategy == EgressStrategy::Ordered;
-    let hedge_delay = (ordered && state.egress_hedge_ms > 0)
+    let hedge_delay = (state.egress_hedge_ms > 0)
         .then(|| Duration::from_millis(state.egress_hedge_ms))
         .filter(|d| *d < per_try);
     timeout(state.handshake, async {
