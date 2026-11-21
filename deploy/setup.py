@@ -2469,12 +2469,24 @@ def run_user_command(deploy_dir: Path, action: str, name: str | None = None, sni
     base = compose_cmd(deploy_dir, project)
     svc = compose_service(base)
     cid = run(base + ["ps", "-q", svc], check=False).stdout.strip()
-    cmd_prefix = base + (["exec", "-T", svc] if cid else ["run", "--rm", "-T", "--no-deps", svc])
-    write_prefix = base + ["run", "--rm", "-T", "--no-deps", compose_write_service(base)]
+    cmd_prefix = base + (
+        ["exec", "-T", svc, "/usr/local/bin/mtevil"]
+        if cid
+        else ["run", "--rm", "-T", "--no-deps", "--entrypoint", "/usr/local/bin/mtevil", svc]
+    )
+    write_prefix = base + [
+        "run",
+        "--rm",
+        "-T",
+        "--no-deps",
+        "--entrypoint",
+        "/usr/local/bin/mtevil",
+        compose_write_service(base),
+    ]
 
     act = (action or "list").strip().lower()
     if act in ("list", "ls"):
-        proc = run(cmd_prefix + ["mtevil", "user-list", "--users-file", users_file], check=False)
+        proc = run(cmd_prefix + ["user-list", "--users-file", users_file], check=False)
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()
             print(err_text(f"Не удалось получить список пользователей: {detail}"), file=sys.stderr)
@@ -2492,7 +2504,7 @@ def run_user_command(deploy_dir: Path, action: str, name: str | None = None, sni
         if not name:
             print(err_text("Укажите имя пользователя: mtevilctl user add <имя>"), file=sys.stderr)
             return 1
-        proc = run(write_prefix + ["mtevil", "user-add", "--users-file", users_file, "--name", name], check=False)
+        proc = run(write_prefix + ["user-add", "--users-file", users_file, "--name", name], check=False)
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()
             print(err_text(f"Не удалось добавить пользователя '{name}': {detail}"), file=sys.stderr)
@@ -2504,7 +2516,7 @@ def run_user_command(deploy_dir: Path, action: str, name: str | None = None, sni
         if not name:
             print(err_text("Укажите имя пользователя: mtevilctl user del <имя>"), file=sys.stderr)
             return 1
-        proc = run(write_prefix + ["mtevil", "user-del", "--users-file", users_file, "--name", name], check=False)
+        proc = run(write_prefix + ["user-del", "--users-file", users_file, "--name", name], check=False)
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()
             print(err_text(f"Не удалось удалить пользователя '{name}': {detail}"), file=sys.stderr)

@@ -1930,7 +1930,7 @@ class SetupValidationTests(unittest.TestCase):
                 self.assertEqual(setup.main(), 0)
             add_cmds = [" ".join(c) for c in calls if "user-add" in " ".join(c)]
             self.assertEqual(len(add_cmds), 1)
-            self.assertIn(" run --rm -T --no-deps init ", add_cmds[0])
+            self.assertIn(" run --rm -T --no-deps --entrypoint /usr/local/bin/mtevil init user-add ", add_cmds[0])
 
             calls.clear()
             with (
@@ -1942,7 +1942,7 @@ class SetupValidationTests(unittest.TestCase):
                 self.assertEqual(setup.main(), 0)
             del_cmds = [" ".join(c) for c in calls if "user-del" in " ".join(c)]
             self.assertEqual(len(del_cmds), 1)
-            self.assertIn(" run --rm -T --no-deps init ", del_cmds[0])
+            self.assertIn(" run --rm -T --no-deps --entrypoint /usr/local/bin/mtevil init user-del ", del_cmds[0])
 
 
 if __name__ == "__main__":
