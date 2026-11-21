@@ -74,6 +74,7 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         egress_token: [0u8; 16],
         egress_rr: std::sync::atomic::AtomicUsize::new(0),
         egress_health: std::sync::Mutex::new(EgressHealth::new(0)),
+        egress_probe_notify: Arc::new(tokio::sync::Notify::new()),
         egress_cooldown: Duration::from_millis(config::default_egress_cooldown_base_ms()),
         egress_cooldown_max: Duration::from_millis(config::default_egress_cooldown_max_ms()),
         egress_probe_interval: Duration::from_secs(config::default_egress_probe_interval_secs()),
@@ -3812,5 +3813,102 @@ fn inv10_f31_ip_failure_tracker_evicts_oldest_and_tracks_metric() -> Result<()> 
     // ip4 can now accumulate failures and hit rate-limit.
     assert!(!tracker.record_failure(ip4, base + Duration::from_secs(4)));
     assert!(tracker.is_rate_limited(ip4, base + Duration::from_secs(4)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn inv10_f24_forced_probe_single_flight_200_concurrent_connections() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+    let cover = cover_mock().await?;
+
+    // Node 0 stays dead (refuses/closes without ACK), Node 1 recovers and responds after 60ms.
+    let n0_alive = Arc::new(AtomicBool::new(false));
+    let n1_alive = Arc::new(AtomicBool::new(false));
+    let n1_hits = Arc::new(AtomicUsize::new(0));
+
+    async fn spawn_toggle_egress(
+        alive: Arc<AtomicBool>,
+        hits: Arc<AtomicUsize>,
+        ack_delay_ms: u64,
+    ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        let l = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = l.local_addr()?;
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else {
+                    break;
+                };
+                let alive_c = alive.clone();
+                let hits_c = hits.clone();
+                tokio::spawn(async move {
+                    if !alive_c.load(Relaxed) {
+                        drop(s);
+                        return;
+                    }
+                    let mut buf = [0u8; 88];
+                    if s.read_exact(&mut buf).await.is_ok() {
+                        hits_c.fetch_add(1, Relaxed);
+                        if ack_delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(ack_delay_ms)).await;
+                        }
+                        let _ = s.write_all(&[EGRESS_ACK_OK]).await;
+                    }
+                });
+            }
+        });
+        Ok((addr, task))
+    }
+
+    let n0_hits = Arc::new(AtomicUsize::new(0));
+    let (addr0, t0) = spawn_toggle_egress(n0_alive.clone(), n0_hits.clone(), 0).await?;
+    let (addr1, t1) = spawn_toggle_egress(n1_alive.clone(), n1_hits.clone(), 60).await?;
+
+    let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut st).context("unique state")?;
+        sm.egress_upstreams = vec![addr0, addr1];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+        sm.egress_cooldown = Duration::from_secs(30);
+        sm.egress_cooldown_max = Duration::from_secs(60);
+        sm.egress_hedge_ms = 0;
+        sm.egress_use_mtv3 = false;
+        sm.handshake = Duration::from_secs(5);
+    }
+
+    // 1. Both nodes down -> put both into 30s cooldown.
+    assert!(connect_upstream(&st, 2, &[0x10; 64]).await.is_err());
+
+    // 2. Bring node 1 back up while both are still in 30s cooldown.
+    n1_alive.store(true, Relaxed);
+    // Ensure node 1 expires slightly sooner so forced probe targets node 1 first (or even if node 0 is probed, <= 1 error!).
+    let mut joins = Vec::with_capacity(200);
+    for _ in 0..200 {
+        let st_c = st.clone();
+        joins.push(tokio::spawn(async move {
+            connect_upstream(&st_c, 2, &[0x20; 64]).await.is_ok()
+        }));
+    }
+    let mut ok = 0usize;
+    let mut fail = 0usize;
+    for j in joins {
+        if j.await? {
+            ok += 1;
+        } else {
+            fail += 1;
+        }
+    }
+    assert!(
+        fail <= 1,
+        "single-flight forced probe must keep errors <= 1 out of 200 concurrent connections (ok={ok}, fail={fail})"
+    );
+    assert!(
+        ok >= 199,
+        "expected >= 199 connections routed to recovered node (ok={ok})"
+    );
+    assert!(n1_hits.load(Relaxed) >= 199);
+
+    t0.abort();
+    t1.abort();
     Ok(())
 }

@@ -920,10 +920,24 @@ pub(crate) async fn connect_upstream(
         }
         // Fail-open when all nodes were in cooldown: force a single probe on the node
         // whose cooldown expires soonest (at most 1 concurrent forced probe per node).
+        // Other concurrent callers wait in single-flight on `egress_probe_notify` within
+        // the remaining handshake budget instead of failing immediately.
         if !attempted_any {
+            struct NotifyOnDrop<'a>(&'a tokio::sync::Notify);
+            impl Drop for NotifyOnDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.notify_waiters();
+                }
+            }
+
+            let notified = state.egress_probe_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             if let Some((idx, claim)) =
                 EgressHealth::try_claim_forced_soonest(&state.egress_health, count, dc_abs)
             {
+                let _notify_guard = NotifyOnDrop(&state.egress_probe_notify);
                 match dial_egress_candidate(state, idx, dc_id, dc_abs, dc_header, per_try).await {
                     Ok(upstream) => {
                         finalize_egress_success(
@@ -939,6 +953,53 @@ pub(crate) async fn connect_upstream(
                     Err(err) => {
                         last_err = Some(finalize_egress_error(state, idx, claim, err));
                     }
+                }
+            } else {
+                // Another connection is already running a forced probe; wait in single-flight
+                // until a node recovers or all active forced probes finish (bounded by handshake budget).
+                notified.await;
+                loop {
+                    let next_notified = state.egress_probe_notify.notified();
+                    tokio::pin!(next_notified);
+                    next_notified.as_mut().enable();
+
+                    for offset in 0..count {
+                        let idx = if ordered {
+                            offset
+                        } else {
+                            (start + offset) % count
+                        };
+                        let Some(claim) = EgressHealth::try_claim(
+                            &state.egress_health,
+                            idx,
+                            dc_abs,
+                            Instant::now(),
+                        ) else {
+                            continue;
+                        };
+                        match dial_egress_candidate(state, idx, dc_id, dc_abs, dc_header, per_try)
+                            .await
+                        {
+                            Ok(upstream) => {
+                                finalize_egress_success(
+                                    state,
+                                    idx,
+                                    claim,
+                                    ordered,
+                                    &last_err,
+                                    "single_flight_recovered",
+                                );
+                                return Ok((upstream, "egress"));
+                            }
+                            Err(err) => {
+                                last_err = Some(finalize_egress_error(state, idx, claim, err));
+                            }
+                        }
+                    }
+                    if !EgressHealth::any_probing(&state.egress_health) {
+                        break;
+                    }
+                    next_notified.await;
                 }
             }
         }

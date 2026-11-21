@@ -231,6 +231,11 @@ impl EgressHealth {
         })
     }
 
+    pub(crate) fn any_probing(health: &std::sync::Mutex<Self>) -> bool {
+        let guard = health.lock().unwrap_or_else(|e| e.into_inner());
+        guard.nodes.iter().any(|s| s.probing) || guard.dc_slots.values().any(|s| s.probing)
+    }
+
     pub(crate) fn try_claim_forced_soonest<'a>(
         health: &'a std::sync::Mutex<EgressHealth>,
         node_count: usize,
