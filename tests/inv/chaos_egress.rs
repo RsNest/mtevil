@@ -484,9 +484,11 @@ async fn inv10_f24_all_nodes_down_and_recovered_without_15s_gap() -> Result<()> 
     // 1. Both nodes down -> client fails and puts both nodes into 15-second cooldown.
     assert!(run_probe_telegram(&cfg_path, edge_addr).await.is_err());
 
-    // 2. Immediately bring n1 back up (well before 15s cooldown expires!):
-    //    Fail-open forced probe must recover traffic immediately without a 15-second hole!
+    // 2. Immediately bring both nodes back up (well before 15s cooldown expires!):
+    //    Fail-open forced probe must recover traffic immediately without a 15-second hole,
+    //    regardless of which node got a slightly shorter ±20% jittered cooldown.
     n1.set_mode(MODE_HEALTHY);
+    n2.set_mode(MODE_HEALTHY);
     let rec_ms = run_probe_telegram(&cfg_path, edge_addr).await?;
     assert!(
         rec_ms < 3000,

@@ -1241,4 +1241,57 @@ mod tests {
         assert!(verify_egress_preface_v3(&tampered, &token, now, EGRESS_V3_MAX_SKEW_SECS).is_err());
         Ok(())
     }
+
+    #[test]
+    fn fuzz_targets_smoke_on_corpus_and_mutations() -> Result<()> {
+        let secret = [0x01u8; 16];
+        let token = [0x10u8; 16];
+        let now = 1_700_000_000u64;
+        let mut rng = OsRng;
+        let (ch_rec, _, _) = build_client_hello(&secret, "example.com", now, &mut rng)?;
+        let ch = &ch_rec[5..];
+
+        // 1. ClientHello parser: truncated slices + single-byte mutations never panic.
+        for len in 0..=ch.len().min(96) {
+            let _ = handshake_length(&ch[..len]);
+            let _ = authenticate(&ch[..len], &secret, "example.com", now);
+        }
+        for pos in 0..ch.len() {
+            let mut mutated = ch.to_vec();
+            mutated[pos] ^= 0xff;
+            let _ = authenticate_with_record_version(&mutated, 3, &secret, "example.com", now);
+        }
+
+        // 2. PROXY v2 parser: boundary lengths and mutated headers never panic.
+        let mut v2 = [0u8; PROXY_V2_HEADER_LEN];
+        v2[..12].copy_from_slice(&PROXY_V2_SIG);
+        v2[12] = 0x21;
+        v2[13] = 0x11;
+        v2[14..16].copy_from_slice(&12u16.to_be_bytes());
+        for pos in 0..PROXY_V2_HEADER_LEN {
+            let mut m = v2;
+            m[pos] ^= 0x55;
+            if let Ok(hdr) = parse_proxy_v2_header(&m) {
+                let _ = parse_proxy_v2_payload(&hdr, &[0u8; 12]);
+                let _ = parse_proxy_v2_payload(&hdr, &[]);
+            }
+        }
+
+        // 3. Obfuscated2 init parser: mutated 64-byte headers never panic.
+        let (init, _, _) = build_client_init(&secret, 2)?;
+        for pos in 0..64 {
+            let mut m = init;
+            m[pos] ^= 0xaa;
+            let _ = client_transport(&m, &secret);
+        }
+
+        // 4. Egress MTV3 preface parser: mutated 126-byte prefaces never panic.
+        let preface = build_egress_preface_v3(&token, 2, now, &[0x22; 16], &[0x33; 64])?;
+        for pos in 0..EGRESS_PREFACE_V3_LEN {
+            let mut m = preface;
+            m[pos] ^= 0x77;
+            let _ = verify_egress_preface_v3(&m, &token, now, EGRESS_V3_MAX_SKEW_SECS);
+        }
+        Ok(())
+    }
 }

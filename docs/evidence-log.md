@@ -1024,3 +1024,7 @@ wire-точность. Перебор высоких портов сгорает
   - `inv10_f24_all_nodes_down_and_recovered_without_15s_gap`: падение всех узлов одновременно с последующим восстановлением — трафик восстанавливается немедленно через fail-open пробу без 15-секундного простоя;
   - `inv10_f15_f29_process_survives_aborted_accepts_and_metrics_live`: серия оборванных подключений на `edge` — процесс остаётся живым, `/metrics` доступен, последующий `probe-telegram` проходит успешно.
 - Проверка: `cargo fmt --all`, `cargo clippy --workspace --all-targets --locked -- -D warnings` (0 предупреждений), `cargo test --workspace --locked` (**86/86** тестов зелёные).
+- **T15 (Fuzz-таргеты `cargo-fuzz` для парсеров `proto::wire`):**
+  - Добавлен каталог `fuzz/` (исключён из workspace `Cargo.toml` для совместимости со стабильным Rust) с `fuzz/Cargo.toml` и 4 fuzz-таргетами: `fuzz_client_hello` (`authenticate` / `authenticate_with_record_version` / `handshake_length`), `fuzz_proxy_v2` (`parse_proxy_v2_header` / `parse_proxy_v2_payload`), `fuzz_obfuscated2_init` (`client_transport`) и `fuzz_egress_preface` (`verify_egress_preface_v3`).
+  - Сформированы seed-корпуса в `fuzz/corpus/` из тестовых векторов `tests/vectors/prototype/` и валидных бинарных образцов PROXY v2 и MTV3.
+  - В `crates/proto/src/wire.rs` добавлен детерминированный smoke-тест `fuzz_targets_smoke_on_corpus_and_mutations` (87/87 тестов workspace зелёные).
