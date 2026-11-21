@@ -1013,3 +1013,14 @@ wire-точность. Перебор высоких портов сгорает
   - В `Config` и CLI добавлен `metrics_listen: Option<SocketAddr>` (выключен по умолчанию, валидация требует loopback `127.0.0.1` / `::1`).
   - В `Counters` добавлены `egress_failover_total`, `cover_rejected`, `replay_full`, `forced_close` и метод `render_prometheus` (Prometheus text exposition `0.0.4`, без внешних HTTP-зависимостей, работает в отдельной задаче `spawn_metrics_server`).
   - Тест `metrics_endpoint_serves_prometheus_text_and_returns_404_on_other_paths` и валидация non-loopback адреса в `config::tests` зелёные (82/82 тестов workspace).
+
+
+## 2026-11-22 · Фаза 4 / T14: Интеграционные chaos-тесты (`tests/inv/chaos_egress.rs`, `INV-10`, `F-15`, `F-23`, `F-24`, `F-29`)
+
+- Создан набор интеграционных chaos-тестов [chaos_egress.rs](../tests/inv/chaos_egress.rs) (подключён как `[[test]] name = "inv_chaos"` в `crates/data-plane/Cargo.toml`), запускающий реальный собранный бинарник `mtevil` в режиме `edge` против `FakeEgress` (с 6 режимами инъекции отказов: `refuse`, `blackhole`, `slow_ack`, `negative_ack`, `flap`, `kill_mid_session`) и локального mock Telegram DC (`req_pq_multi -> resPQ`).
+- Покрытые сценарии (4/4 тестов зелёные):
+  - `inv10_f23_chaos_ordered_failover_modes_and_failback`: отказ первичного узла в режимах `blackhole` (hedge + failover), `slow_ack`, `negative_ack`, `flap`, `kill_mid_session` и `refuse`, переключение на резервный узел и автоматический failback фоновыми пробами;
+  - `inv10_f23_chaos_round_robin_with_dead_node_zero_errors`: 3 узла в `round-robin` с одним мёртвым узлом — `0` клиентских ошибок при серии прогонов и пропуск мёртвого узла через circuit breaker;
+  - `inv10_f24_all_nodes_down_and_recovered_without_15s_gap`: падение всех узлов одновременно с последующим восстановлением — трафик восстанавливается немедленно через fail-open пробу без 15-секундного простоя;
+  - `inv10_f15_f29_process_survives_aborted_accepts_and_metrics_live`: серия оборванных подключений на `edge` — процесс остаётся живым, `/metrics` доступен, последующий `probe-telegram` проходит успешно.
+- Проверка: `cargo fmt --all`, `cargo clippy --workspace --all-targets --locked -- -D warnings` (0 предупреждений), `cargo test --workspace --locked` (**86/86** тестов зелёные).

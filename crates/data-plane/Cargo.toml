@@ -8,6 +8,10 @@ description = "Test-only FakeTLS Direct proxy authorized by ADR-001"
 name = "mtevil"
 path = "src/main.rs"
 
+[[test]]
+name = "inv_chaos"
+path = "../../tests/inv/chaos_egress.rs"
+
 [dependencies]
 mtevil-proto = { path = "../proto" }
 anyhow.workspace = true
