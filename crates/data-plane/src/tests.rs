@@ -3781,3 +3781,36 @@ async fn inv10_f31_egress_nonce_cache_30000_valid_hmacs_zero_rejections_and_dupl
     );
     Ok(())
 }
+
+#[test]
+fn inv10_f31_ip_failure_tracker_evicts_oldest_and_tracks_metric() -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut tracker = IpFailureTracker::with_capacity(Duration::from_secs(60), 2, 3);
+    let counters = telemetry::Counters::default();
+    let base = Instant::now();
+    let ip1: std::net::IpAddr = "203.0.113.1".parse()?;
+    let ip2: std::net::IpAddr = "203.0.113.2".parse()?;
+    let ip3: std::net::IpAddr = "203.0.113.3".parse()?;
+    let ip4: std::net::IpAddr = "203.0.113.4".parse()?;
+
+    assert!(!tracker.record_failure(ip1, base));
+    assert!(!tracker.record_failure(ip2, base + Duration::from_secs(1)));
+    assert!(!tracker.record_failure(ip3, base + Duration::from_secs(2)));
+    assert_eq!(tracker.entries.len(), 3);
+
+    // 4th distinct IP must evict oldest (ip1) instead of silently ignoring ip4.
+    if tracker.record_failure(ip4, base + Duration::from_secs(3)) {
+        counters
+            .egress_failed_tracker_evictions
+            .fetch_add(1, Relaxed);
+    }
+    assert_eq!(counters.egress_failed_tracker_evictions.load(Relaxed), 1);
+    assert_eq!(tracker.entries.len(), 3);
+    assert!(!tracker.entries.contains_key(&ip1));
+    assert!(tracker.entries.contains_key(&ip4));
+
+    // ip4 can now accumulate failures and hit rate-limit.
+    assert!(!tracker.record_failure(ip4, base + Duration::from_secs(4)));
+    assert!(tracker.is_rate_limited(ip4, base + Duration::from_secs(4)));
+    Ok(())
+}

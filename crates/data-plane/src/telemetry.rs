@@ -98,6 +98,7 @@ pub struct Counters {
     pub egress_mtv3_connections: AtomicU64,
     pub egress_preface_aborted: AtomicU64,
     pub egress_nonce_cache_full: AtomicU64,
+    pub egress_failed_tracker_evictions: AtomicU64,
 }
 
 impl Counters {
@@ -164,6 +165,9 @@ impl Counters {
             "egress_mtv3_connections": self.egress_mtv3_connections.load(Ordering::Relaxed),
             "egress_preface_aborted": self.egress_preface_aborted.load(Ordering::Relaxed),
             "egress_nonce_cache_full": self.egress_nonce_cache_full.load(Ordering::Relaxed),
+            "egress_failed_tracker_evictions": self
+                .egress_failed_tracker_evictions
+                .load(Ordering::Relaxed),
         })
     }
 
@@ -287,6 +291,20 @@ impl Counters {
             out,
             "mtevil_egress_nonce_cache_full_total {}",
             self.egress_nonce_cache_full.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_egress_failed_tracker_evictions_total Oldest-entry evictions from egress per-IP auth failure tracker"
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE mtevil_egress_failed_tracker_evictions_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "mtevil_egress_failed_tracker_evictions_total {}",
+            self.egress_failed_tracker_evictions.load(Ordering::Relaxed)
         );
 
         let _ = writeln!(

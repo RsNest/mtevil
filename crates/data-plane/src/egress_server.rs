@@ -30,18 +30,31 @@ impl EgressSecurityConfig {
     }
 }
 
+/// Maximum number of distinct source IPs tracked simultaneously in `IpFailureTracker`.
+///
+/// Upper memory bound: at most `IP_FAILURE_TRACKER_MAX_IPS` (4096) entries, each holding
+/// an `IpAddr` and a `VecDeque<Instant>` bounded to `max_failed_per_ip + 1` timestamps
+/// (~1.5–2 MiB total at the default `egress_max_failed_per_ip = 16`).
+pub(crate) const IP_FAILURE_TRACKER_MAX_IPS: usize = 4096;
+
 pub(crate) struct IpFailureTracker {
     pub(crate) entries: HashMap<std::net::IpAddr, std::collections::VecDeque<Instant>>,
     pub(crate) window: Duration,
     pub(crate) max_failed: usize,
+    pub(crate) max_entries: usize,
 }
 
 impl IpFailureTracker {
     pub(crate) fn new(window: Duration, max_failed: usize) -> Self {
+        Self::with_capacity(window, max_failed, IP_FAILURE_TRACKER_MAX_IPS)
+    }
+
+    pub(crate) fn with_capacity(window: Duration, max_failed: usize, max_entries: usize) -> Self {
         Self {
             entries: HashMap::new(),
             window,
             max_failed,
+            max_entries: max_entries.max(1),
         }
     }
 
@@ -74,12 +87,23 @@ impl IpFailureTracker {
         false
     }
 
-    pub(crate) fn record_failure(&mut self, ip: std::net::IpAddr, now: Instant) {
-        if self.entries.len() >= 4096 {
+    /// Record an authentication failure for `ip`. Returns `true` if the oldest tracked IP
+    /// had to be evicted to make room for a new entry.
+    pub(crate) fn record_failure(&mut self, ip: std::net::IpAddr, now: Instant) -> bool {
+        let mut evicted = false;
+        if !self.entries.contains_key(&ip) && self.entries.len() >= self.max_entries {
             self.prune(now);
-        }
-        if self.entries.len() >= 4096 && !self.entries.contains_key(&ip) {
-            return;
+            if self.entries.len() >= self.max_entries {
+                if let Some(oldest_ip) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, q)| q.back().copied())
+                    .map(|(k, _)| *k)
+                {
+                    self.entries.remove(&oldest_ip);
+                    evicted = true;
+                }
+            }
         }
         let window = self.window;
         let q = self.entries.entry(ip).or_default();
@@ -93,6 +117,7 @@ impl IpFailureTracker {
         if q.len() < self.max_failed.saturating_add(1) {
             q.push_back(now);
         }
+        evicted
     }
 }
 
@@ -129,9 +154,21 @@ impl EgressRuntimeSecurity {
         Ok(())
     }
 
-    pub(crate) fn record_auth_failure(&self, ip: std::net::IpAddr) {
+    pub(crate) fn record_auth_failure(&self, ip: std::net::IpAddr) -> bool {
         let mut tracker = self.failed_by_ip.lock().unwrap_or_else(|e| e.into_inner());
-        tracker.record_failure(ip, Instant::now());
+        tracker.record_failure(ip, Instant::now())
+    }
+
+    pub(crate) fn record_auth_failure_counted(
+        &self,
+        ip: std::net::IpAddr,
+        counters: &telemetry::Counters,
+    ) {
+        if self.record_auth_failure(ip) {
+            counters
+                .egress_failed_tracker_evictions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -290,7 +327,7 @@ pub(crate) async fn egress_connection(
         ) {
             Ok(p) => p,
             Err(err) => {
-                security.record_auth_failure(peer_ip);
+                security.record_auth_failure_counted(peer_ip, counters);
                 return Err(err);
             }
         };
@@ -306,7 +343,7 @@ pub(crate) async fn egress_connection(
         match decision {
             Decision::Fresh => {}
             Decision::Duplicate => {
-                security.record_auth_failure(peer_ip);
+                security.record_auth_failure_counted(peer_ip, counters);
                 bail!("egress MTV3 nonce replay detected");
             }
             Decision::Full => {
@@ -327,7 +364,7 @@ pub(crate) async fn egress_connection(
         (parsed.dc, Some(parsed.dc_header))
     } else if magic == wire::EGRESS_MAGIC_V2 {
         if !security.cfg.accept_legacy {
-            security.record_auth_failure(peer_ip);
+            security.record_auth_failure_counted(peer_ip, counters);
             bail!("egress legacy MTV2 disabled");
         }
         let mut rest = [0u8; 20];
@@ -344,14 +381,14 @@ pub(crate) async fn egress_connection(
             .fetch_add(rest.len() as u64, Relaxed);
         let token: [u8; 16] = rest[4..20].try_into()?;
         if !ct_eq_16(&token, expected_token) {
-            security.record_auth_failure(peer_ip);
+            security.record_auth_failure_counted(peer_ip, counters);
             bail!("egress token mismatch");
         }
         let dc_id = i16::from_le_bytes([rest[0], rest[1]]);
         counters.egress_legacy_connections.fetch_add(1, Relaxed);
         (dc_id, None)
     } else {
-        security.record_auth_failure(peer_ip);
+        security.record_auth_failure_counted(peer_ip, counters);
         bail!("invalid egress magic");
     };
     drop(unauth_permit);
