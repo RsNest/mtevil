@@ -1031,3 +1031,16 @@ wire-точность. Перебор высоких портов сгорает
 - **T16 (CI workflow `.github/workflows/ci.yml` и `deny.toml`):**
   - Добавлен `.github/workflows/ci.yml` (на `push` и `pull_request`): `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` (тулчейн `1.100.0`, как в `Dockerfile`), `cargo-deny check advisories licenses`, `cargo-audit`, прогон всех 4 fuzz-таргетов по `60 с` на nightly и сборка `Dockerfile` без push.
   - Добавлен `deny.toml` (v2) с политикой advisories/licenses/sources; `.github/workflows/release.yml` не затронут; `Dockerfile` дополнен `COPY tests/inv ./tests/inv` для корректного манифеста `inv_chaos`.
+
+
+## 2026-11-22 · Фаза 5 / T17: Модуляризация `crates/data-plane/src/main.rs`
+
+- Монолит `crates/data-plane/src/main.rs` (~4974 строки) разбит на 7 тематических модулей без изменения поведения и без единой правки в тестах (`tests.rs` не изменялся):
+  - `egress_health.rs` (circuit breaker, exponential backoff/jitter, fail-open, state tracking);
+  - `alerts.rs` (форматирование алертов, HTTP webhook, `monitor_edge_egress`);
+  - `cover.rs` (фоновый `CoverResolver` с TTL/LKG и `bounded_cover`/`cover`);
+  - `connect.rs` (`connect_upstream`, hedged connect, `dial_egress_candidate`, `dc_media_override`, `monitor_dc_reachability`, `probe_telegram_e2e`);
+  - `relay.rs` (`TlsReader`, `relay_client`, `upload`/`download`, `RelayStats`, `sample_fd_retrans`);
+  - `serve.rs` (`Acceptor`, `AcceptLoopState`, `serve`, `connection`, `spawn_metrics_server`, FD budget);
+  - `egress_server.rs` (`serve_egress_with_security`, `egress_connection`, `IpFailureTracker`).
+- Проверка: `cargo fmt --all`, `cargo clippy --workspace --all-targets --locked -- -D warnings` (0 предупреждений), `cargo test --workspace --locked` (87/87 зелёные).
