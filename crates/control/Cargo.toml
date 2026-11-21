@@ -1,8 +1,0 @@
-[package]
-name = "mtevil-control"
-version = "0.0.0"
-edition.workspace = true
-description = "Epoch-конфиги, users, API, metrics. ПУСТО: spec-first, код после ADR-001 (ADR-000 §1)"
-
-[lints]
-workspace = true

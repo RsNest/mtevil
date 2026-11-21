@@ -14,6 +14,8 @@ path = "../../tests/inv/chaos_egress.rs"
 
 [dependencies]
 mtevil-proto = { path = "../proto" }
+mtevil-egress = { path = "../egress" }
+mtevil-guard = { path = "../guard" }
 anyhow.workspace = true
 clap.workspace = true
 hex.workspace = true

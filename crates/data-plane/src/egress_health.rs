@@ -7,31 +7,6 @@ pub(crate) struct CooldownSlot {
     pub(crate) failures: u32,
 }
 
-pub(crate) fn compute_egress_cooldown_unclamped_ms(
-    base_ms: u64,
-    max_ms: u64,
-    failures: u32,
-) -> u64 {
-    let shift = failures.saturating_sub(1).min(20);
-    let scaled = base_ms.saturating_mul(1u64 << shift);
-    scaled.min(max_ms.max(base_ms))
-}
-
-pub(crate) fn apply_cooldown_jitter_ms(clamped_ms: u64, sample_permille: i64) -> u64 {
-    let factor = (1000 + sample_permille.clamp(-200, 200)) as u128;
-    let out = (u128::from(clamped_ms) * factor) / 1000;
-    (out as u64).max(1)
-}
-
-pub(crate) fn compute_egress_cooldown(base: Duration, max: Duration, failures: u32) -> Duration {
-    use rand::Rng;
-    let base_ms = base.as_millis().min(u128::from(u64::MAX)) as u64;
-    let max_ms = max.as_millis().min(u128::from(u64::MAX)) as u64;
-    let clamped_ms = compute_egress_cooldown_unclamped_ms(base_ms, max_ms, failures);
-    let sample = rand::rngs::OsRng.gen_range(-200..=200);
-    Duration::from_millis(apply_cooldown_jitter_ms(clamped_ms, sample))
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum EdgeRouteState {
     #[default]

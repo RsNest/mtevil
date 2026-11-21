@@ -1,5 +1,9 @@
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
+use mtevil_egress::compute_egress_cooldown;
+#[cfg(test)]
+use mtevil_egress::{apply_cooldown_jitter_ms, compute_egress_cooldown_unclamped_ms};
+use mtevil_guard::replay::{self, Decision, ReplayCache};
 use mtevil_proto::{self as wire, AesCtr};
 use sha2::{Digest, Sha256};
 use std::{
@@ -16,8 +20,6 @@ use tokio::{
     time::{timeout, Instant},
 };
 use zeroize::Zeroizing;
-mod replay;
-use replay::{Decision, ReplayCache};
 
 mod config;
 use config::{Config, EgressStrategy, NamedSecret, Role};

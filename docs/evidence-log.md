@@ -1044,3 +1044,8 @@ wire-точность. Перебор высоких портов сгорает
   - `serve.rs` (`Acceptor`, `AcceptLoopState`, `serve`, `connection`, `spawn_metrics_server`, FD budget);
   - `egress_server.rs` (`serve_egress_with_security`, `egress_connection`, `IpFailureTracker`).
 - Проверка: `cargo fmt --all`, `cargo clippy --workspace --all-targets --locked -- -D warnings` (0 предупреждений), `cargo test --workspace --locked` (87/87 зелёные).
+- **T18 (Приведение workspace в соответствие с фактической архитектурой):**
+  - В `crates/guard` (`mtevil-guard`) перенесён реальный `ReplayCache` (`Decision`, `ReplayLoadStatus`, персистентный снэпшот + 3 unit-теста);
+  - В `crates/egress` (`mtevil-egress`) перенесены примитивы экспоненциального backoff и jitter (`compute_egress_cooldown_unclamped_ms`, `apply_cooldown_jitter_ms`, `compute_egress_cooldown` + unit-тест);
+  - Пустые placeholder-крейты `crates/me-pool` и `crates/control` удалены из `Cargo.toml` и репозитория, `Cargo.lock` обновлён только по workspace-зависимостям;
+  - Проверка: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings` (0 предупреждений), `cargo test --workspace --locked` (**88/88** тестов зелёные).
