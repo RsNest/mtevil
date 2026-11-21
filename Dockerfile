@@ -4,6 +4,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY tests/vectors/prototype ./tests/vectors/prototype
+COPY tests/inv ./tests/inv
 ARG MTEVIL_VERSION=0.1.0-dev
 ENV MTEVIL_BUILD_VERSION=${MTEVIL_VERSION}
 RUN cargo build --release --locked -p mtevil-data-plane
