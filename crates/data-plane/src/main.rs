@@ -34,7 +34,7 @@ const BUILD_VERSION: &str = match option_env!("MTEVIL_BUILD_VERSION") {
 struct Args {
     #[command(subcommand)]
     command: Option<Action>,
-    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms","egress_probe_interval_secs","egress_probe_degraded_interval_secs","egress_hedge_ms","egress_accept_legacy","egress_use_mtv3","egress_allow_from","egress_max_failed_per_ip"])]
+    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms","egress_probe_interval_secs","egress_probe_degraded_interval_secs","egress_hedge_ms","egress_accept_legacy","egress_use_mtv3","egress_allow_from","egress_max_failed_per_ip","dc_media_override","dc_probe_interval_secs"])]
     config: Option<PathBuf>,
     #[arg(long)]
     check_config: bool,
@@ -116,6 +116,12 @@ struct Args {
     /// Maximum failed authentication attempts per source IP within a 60s sliding window on egress.
     #[arg(long)]
     egress_max_failed_per_ip: Option<usize>,
+    /// Configurable media/alternate DC candidate overrides (`ID=IP:PORT`).
+    #[arg(long)]
+    dc_media_override: Vec<String>,
+    /// Background DC self-check interval in seconds on direct/egress (0 = disabled).
+    #[arg(long)]
+    dc_probe_interval_secs: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -249,6 +255,14 @@ impl Args {
             egress_max_failed_per_ip: self
                 .egress_max_failed_per_ip
                 .unwrap_or_else(config::default_egress_max_failed_per_ip),
+            dc_media_override: if self.dc_media_override.is_empty() {
+                config::default_dc_media_override()
+            } else {
+                self.dc_media_override
+            },
+            dc_probe_interval_secs: self
+                .dc_probe_interval_secs
+                .unwrap_or_else(config::default_dc_probe_interval_secs),
         };
         config.validate()?;
         Ok(config)
@@ -612,6 +626,7 @@ struct State {
     proxy_protocol: bool,
     cover_permits: Semaphore,
     dcs: HashMap<i16, SocketAddr>,
+    dc_media_overrides: HashMap<i16, Vec<SocketAddr>>,
     egress_upstreams: Vec<SocketAddr>,
     egress_strategy: EgressStrategy,
     egress_token: [u8; 16],
@@ -1464,6 +1479,7 @@ async fn main() -> Result<()> {
     let check_config = args.check_config;
     let config = args.runtime_config()?;
     let dcs = config.datacenters().unwrap_or_default();
+    let dc_media_overrides = config.dc_media_overrides().unwrap_or_default();
     let egress_token = config.egress_token()?;
     let stats_path = std::env::var_os("MTEVIL_STATS_FILE")
         .map(PathBuf::from)
@@ -1530,13 +1546,23 @@ async fn main() -> Result<()> {
             max_failed_per_ip: config.egress_max_failed_per_ip,
             failed_window: Duration::from_secs(60),
             max_unauth_handshakes: (effective_max / 4).clamp(4, 128),
+            dc_media_overrides: dc_media_overrides.clone(),
         };
+        let dcs_arc = Arc::new(dcs);
+        let dc_monitor = (config.dc_probe_interval_secs > 0).then(|| {
+            tokio::spawn(monitor_dc_reachability(
+                dcs_arc.clone(),
+                Arc::new(dc_media_overrides),
+                counters.clone(),
+                Duration::from_secs(config.dc_probe_interval_secs),
+            ))
+        });
         #[cfg(unix)]
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let res = serve_egress_with_security(
             listener,
-            Arc::new(dcs),
+            dcs_arc,
             egress_token,
             effective_max,
             Duration::from_secs(config.handshake_timeout_secs),
@@ -1555,6 +1581,10 @@ async fn main() -> Result<()> {
             },
         )
         .await;
+        if let Some(task) = dc_monitor {
+            task.abort();
+            let _ = task.await;
+        }
         let _ = stats_stop_tx.send(());
         let _ = stats_task.await;
         return res;
@@ -1602,6 +1632,7 @@ async fn main() -> Result<()> {
         proxy_protocol: config.proxy_protocol,
         cover_permits: Semaphore::new(max_cover_connections),
         dcs,
+        dc_media_overrides,
         egress_upstreams: config.egress_upstreams,
         egress_strategy: config.egress_strategy,
         egress_token,
@@ -1722,6 +1753,15 @@ async fn main() -> Result<()> {
         let interval = state.egress_probe_interval;
         tokio::spawn(monitor_edge_egress(state.clone(), interval))
     });
+    let dc_monitor =
+        (state.egress_upstreams.is_empty() && config.dc_probe_interval_secs > 0).then(|| {
+            tokio::spawn(monitor_dc_reachability(
+                Arc::new(state.dcs.clone()),
+                Arc::new(state.dc_media_overrides.clone()),
+                state.counters.clone(),
+                Duration::from_secs(config.dc_probe_interval_secs),
+            ))
+        });
     let (users_stop_tx, users_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let users_task = reload_config
         .map(|cfg| spawn_users_reloader(state.clone(), cfg, Duration::from_secs(1), users_stop_rx));
@@ -1740,6 +1780,10 @@ async fn main() -> Result<()> {
     let _ = stats_stop_tx.send(());
     let _ = stats_task.await;
     if let Some(task) = egress_monitor {
+        task.abort();
+        let _ = task.await;
+    }
+    if let Some(task) = dc_monitor {
         task.abort();
         let _ = task.await;
     }
@@ -3517,61 +3561,227 @@ async fn probe_telegram_e2e(
 }
 
 #[cfg(test)]
+fn default_media_override_map() -> HashMap<i16, Vec<SocketAddr>> {
+    Config {
+        role: Role::Direct,
+        listen: SocketAddr::from(([127, 0, 0, 1], 24443)),
+        secret_file: None,
+        users_file: None,
+        replay_file: None,
+        sni: String::new(),
+        cover: String::new(),
+        enable_dd: false,
+        proxy_protocol: false,
+        dc: Vec::new(),
+        egress_upstreams: Vec::new(),
+        egress_strategy: EgressStrategy::RoundRobin,
+        egress_token_file: None,
+        max_connections: 128,
+        client_hello_timeout_secs: 5,
+        handshake_timeout_secs: 10,
+        idle_timeout_secs: 300,
+        drain_timeout_secs: 5,
+        fake_tls_cert_bytes: wire::DEFAULT_CERT_BYTES,
+        fake_tls_cert_jitter: 0,
+        flight_shaping: false,
+        client_mss: None,
+        client_mss_bulk: None,
+        alert_webhook_url: None,
+        egress_cooldown_base_ms: config::default_egress_cooldown_base_ms(),
+        egress_cooldown_max_ms: config::default_egress_cooldown_max_ms(),
+        egress_probe_interval_secs: config::default_egress_probe_interval_secs(),
+        egress_probe_degraded_interval_secs: config::default_egress_probe_degraded_interval_secs(),
+        egress_hedge_ms: config::default_egress_hedge_ms(),
+        egress_accept_legacy: config::default_egress_accept_legacy(),
+        egress_use_mtv3: config::default_egress_use_mtv3(),
+        egress_allow_from: Vec::new(),
+        egress_max_failed_per_ip: config::default_egress_max_failed_per_ip(),
+        dc_media_override: config::default_dc_media_override(),
+        dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
+    }
+    .dc_media_overrides()
+    .unwrap_or_default()
+}
+
+#[cfg(test)]
 fn lookup_dc_addr(dcs: &HashMap<i16, SocketAddr>, dc_id: i16) -> Option<SocketAddr> {
     lookup_dc_candidates(dcs, dc_id, 0).into_iter().next()
 }
 
+#[cfg(test)]
 fn lookup_dc_candidates(dcs: &HashMap<i16, SocketAddr>, dc_id: i16, seq: usize) -> Vec<SocketAddr> {
+    lookup_dc_candidates_with_overrides(dcs, &default_media_override_map(), dc_id, seq)
+}
+
+fn lookup_dc_candidates_with_overrides(
+    dcs: &HashMap<i16, SocketAddr>,
+    overrides: &HashMap<i16, Vec<SocketAddr>>,
+    dc_id: i16,
+    seq: usize,
+) -> Vec<SocketAddr> {
     let std_dc2 = SocketAddr::from(([149, 154, 167, 51], 443));
     let std_dc2_media = SocketAddr::from(([149, 154, 167, 151], 443));
-    let std_dc2_alt = SocketAddr::from(([149, 154, 167, 220], 443));
     let std_dc4 = SocketAddr::from(([149, 154, 167, 91], 443));
     let std_dc4_media = SocketAddr::from(([149, 154, 166, 120], 443));
-    let std_dc4_alt = SocketAddr::from(([149, 154, 167, 92], 443));
 
     if let Some(&addr) = dcs.get(&dc_id) {
         let mut out = vec![addr];
-        if dc_id == 2 && addr == std_dc2 {
-            out.push(std_dc2_alt);
-        } else if dc_id == -2 && addr == std_dc2_media {
-            if seq % 2 == 1 {
-                out = vec![std_dc2_alt, std_dc2_media, std_dc2];
-            } else {
-                out.push(std_dc2_alt);
-                out.push(std_dc2);
+        let is_standard_prod = (dc_id == 2 && addr == std_dc2)
+            || (dc_id == -2 && addr == std_dc2_media)
+            || (dc_id == 4 && addr == std_dc4)
+            || (dc_id == -4 && addr == std_dc4_media);
+        let apply_ovr = is_standard_prod
+            || overrides
+                .get(&dc_id)
+                .is_some_and(|list| list.contains(&addr));
+        if apply_ovr {
+            if let Some(ovr_list) = overrides.get(&dc_id) {
+                if dc_id < 0 && ovr_list.len() >= 2 && seq % 2 == 1 {
+                    let mut rot = Vec::with_capacity(ovr_list.len() + 2);
+                    for (i, &cand) in ovr_list.iter().enumerate() {
+                        if i > 0 && !rot.contains(&cand) {
+                            rot.push(cand);
+                        }
+                    }
+                    if !rot.contains(&addr) {
+                        rot.push(addr);
+                    }
+                    if let Some(&first) = ovr_list.first() {
+                        if !rot.contains(&first) {
+                            rot.push(first);
+                        }
+                    }
+                    out = rot;
+                } else {
+                    for &cand in ovr_list {
+                        if !out.contains(&cand) {
+                            out.push(cand);
+                        }
+                    }
+                }
             }
-        } else if dc_id == 4 && addr == std_dc4 {
-            out.push(std_dc4_alt);
-        } else if dc_id == -4 && addr == std_dc4_media {
-            if seq % 2 == 1 {
-                out = vec![std_dc4_alt, std_dc4_media, std_dc4];
-            } else {
-                out.push(std_dc4_alt);
-                out.push(std_dc4);
+            if dc_id < 0 {
+                if let Some(&base) = dcs.get(&dc_id.abs()) {
+                    if !out.contains(&base) {
+                        out.push(base);
+                    }
+                } else if dc_id == -2 && !out.contains(&std_dc2) {
+                    out.push(std_dc2);
+                } else if dc_id == -4 && !out.contains(&std_dc4) {
+                    out.push(std_dc4);
+                }
             }
         }
         return out;
     }
+    if dc_id < 0 {
+        if let Some(ovr_list) = overrides.get(&dc_id).filter(|l| !l.is_empty()) {
+            let apply = match dcs.get(&dc_id.abs()) {
+                Some(&base) => {
+                    (dc_id == -2 && base == std_dc2)
+                        || (dc_id == -4 && base == std_dc4)
+                        || ovr_list.iter().any(|c| {
+                            c.ip() != std_dc2_media.ip()
+                                && c.ip() != std_dc4_media.ip()
+                                && c.ip() != std::net::IpAddr::from([149, 154, 167, 220])
+                                && c.ip() != std::net::IpAddr::from([149, 154, 167, 92])
+                        })
+                }
+                None => false,
+            };
+            if apply {
+                let mut out = if ovr_list.len() >= 2 && seq % 2 == 1 {
+                    let mut rot = ovr_list[1..].to_vec();
+                    rot.push(ovr_list[0]);
+                    rot
+                } else {
+                    ovr_list.clone()
+                };
+                if let Some(&base) = dcs.get(&dc_id.abs()) {
+                    if !out.contains(&base) {
+                        out.push(base);
+                    }
+                }
+                return out;
+            }
+        }
+    }
     let Some(&base) = dcs.get(&dc_id.abs()) else {
         return Vec::new();
     };
-    // When using the default production signaling DCs, route negative media DC requests (-2, -4)
-    // across Telegram's dedicated media DC endpoints with automatic failover unless overridden.
-    if dc_id == -2 && base == std_dc2 {
-        return if seq % 2 == 1 {
-            vec![std_dc2_alt, std_dc2_media, std_dc2]
-        } else {
-            vec![std_dc2_media, std_dc2_alt, std_dc2]
-        };
-    }
-    if dc_id == -4 && base == std_dc4 {
-        return if seq % 2 == 1 {
-            vec![std_dc4_alt, std_dc4_media, std_dc4]
-        } else {
-            vec![std_dc4_media, std_dc4_alt, std_dc4]
-        };
-    }
     vec![base]
+}
+
+async fn run_dc_reachability_check_once(
+    dcs: &HashMap<i16, SocketAddr>,
+    overrides: &HashMap<i16, Vec<SocketAddr>>,
+    counters: &telemetry::Counters,
+    per_target_limit: Duration,
+) -> (usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut targets: Vec<(i16, SocketAddr)> = Vec::new();
+    let mut ids: Vec<i16> = dcs.keys().copied().collect();
+    for &id in overrides.keys() {
+        if !ids.contains(&id) && dcs.contains_key(&id.abs()) {
+            ids.push(id);
+        }
+    }
+    ids.sort();
+    for id in ids {
+        for addr in lookup_dc_candidates_with_overrides(dcs, overrides, id, 0) {
+            if !targets.iter().any(|(_, a)| *a == addr) {
+                targets.push((id, addr));
+            }
+        }
+    }
+    let mut ok_count = 0usize;
+    let mut fail_count = 0usize;
+    let mut checks = Vec::with_capacity(targets.len());
+    for (dc_id, addr) in targets {
+        let t0 = Instant::now();
+        let reachable = timeout(per_target_limit, TcpStream::connect(addr))
+            .await
+            .is_ok_and(|res| res.is_ok());
+        let rtt_ms = t0.elapsed().as_millis() as u64;
+        if reachable {
+            ok_count += 1;
+            counters.dc_self_check_ok.fetch_add(1, Relaxed);
+        } else {
+            fail_count += 1;
+            counters.dc_self_check_failed.fetch_add(1, Relaxed);
+        }
+        checks.push(json!({
+            "dc": dc_id,
+            "address": addr.to_string(),
+            "reachable": reachable,
+            "rtt_ms": rtt_ms,
+        }));
+    }
+    telemetry::event(
+        "dc_self_check",
+        0,
+        json!({
+            "reachable_count": ok_count,
+            "unreachable_count": fail_count,
+            "checks": checks,
+        }),
+    );
+    (ok_count, fail_count)
+}
+
+async fn monitor_dc_reachability(
+    dcs: Arc<HashMap<i16, SocketAddr>>,
+    overrides: Arc<HashMap<i16, Vec<SocketAddr>>>,
+    counters: Arc<telemetry::Counters>,
+    period: Duration,
+) {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let _ = run_dc_reachability_check_once(&dcs, &overrides, &counters, Duration::from_secs(3))
+            .await;
+    }
 }
 
 async fn connect_dc_candidates(
@@ -3753,7 +3963,8 @@ async fn connect_upstream(
     use std::sync::atomic::Ordering::Relaxed;
     if state.egress_upstreams.is_empty() {
         let seq = state.egress_rr.fetch_add(1, Relaxed);
-        let candidates = lookup_dc_candidates(&state.dcs, dc_id, seq);
+        let candidates =
+            lookup_dc_candidates_with_overrides(&state.dcs, &state.dc_media_overrides, dc_id, seq);
         let mut upstream = connect_dc_candidates(&candidates, state.handshake).await?;
         timeout(state.handshake, upstream.write_all(dc_header)).await??;
         state
@@ -4003,6 +4214,7 @@ struct EgressSecurityConfig {
     max_failed_per_ip: usize,
     failed_window: Duration,
     max_unauth_handshakes: usize,
+    dc_media_overrides: HashMap<i16, Vec<SocketAddr>>,
 }
 
 impl EgressSecurityConfig {
@@ -4014,6 +4226,7 @@ impl EgressSecurityConfig {
             max_failed_per_ip: config::default_egress_max_failed_per_ip(),
             failed_window: Duration::from_secs(60),
             max_unauth_handshakes: (max_connections / 4).clamp(4, 128),
+            dc_media_overrides: default_media_override_map(),
         }
     }
 
@@ -4340,7 +4553,8 @@ async fn egress_connection(
         return Ok(());
     }
     let seq = counters.active.load(Relaxed) as usize;
-    let candidates = lookup_dc_candidates(dcs, raw_dc_id, seq);
+    let candidates =
+        lookup_dc_candidates_with_overrides(dcs, &security.cfg.dc_media_overrides, raw_dc_id, seq);
     if candidates.is_empty() {
         if edge.write_all(&[EGRESS_ACK_ERR]).await.is_ok() {
             counters.downstream_tx_bytes.fetch_add(1, Relaxed);

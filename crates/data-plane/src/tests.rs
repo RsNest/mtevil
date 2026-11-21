@@ -65,6 +65,7 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         proxy_protocol: false,
         cover_permits: Semaphore::new(8),
         dcs: HashMap::from([(2, dc)]),
+        dc_media_overrides: default_media_override_map(),
         egress_upstreams: Vec::new(),
         egress_strategy: EgressStrategy::RoundRobin,
         egress_token: [0u8; 16],
@@ -1262,6 +1263,8 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         egress_use_mtv3: config::default_egress_use_mtv3(),
         egress_allow_from: Vec::new(),
         egress_max_failed_per_ip: config::default_egress_max_failed_per_ip(),
+        dc_media_override: config::default_dc_media_override(),
+        dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
     };
 
     let mut proxy_state = state(cover.addr, dc_addr);
@@ -1697,6 +1700,8 @@ async fn probe_telegram_e2e_verifies_handshake_and_res_pq_reply() -> Result<()> 
         egress_use_mtv3: config::default_egress_use_mtv3(),
         egress_allow_from: Vec::new(),
         egress_max_failed_per_ip: config::default_egress_max_failed_per_ip(),
+        dc_media_override: config::default_dc_media_override(),
+        dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
     };
 
     let rtt_ms = probe_telegram_e2e(&cfg, proxy_addr, 2, Duration::from_secs(3)).await?;
@@ -2101,6 +2106,8 @@ async fn allowed_sni_file_accepts_previous_and_current_sni_without_breaking_link
         egress_use_mtv3: config::default_egress_use_mtv3(),
         egress_allow_from: Vec::new(),
         egress_max_failed_per_ip: config::default_egress_max_failed_per_ip(),
+        dc_media_override: config::default_dc_media_override(),
+        dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
     };
     assert_eq!(cfg.allowed_snis(), "ya.ru,example.com,vk.com");
 
@@ -2871,6 +2878,7 @@ async fn egress_mtv3_verifies_hmac_rejects_replay_skew_legacy_toggle_and_securit
         max_failed_per_ip: 4,
         failed_window: Duration::from_secs(60),
         max_unauth_handshakes: 2,
+        dc_media_overrides: default_media_override_map(),
     };
     let egress_task = tokio::spawn(serve_egress_with_security(
         egress_listener,
@@ -2993,6 +3001,7 @@ async fn egress_mtv3_verifies_hmac_rejects_replay_skew_legacy_toggle_and_securit
         max_failed_per_ip: 16,
         failed_window: Duration::from_secs(60),
         max_unauth_handshakes: 1,
+        dc_media_overrides: default_media_override_map(),
     };
     let egress2_task = tokio::spawn(serve_egress_with_security(
         egress2_listener,
@@ -3028,6 +3037,51 @@ async fn egress_mtv3_verifies_hmac_rejects_replay_skew_legacy_toggle_and_securit
     let _ = shutdown2_tx.send(());
     timeout(Duration::from_secs(2), egress_task).await???;
     timeout(Duration::from_secs(2), egress2_task).await???;
+    dc_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn dc_media_override_is_configurable_and_background_dc_self_check_leaves_routing_unchanged(
+) -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let live_dc = TcpListener::bind("127.0.0.1:0").await?;
+    let live_addr = live_dc.local_addr()?;
+    let dead_addr = closed_port().await?;
+    let custom_media_a: SocketAddr = "127.0.0.1:40151".parse()?;
+    let custom_media_b: SocketAddr = "127.0.0.1:40220".parse()?;
+
+    let dc_task = tokio::spawn(async move { while let Ok((_peer, _)) = live_dc.accept().await {} });
+
+    // 1. Custom dc_media_override replaces hardcoded candidates and rotates negative media DCs.
+    let dcs = HashMap::from([(2i16, live_addr)]);
+    let overrides = HashMap::from([(-2i16, vec![custom_media_a, custom_media_b])]);
+    let seq0 = lookup_dc_candidates_with_overrides(&dcs, &overrides, -2, 0);
+    let seq1 = lookup_dc_candidates_with_overrides(&dcs, &overrides, -2, 1);
+    assert_eq!(seq0, vec![custom_media_a, custom_media_b, live_addr]);
+    assert_eq!(seq1, vec![custom_media_b, custom_media_a, live_addr]);
+
+    // 2. Background DC self-check updates metrics (`dc_self_check_ok` / `dc_self_check_failed`)
+    //    without modifying `dcs` or `overrides` routing tables.
+    let self_check_dcs = HashMap::from([(2i16, live_addr), (4i16, dead_addr)]);
+    let self_check_overrides = HashMap::new();
+    let counters = telemetry::Counters::default();
+    let (ok, fail) = run_dc_reachability_check_once(
+        &self_check_dcs,
+        &self_check_overrides,
+        &counters,
+        Duration::from_millis(300),
+    )
+    .await;
+    assert_eq!((ok, fail), (1, 1));
+    assert_eq!(counters.dc_self_check_ok.load(Relaxed), 1);
+    assert_eq!(counters.dc_self_check_failed.load(Relaxed), 1);
+    // Routing candidates for DC 4 remain unchanged after self-check failure:
+    assert_eq!(
+        lookup_dc_candidates_with_overrides(&self_check_dcs, &self_check_overrides, 4, 0),
+        vec![dead_addr]
+    );
+
     dc_task.abort();
     Ok(())
 }

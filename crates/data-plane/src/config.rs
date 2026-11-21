@@ -202,6 +202,12 @@ pub struct Config {
     /// Maximum failed authentication attempts per source IP within a 60s sliding window on egress.
     #[serde(default = "default_egress_max_failed_per_ip")]
     pub egress_max_failed_per_ip: usize,
+    /// Configurable media/alternate DC candidate overrides (`ID=IP:PORT`, multiple entries per ID allowed).
+    #[serde(default = "default_dc_media_override")]
+    pub dc_media_override: Vec<String>,
+    /// Background DC self-check interval in seconds on direct/egress (0 = disabled).
+    #[serde(default = "default_dc_probe_interval_secs")]
+    pub dc_probe_interval_secs: u64,
 }
 fn default_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 24443))
@@ -250,6 +256,19 @@ pub fn default_egress_use_mtv3() -> bool {
 }
 pub fn default_egress_max_failed_per_ip() -> usize {
     16
+}
+pub fn default_dc_media_override() -> Vec<String> {
+    vec![
+        "2=149.154.167.220:443".to_string(),
+        "-2=149.154.167.151:443".to_string(),
+        "-2=149.154.167.220:443".to_string(),
+        "4=149.154.167.92:443".to_string(),
+        "-4=149.154.166.120:443".to_string(),
+        "-4=149.154.167.92:443".to_string(),
+    ]
+}
+pub fn default_dc_probe_interval_secs() -> u64 {
+    60
 }
 
 impl Config {
@@ -322,7 +341,12 @@ impl Config {
             (1..=4096).contains(&self.egress_max_failed_per_ip),
             "egress_max_failed_per_ip must be 1..=4096"
         );
+        ensure!(
+            self.dc_probe_interval_secs <= 86400,
+            "dc_probe_interval_secs must be 0..=86400"
+        );
         self.parsed_egress_allow_from()?;
+        self.dc_media_overrides()?;
         mtevil_proto::ServerFlightProfile {
             cert_bytes: self.fake_tls_cert_bytes,
             jitter: self.fake_tls_cert_jitter,
@@ -386,6 +410,31 @@ impl Config {
             ensure!(dcs.insert(id, address).is_none(), "duplicate DC id");
         }
         Ok(dcs)
+    }
+    pub fn dc_media_overrides(&self) -> Result<HashMap<i16, Vec<SocketAddr>>> {
+        let mut out: HashMap<i16, Vec<SocketAddr>> = HashMap::new();
+        for entry in &self.dc_media_override {
+            let (id, address) = entry
+                .split_once('=')
+                .context("dc_media_override must be ID=IP:PORT")?;
+            let id: i16 = id.parse().context("invalid dc_media_override DC id")?;
+            ensure!(
+                (-5..=-1).contains(&id) || (1..=5).contains(&id),
+                "dc_media_override DC id must be 1..5 or -5..-1"
+            );
+            let address: SocketAddr = address
+                .parse()
+                .context("invalid dc_media_override address")?;
+            ensure!(
+                address.port() > 0,
+                "dc_media_override port must not be zero"
+            );
+            let list = out.entry(id).or_default();
+            if !list.contains(&address) {
+                list.push(address);
+            }
+        }
+        Ok(out)
     }
     pub fn load_secrets_allow_empty(&self) -> Result<Vec<NamedSecret>> {
         let mut out = Vec::new();
@@ -525,6 +574,8 @@ mod tests {
         assert!(c.egress_use_mtv3);
         assert!(c.egress_allow_from.is_empty());
         assert_eq!(c.egress_max_failed_per_ip, 16);
+        assert_eq!(c.dc_media_override.len(), 6);
+        assert_eq!(c.dc_probe_interval_secs, 60);
         assert!(serde_json::from_str::<Config>(r#"{"secret_file":"secret","sni":"example.com","cover":"example.com:443","dc":[],"max_conections":100}"#).is_err());
         Ok(())
     }
@@ -610,6 +661,12 @@ mod tests {
         assert!(cidrs[1].contains("2001:db8::1".parse()?));
         let mut c = config()?;
         c.egress_allow_from = vec!["10.203.0.0/33".into()];
+        assert!(c.validate().is_err());
+        let mut c = config()?;
+        c.dc_media_override = vec!["0=149.154.167.151:443".into()];
+        assert!(c.validate().is_err());
+        let mut c = config()?;
+        c.dc_probe_interval_secs = 86_401;
         assert!(c.validate().is_err());
 
         let edge: Config = serde_json::from_str(
