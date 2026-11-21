@@ -34,7 +34,7 @@ const BUILD_VERSION: &str = match option_env!("MTEVIL_BUILD_VERSION") {
 struct Args {
     #[command(subcommand)]
     command: Option<Action>,
-    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms","egress_probe_interval_secs","egress_probe_degraded_interval_secs","egress_hedge_ms","egress_accept_legacy","egress_use_mtv3","egress_allow_from","egress_max_failed_per_ip","dc_media_override","dc_probe_interval_secs","cover_dns_ttl_secs"])]
+    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms","egress_probe_interval_secs","egress_probe_degraded_interval_secs","egress_hedge_ms","egress_accept_legacy","egress_use_mtv3","egress_allow_from","egress_max_failed_per_ip","dc_media_override","dc_probe_interval_secs","cover_dns_ttl_secs","diagnostics"])]
     config: Option<PathBuf>,
     #[arg(long)]
     check_config: bool,
@@ -125,6 +125,9 @@ struct Args {
     /// Background cover DNS cache TTL / refresh interval in seconds.
     #[arg(long)]
     cover_dns_ttl_secs: Option<u64>,
+    /// Enable per-chunk timeline diagnostic marks on relay paths.
+    #[arg(long)]
+    diagnostics: bool,
 }
 
 #[derive(Subcommand)]
@@ -269,6 +272,7 @@ impl Args {
             cover_dns_ttl_secs: self
                 .cover_dns_ttl_secs
                 .unwrap_or_else(config::default_cover_dns_ttl_secs),
+            diagnostics: self.diagnostics,
         };
         config.validate()?;
         Ok(config)
@@ -775,6 +779,7 @@ struct State {
     counters: Arc<telemetry::Counters>,
     alert_webhook_url: Option<String>,
     alerts_file: Option<PathBuf>,
+    diagnostics: bool,
 }
 
 fn format_edge_alert_message(ev: &EdgeAlertEvent) -> String {
@@ -1792,6 +1797,7 @@ async fn main() -> Result<()> {
         counters,
         alert_webhook_url: config.alert_webhook_url,
         alerts_file,
+        diagnostics: config.diagnostics,
     });
     let role_str: &'static str = if state.egress_upstreams.is_empty() {
         "direct"
@@ -2660,6 +2666,7 @@ async fn relay_client(
         counters: Some(state.counters.clone()),
         client_fd,
         upstream_fd,
+        diagnostics: state.diagnostics,
         ..RelayStats::default()
     };
     let relay_start_us = us();
@@ -2784,6 +2791,7 @@ struct RelayStats {
     counters: Option<Arc<telemetry::Counters>>,
     client_fd: Option<i32>,
     upstream_fd: Option<i32>,
+    diagnostics: bool,
 }
 
 impl Default for RelayStats {
@@ -2811,6 +2819,7 @@ impl Default for RelayStats {
             counters: None,
             client_fd: None,
             upstream_fd: None,
+            diagnostics: false,
         }
     }
 }
@@ -3088,10 +3097,12 @@ async fn upload<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     stats: &RelayStats,
 ) -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
+    const RETRANS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
     let mut buf = [0u8; wire::MAX_RECORD];
     let mut prefix = [0u8; 28];
     let mut prefix_len = 0;
     let mut prev_retrans = 0u32;
+    let mut last_retrans_sample = Instant::now();
     loop {
         let prev_consumed = tls.as_ref().map(|t| t.consumed).unwrap_or(0);
         let read = match &mut tls {
@@ -3139,7 +3150,9 @@ async fn upload<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
         stats.client_reads.fetch_add(1, Relaxed);
         stats.record_activity();
-        stats.timeline.mark("client_read", n as u64);
+        if stats.diagnostics {
+            stats.timeline.mark("client_read", n as u64);
+        }
         wire::crypt(&mut decrypt, &mut buf[..n]);
         let take = n.min(prefix.len() - prefix_len);
         prefix[prefix_len..prefix_len + take].copy_from_slice(&buf[..take]);
@@ -3171,15 +3184,20 @@ async fn upload<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
         if let Some(counters) = &stats.counters {
             counters.upstream_tx_bytes.fetch_add(n as u64, Relaxed);
-            sample_fd_retrans(
-                stats.upstream_fd,
-                &mut prev_retrans,
-                &counters.upstream_retrans_segs,
-            );
+            if last_retrans_sample.elapsed() >= RETRANS_SAMPLE_INTERVAL {
+                sample_fd_retrans(
+                    stats.upstream_fd,
+                    &mut prev_retrans,
+                    &counters.upstream_retrans_segs,
+                );
+                last_retrans_sample = Instant::now();
+            }
         }
         stats.uploaded.fetch_add(n as u64, Relaxed);
         stats.dc_writes.fetch_add(1, Relaxed);
-        stats.timeline.mark("dc_write", n as u64);
+        if stats.diagnostics {
+            stats.timeline.mark("dc_write", n as u64);
+        }
         stats.stamp(&stats.first_up_us, &stats.last_up_us);
     }
 }
@@ -3193,6 +3211,7 @@ async fn download<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     stats: &RelayStats,
 ) -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
+    const RETRANS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
     let mut frame_buf = vec![0u8; 5 + wire::MAX_RECORD];
     frame_buf[0] = 0x17;
     frame_buf[1] = 3;
@@ -3200,6 +3219,7 @@ async fn download<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let mut prefix = [0u8; 28];
     let mut prefix_len = 0;
     let mut prev_retrans = 0u32;
+    let mut last_retrans_sample = Instant::now();
     loop {
         let n = match r.read(&mut frame_buf[5..]).await {
             Ok(n) => n,
@@ -3228,7 +3248,9 @@ async fn download<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
         stats.dc_reads.fetch_add(1, Relaxed);
         stats.record_activity();
-        stats.timeline.mark("dc_read", n as u64);
+        if stats.diagnostics {
+            stats.timeline.mark("dc_read", n as u64);
+        }
         {
             let buf = &mut frame_buf[5..5 + n];
             wire::crypt(&mut decrypt, buf);
@@ -3286,15 +3308,20 @@ async fn download<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             counters
                 .downstream_tx_bytes
                 .fetch_add(bytes.len() as u64, Relaxed);
-            sample_fd_retrans(
-                stats.client_fd,
-                &mut prev_retrans,
-                &counters.downstream_retrans_segs,
-            );
+            if last_retrans_sample.elapsed() >= RETRANS_SAMPLE_INTERVAL {
+                sample_fd_retrans(
+                    stats.client_fd,
+                    &mut prev_retrans,
+                    &counters.downstream_retrans_segs,
+                );
+                last_retrans_sample = Instant::now();
+            }
         }
         stats.downloaded.fetch_add(n as u64, Relaxed);
         stats.client_writes.fetch_add(1, Relaxed);
-        stats.timeline.mark("client_write", n as u64);
+        if stats.diagnostics {
+            stats.timeline.mark("client_write", n as u64);
+        }
         stats.stamp(&stats.first_dn_us, &stats.last_dn_us);
     }
 }
@@ -3323,8 +3350,10 @@ async fn counted_copy<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     retrans_counter: &std::sync::atomic::AtomicU64,
 ) -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
+    const RETRANS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
     let mut buf = [0; wire::MAX_RECORD];
     let mut prev_retrans = 0u32;
+    let mut last_retrans_sample = Instant::now();
     loop {
         let n = timeout(idle, r.read(&mut buf)).await??;
         if n == 0 {
@@ -3335,7 +3364,13 @@ async fn counted_copy<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
         rx_counter.fetch_add(n as u64, Relaxed);
         let res = timeout(idle, w.write_all(&buf[..n])).await;
-        sample_fd_retrans(write_fd, &mut prev_retrans, retrans_counter);
+        if res.is_err()
+            || res.as_ref().is_ok_and(|r| r.is_err())
+            || last_retrans_sample.elapsed() >= RETRANS_SAMPLE_INTERVAL
+        {
+            sample_fd_retrans(write_fd, &mut prev_retrans, retrans_counter);
+            last_retrans_sample = Instant::now();
+        }
         res??;
         tx_counter.fetch_add(n as u64, Relaxed);
     }
@@ -3748,6 +3783,7 @@ fn default_media_override_map() -> HashMap<i16, Vec<SocketAddr>> {
         dc_media_override: config::default_dc_media_override(),
         dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
+        diagnostics: false,
     }
     .dc_media_overrides()
     .unwrap_or_default()

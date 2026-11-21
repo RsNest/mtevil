@@ -211,6 +211,9 @@ pub struct Config {
     /// Background cover DNS cache TTL / refresh interval in seconds (INV-04).
     #[serde(default = "default_cover_dns_ttl_secs")]
     pub cover_dns_ttl_secs: u64,
+    /// Enable per-chunk timeline diagnostic marks on relay paths (default false).
+    #[serde(default)]
+    pub diagnostics: bool,
 }
 fn default_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 24443))
@@ -587,6 +590,7 @@ mod tests {
         assert_eq!(c.dc_media_override.len(), 6);
         assert_eq!(c.dc_probe_interval_secs, 60);
         assert_eq!(c.cover_dns_ttl_secs, 60);
+        assert!(!c.diagnostics);
         assert!(serde_json::from_str::<Config>(r#"{"secret_file":"secret","sni":"example.com","cover":"example.com:443","dc":[],"max_conections":100}"#).is_err());
         Ok(())
     }

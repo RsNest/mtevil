@@ -93,6 +93,7 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         counters: Arc::new(telemetry::Counters::default()),
         alert_webhook_url: None,
         alerts_file: None,
+        diagnostics: false,
     })
 }
 
@@ -1269,6 +1270,7 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         dc_media_override: config::default_dc_media_override(),
         dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
+        diagnostics: false,
     };
 
     let mut proxy_state = state(cover.addr, dc_addr);
@@ -1707,6 +1709,7 @@ async fn probe_telegram_e2e_verifies_handshake_and_res_pq_reply() -> Result<()> 
         dc_media_override: config::default_dc_media_override(),
         dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
+        diagnostics: false,
     };
 
     let rtt_ms = probe_telegram_e2e(&cfg, proxy_addr, 2, Duration::from_secs(3)).await?;
@@ -2114,6 +2117,7 @@ async fn allowed_sni_file_accepts_previous_and_current_sni_without_breaking_link
         dc_media_override: config::default_dc_media_override(),
         dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
+        diagnostics: false,
     };
     assert_eq!(cfg.allowed_snis(), "ya.ru,example.com,vk.com");
 
@@ -3143,5 +3147,136 @@ async fn inv04_cover_dns_caches_and_preserves_last_known_good_on_failure_or_time
     assert_eq!(counters.cover_dns_fail.load(Relaxed), 3);
     // Last-known-good still served immediately without blocking data path:
     assert_eq!(resolver.next_addr(), Some(a2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn diagnostics_flag_gates_timeline_marks_and_preserves_close_attribution() -> Result<()> {
+    for diag in [false, true] {
+        let (mut dc_peer, dc_reader) = tokio::io::duplex(4096);
+        let (client_writer, mut client_peer) = tokio::io::duplex(4096);
+        let decoder = AesCtr::new_from_slices(&[0; 32], &[0; 16])?;
+        let encoder = AesCtr::new_from_slices(&[0; 32], &[0; 16])?;
+        let stats = RelayStats {
+            diagnostics: diag,
+            ..RelayStats::default()
+        };
+        let writer = tokio::spawn(async move {
+            dc_peer.write_all(b"chunk-one").await?;
+            dc_peer.write_all(b"chunk-two").await?;
+            dc_peer.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let reader = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            client_peer.read_to_end(&mut buf).await?;
+            Ok::<_, anyhow::Error>(buf)
+        });
+        download(
+            dc_reader,
+            client_writer,
+            decoder,
+            encoder,
+            false,
+            Duration::from_secs(1),
+            &stats,
+        )
+        .await?;
+        writer.await??;
+        let received = reader.await??;
+        assert_eq!(received.len(), 18);
+
+        let summary = stats.summary();
+        assert_eq!(summary["initiator"], "dc_eof");
+        let events = summary["timeline"]["events"]
+            .as_array()
+            .context("timeline events array")?;
+        if diag {
+            assert!(
+                events.iter().any(|e| e[1] == "dc_read")
+                    && events.iter().any(|e| e[1] == "client_write"),
+                "diagnostics=true must record per-chunk timeline marks"
+            );
+        } else {
+            assert!(
+                events
+                    .iter()
+                    .all(|e| e[1] != "dc_read" && e[1] != "client_write"),
+                "diagnostics=false must skip per-chunk timeline marks"
+            );
+            assert!(events.iter().any(|e| e[1] == "dc_eof"));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "manual T12 loopback throughput benchmark"]
+async fn bench_t12_relay_loopback_throughput() -> Result<()> {
+    const TOTAL_BYTES: usize = 64 * 1024 * 1024;
+    const CHUNK: usize = 16 * 1024;
+    for diag in [true, false] {
+        let dc_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let dc_addr = dc_listener.local_addr()?;
+        let cl_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let cl_addr = cl_listener.local_addr()?;
+
+        let dc_sender = tokio::spawn(async move {
+            let (mut s, _) = dc_listener.accept().await?;
+            let payload = vec![0x5au8; CHUNK];
+            let mut rem = TOTAL_BYTES;
+            while rem > 0 {
+                let n = rem.min(CHUNK);
+                s.write_all(&payload[..n]).await?;
+                rem -= n;
+            }
+            s.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let cl_sink = tokio::spawn(async move {
+            let (mut s, _) = cl_listener.accept().await?;
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut got = 0usize;
+            loop {
+                let n = s.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                got += n;
+            }
+            Ok::<_, anyhow::Error>(got)
+        });
+
+        let dc_stream = TcpStream::connect(dc_addr).await?;
+        let cl_stream = TcpStream::connect(cl_addr).await?;
+        let stats = RelayStats {
+            counters: Some(Arc::new(telemetry::Counters::default())),
+            client_fd: stream_raw_fd(&cl_stream),
+            diagnostics: diag,
+            ..RelayStats::default()
+        };
+        let decoder = AesCtr::new_from_slices(&[0u8; 32], &[0u8; 16])?;
+        let encoder = AesCtr::new_from_slices(&[0u8; 32], &[0u8; 16])?;
+        let t0 = Instant::now();
+        download(
+            dc_stream,
+            cl_stream,
+            decoder,
+            encoder,
+            true,
+            Duration::from_secs(10),
+            &stats,
+        )
+        .await?;
+        let elapsed = t0.elapsed();
+        dc_sender.await??;
+        let got = cl_sink.await??;
+        let mib_per_s = (TOTAL_BYTES as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
+        eprintln!(
+            "T12 bench diagnostics={diag}: {TOTAL_BYTES} bytes (framed rx={got}) in {:.1} ms ({:.1} MiB/s)",
+            elapsed.as_secs_f64() * 1000.0,
+            mib_per_s
+        );
+    }
     Ok(())
 }

@@ -1001,3 +1001,11 @@ wire-точность. Перебор высоких портов сгорает
 - **T11 (`F-01`, `F-02`, `INV-04`, фоновый DNS-резолвер для `cover` с TTL-кэшем и `last-known-good`):**
   - В `Config` и CLI добавлен `cover_dns_ttl_secs` (default `60`, `1..=86400`), в `Counters` добавлен счётчик `cover_dns_fail`.
   - Реализован `CoverResolver` и фоновая задача `spawn_cover_resolver`: `cover()` больше не вызывает `TcpStream::connect(&String)` с блокирующим DNS на data-потоке, а берёт `SocketAddr` из `RwLock`-кэша с round-robin и сохранением `last-known-good` при ошибках и таймаутах DNS (при пустом кэше — быстрый bounded close `cover_dns_unavailable`). Тест `inv04_cover_dns_caches_and_preserves_last_known_good_on_failure_or_timeout` зелёный (80/80 тестов workspace).
+
+
+## 2026-11-22 · Фаза 3 / T12: Периодический `sample_fd_retrans` (1 с) и флаг `diagnostics`
+
+- В `Config` и CLI добавлен флаг `diagnostics: bool` (default `false`), гейтящий вызовы `timeline.mark(...)` на каждый чанк в `upload()` и `download()` (`timeline.close` сохранён для атрибуции причины закрытия).
+- В `upload()`, `download()` и `counted_copy()` опрос `sample_fd_retrans` (`getsockopt(TCP_INFO)` на Linux) переведён с вызова на каждый чанк на таймер `1 с` на сессию + обязательный финальный вызов при закрытии/ошибке записи.
+- Локальный release-замер (`bench_t12_relay_loopback_throughput`, 64 MiB через loopback `download()` с AES-CTR + FakeTLS framing): `diagnostics=true` — `71.8 мс` (`891.8 MiB/s`), `diagnostics=false` — `71.5 мс` (`895.4 MiB/s`); на Linux дополнительно устраняются ~4096 системных вызовов `getsockopt(TCP_INFO)` на каждые 64 MiB трафика.
+- Тест `diagnostics_flag_gates_timeline_marks_and_preserves_close_attribution` зелёный (81/81 тестов workspace).
