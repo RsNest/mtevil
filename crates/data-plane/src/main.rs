@@ -456,7 +456,9 @@ struct State {
 fn format_edge_alert_message(ev: &EdgeAlertEvent) -> String {
     if ev.reason == "background_egress_probe_dc2" {
         return match ev.next {
-            EdgeRouteState::PrimaryOk => "Фоновая проверка DC2: доступность egress восстановилась.".into(),
+            EdgeRouteState::PrimaryOk => {
+                "Фоновая проверка DC2: доступность egress восстановилась.".into()
+            }
             EdgeRouteState::FailoverBackup(_) => format!(
                 "Фоновая проверка DC2: основной egress ({}) недоступен, резервный отвечает.",
                 ev.primary
@@ -497,9 +499,14 @@ fn format_edge_alert_message(ev: &EdgeAlertEvent) -> String {
 }
 
 fn send_http_alert_webhook(url: &str, payload: &str) -> std::io::Result<()> {
-    use std::{io::{BufRead, BufReader, Write}, net::ToSocketAddrs};
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::ToSocketAddrs,
+    };
     // Minimal stdlib-only HTTP POST for http://host[:port]/path webhooks (no extra crate deps).
-    let rest = url.strip_prefix("http://").ok_or_else(|| std::io::Error::other("expected an HTTP webhook URL"))?;
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| std::io::Error::other("expected an HTTP webhook URL"))?;
     let (host_port, path) = match rest.find('/') {
         Some(pos) => (&rest[..pos], &rest[pos..]),
         None => (rest, "/"),
@@ -514,7 +521,9 @@ fn send_http_alert_webhook(url: &str, payload: &str) -> std::io::Result<()> {
         "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    let endpoint = addr.to_socket_addrs()?.next()
+    let endpoint = addr
+        .to_socket_addrs()?
+        .next()
         .ok_or_else(|| std::io::Error::other("webhook address did not resolve"))?;
     let limit = Duration::from_secs(3);
     let mut stream = std::net::TcpStream::connect_timeout(&endpoint, limit)?;
@@ -525,7 +534,11 @@ fn send_http_alert_webhook(url: &str, payload: &str) -> std::io::Result<()> {
     let mut status = String::new();
     use std::io::Read;
     BufReader::new(stream).take(256).read_line(&mut status)?;
-    match status.split_whitespace().nth(1).and_then(|code| code.parse::<u16>().ok()) {
+    match status
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+    {
         Some(200..=299) => Ok(()),
         _ => Err(std::io::Error::other("webhook did not return HTTP 2xx")),
     }
@@ -605,8 +618,12 @@ async fn monitor_edge_egress(state: Arc<State>, period: Duration) {
         }
         let route = match available.iter().position(|ok| *ok) {
             None => EdgeRouteState::AllDown,
-            Some(0) if state.egress_strategy == EgressStrategy::Ordered => EdgeRouteState::PrimaryOk,
-            Some(idx) if state.egress_strategy == EgressStrategy::Ordered => EdgeRouteState::FailoverBackup(idx),
+            Some(0) if state.egress_strategy == EgressStrategy::Ordered => {
+                EdgeRouteState::PrimaryOk
+            }
+            Some(idx) if state.egress_strategy == EgressStrategy::Ordered => {
+                EdgeRouteState::FailoverBackup(idx)
+            }
             Some(_) => {
                 let healthy = available.iter().filter(|ok| **ok).count();
                 let total = available.len();
@@ -687,10 +704,7 @@ impl State {
         let cur_snis = self.current_allowed_snis();
         if *cur_snis != next_snis {
             let count = next_snis.split(',').filter(|s| !s.is_empty()).count();
-            *self
-                .allowed_snis
-                .write()
-                .unwrap_or_else(|e| e.into_inner()) = Arc::new(next_snis);
+            *self.allowed_snis.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(next_snis);
             telemetry::event("allowed_sni_reloaded", 0, json!({"sni_count": count}));
         }
     }
@@ -721,7 +735,11 @@ const RUNTIME_STATS_DEFAULT_PATH: &str = "/var/lib/mtevil/runtime-stats.json";
 // excluding unrelated VPS traffic even when running with network_mode: host.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn sample_fd_retrans(fd: Option<std::os::fd::RawFd>, prev: &mut u32, acc: &std::sync::atomic::AtomicU64) {
+fn sample_fd_retrans(
+    fd: Option<std::os::fd::RawFd>,
+    prev: &mut u32,
+    acc: &std::sync::atomic::AtomicU64,
+) {
     #[cfg(target_os = "linux")]
     {
         let Some(raw_fd) = fd else {
@@ -1145,10 +1163,12 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             Action::Stats { stats_file } => {
-                let text = std::fs::read_to_string(&stats_file)
-                    .with_context(|| format!("reading runtime stats file {}", stats_file.display()))?;
-                let val: serde_json::Value = serde_json::from_str(&text)
-                    .with_context(|| format!("parsing runtime stats file {}", stats_file.display()))?;
+                let text = std::fs::read_to_string(&stats_file).with_context(|| {
+                    format!("reading runtime stats file {}", stats_file.display())
+                })?;
+                let val: serde_json::Value = serde_json::from_str(&text).with_context(|| {
+                    format!("parsing runtime stats file {}", stats_file.display())
+                })?;
                 println!("{}", serde_json::to_string_pretty(&val)?);
                 return Ok(());
             }
@@ -1418,19 +1438,184 @@ async fn main() -> Result<()> {
         let _ = task.await;
     }
     if let Err(err) = state.replay.lock().await.flush_snapshot() {
-        telemetry::event("replay_flush_failed", 0, json!({"error": format!("{err:#}")}));
+        telemetry::event(
+            "replay_flush_failed",
+            0,
+            json!({"error": format!("{err:#}")}),
+        );
     }
     res
 }
 
+trait Acceptor {
+    async fn accept_conn(&mut self) -> std::io::Result<(TcpStream, SocketAddr)>;
+}
+
+impl Acceptor for TcpListener {
+    async fn accept_conn(&mut self) -> std::io::Result<(TcpStream, SocketAddr)> {
+        TcpListener::accept(self).await
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptErrorAction {
+    RetryImmediate(&'static str),
+    Backoff(&'static str),
+    Fatal(&'static str),
+}
+
+fn classify_accept_error(err: &std::io::Error) -> AcceptErrorAction {
+    use std::io::ErrorKind;
+    match err.kind() {
+        ErrorKind::ConnectionAborted => {
+            return AcceptErrorAction::RetryImmediate("connection_aborted")
+        }
+        ErrorKind::ConnectionReset => return AcceptErrorAction::RetryImmediate("connection_reset"),
+        ErrorKind::Interrupted => return AcceptErrorAction::RetryImmediate("interrupted"),
+        ErrorKind::WouldBlock => return AcceptErrorAction::RetryImmediate("would_block"),
+        ErrorKind::OutOfMemory => return AcceptErrorAction::Backoff("enomem"),
+        ErrorKind::InvalidInput => return AcceptErrorAction::Fatal("fatal"),
+        _ => {}
+    }
+    match err.raw_os_error() {
+        // EMFILE (POSIX 24, Winsock WSAEMFILE 10024)
+        Some(24 | 10024) => AcceptErrorAction::Backoff("emfile"),
+        // ENFILE (POSIX 23)
+        Some(23) => AcceptErrorAction::Backoff("enfile"),
+        // ENOBUFS (Linux 105, BSD/macOS 55, Winsock WSAENOBUFS 10055)
+        Some(105 | 55 | 10055) => AcceptErrorAction::Backoff("enobufs"),
+        // ENOMEM (POSIX 12)
+        Some(12) => AcceptErrorAction::Backoff("enomem"),
+        // ECONNABORTED / ECONNRESET / EINTR / EAGAIN / EPROTO / ENOPROTOOPT / EHOSTUNREACH / ENETUNREACH / ETIMEDOUT
+        Some(103 | 10053) => AcceptErrorAction::RetryImmediate("connection_aborted"),
+        Some(104 | 10054) => AcceptErrorAction::RetryImmediate("connection_reset"),
+        Some(4 | 10004) => AcceptErrorAction::RetryImmediate("interrupted"),
+        Some(11 | 10035) => AcceptErrorAction::RetryImmediate("would_block"),
+        Some(71 | 92 | 101 | 110 | 112 | 113 | 64) => {
+            AcceptErrorAction::RetryImmediate("connection_aborted")
+        }
+        // EBADF (9 / 10009), EINVAL (22 / 10022), ENOTSOCK (88 / 10038), EOPNOTSUPP (95 / 10045)
+        Some(9 | 10009 | 22 | 10022 | 88 | 10038 | 95 | 10045) => AcceptErrorAction::Fatal("fatal"),
+        _ => AcceptErrorAction::Backoff("other"),
+    }
+}
+
+enum AcceptDecision {
+    Accepted((TcpStream, SocketAddr)),
+    Retry,
+    Shutdown,
+}
+
+struct AcceptLoopState {
+    backoff: Duration,
+    last_log: HashMap<&'static str, (Instant, u64)>,
+}
+
+impl Default for AcceptLoopState {
+    fn default() -> Self {
+        Self {
+            backoff: Duration::from_millis(10),
+            last_log: HashMap::new(),
+        }
+    }
+}
+
+impl AcceptLoopState {
+    const MIN_BACKOFF: Duration = Duration::from_millis(10);
+    const MAX_BACKOFF: Duration = Duration::from_secs(1);
+    const LOG_WINDOW: Duration = Duration::from_secs(1);
+
+    fn log_rate_limited(
+        &mut self,
+        kind: &'static str,
+        action: &'static str,
+        backoff_ms: u64,
+        err: &std::io::Error,
+    ) {
+        let now = Instant::now();
+        match self.last_log.get_mut(kind) {
+            Some((last_at, suppressed)) if now.duration_since(*last_at) < Self::LOG_WINDOW => {
+                *suppressed += 1;
+            }
+            Some((last_at, suppressed)) => {
+                let skipped = *suppressed;
+                *last_at = now;
+                *suppressed = 0;
+                telemetry::event(
+                    "accept_error",
+                    0,
+                    json!({
+                        "kind": kind,
+                        "action": action,
+                        "backoff_ms": backoff_ms,
+                        "suppressed": skipped,
+                        "error": err.to_string(),
+                    }),
+                );
+            }
+            None => {
+                self.last_log.insert(kind, (now, 0));
+                telemetry::event(
+                    "accept_error",
+                    0,
+                    json!({
+                        "kind": kind,
+                        "action": action,
+                        "backoff_ms": backoff_ms,
+                        "suppressed": 0,
+                        "error": err.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    async fn handle_result<F: std::future::Future<Output = ()> + Unpin>(
+        &mut self,
+        accepted: std::io::Result<(TcpStream, SocketAddr)>,
+        counters: &telemetry::Counters,
+        shutdown: &mut F,
+    ) -> Result<AcceptDecision> {
+        match accepted {
+            Ok(pair) => {
+                self.backoff = Self::MIN_BACKOFF;
+                Ok(AcceptDecision::Accepted(pair))
+            }
+            Err(err) => match classify_accept_error(&err) {
+                AcceptErrorAction::RetryImmediate(kind) => {
+                    counters.accept_errors.record(kind);
+                    self.log_rate_limited(kind, "retry_immediate", 0, &err);
+                    Ok(AcceptDecision::Retry)
+                }
+                AcceptErrorAction::Backoff(kind) => {
+                    counters.accept_errors.record(kind);
+                    let sleep_dur = self.backoff;
+                    self.backoff = (self.backoff.saturating_mul(2)).min(Self::MAX_BACKOFF);
+                    self.log_rate_limited(kind, "backoff", sleep_dur.as_millis() as u64, &err);
+                    tokio::select! {
+                        () = tokio::time::sleep(sleep_dur) => Ok(AcceptDecision::Retry),
+                        _ = shutdown => Ok(AcceptDecision::Shutdown),
+                    }
+                }
+                AcceptErrorAction::Fatal(kind) => {
+                    counters.accept_errors.record(kind);
+                    self.log_rate_limited(kind, "fatal", 0, &err);
+                    Err(err.into())
+                }
+            },
+        }
+    }
+}
+
 async fn serve(
-    listener: TcpListener,
+    mut listener: impl Acceptor,
     state: Arc<State>,
     max_connections: usize,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let permits = Arc::new(Semaphore::new(max_connections));
     let mut tasks = tokio::task::JoinSet::new();
+    let mut accept_state = AcceptLoopState::default();
     tokio::pin!(shutdown);
     loop {
         // Reap completed tasks before admitting another. A semaphore only bounds
@@ -1441,9 +1626,17 @@ async fn serve(
             permit = permits.clone().acquire_owned() => permit?,
             _ = &mut shutdown => break,
         };
-        let (socket, _) = tokio::select! {
-            accepted = listener.accept() => accepted?,
+        let accepted = tokio::select! {
+            accepted = listener.accept_conn() => accepted,
             _ = &mut shutdown => break,
+        };
+        let socket = match accept_state
+            .handle_result(accepted, &state.counters, &mut shutdown)
+            .await?
+        {
+            AcceptDecision::Accepted((socket, _)) => socket,
+            AcceptDecision::Retry => continue,
+            AcceptDecision::Shutdown => break,
         };
         let state = state.clone();
         tasks.spawn(async move {
@@ -1588,10 +1781,7 @@ enum ProxyV2Outcome {
     EmptyEof,
 }
 
-async fn read_proxy_v2<R: AsyncRead + Unpin>(
-    r: &mut R,
-    limit: Duration,
-) -> Result<ProxyV2Outcome> {
+async fn read_proxy_v2<R: AsyncRead + Unpin>(r: &mut R, limit: Duration) -> Result<ProxyV2Outcome> {
     timeout(limit, async {
         let mut hdr = [0u8; wire::PROXY_V2_HEADER_LEN];
         let n = r.read(&mut hdr[..1]).await.context("proxy_v2_eof")?;
@@ -1805,8 +1995,12 @@ async fn connection_inner(client: &mut TcpStream, state: &State, session_id: u64
         );
         return bounded_cover(client, raw, state, session_id).await;
     }
-    let flight =
-        wire::server_flight(&matched_secret.key, &hello, &state.flight, &mut rand::rngs::OsRng)?;
+    let flight = wire::server_flight(
+        &matched_secret.key,
+        &hello,
+        &state.flight,
+        &mut rand::rngs::OsRng,
+    )?;
     // INV-01: from the first write onwards every error only closes this path.
     // No cover call exists below this boundary, including partial-write failures.
     write_server_flight(client, &flight, state.flight_shaping, state.handshake).await?;
@@ -1857,8 +2051,8 @@ async fn connection_inner(client: &mut TcpStream, state: &State, session_id: u64
     inner
         .context("inner_header_timeout")?
         .context("inner_header_invalid")?;
-    let transport = wire::client_transport(&frame, &matched_secret.key)
-        .context("inner_transport_invalid")?;
+    let transport =
+        wire::client_transport(&frame, &matched_secret.key).context("inner_transport_invalid")?;
     relay_client(
         client,
         state,
@@ -2428,7 +2622,11 @@ async fn upload<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 Err(error) => stats.failed("dc_write_idle", error.into()),
             };
             if let Some(counters) = &stats.counters {
-                sample_fd_retrans(stats.upstream_fd, &mut prev_retrans, &counters.upstream_retrans_segs);
+                sample_fd_retrans(
+                    stats.upstream_fd,
+                    &mut prev_retrans,
+                    &counters.upstream_retrans_segs,
+                );
             }
             return res;
         }
@@ -2445,20 +2643,32 @@ async fn upload<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 if let Some(counters) = &stats.counters {
-                    sample_fd_retrans(stats.upstream_fd, &mut prev_retrans, &counters.upstream_retrans_segs);
+                    sample_fd_retrans(
+                        stats.upstream_fd,
+                        &mut prev_retrans,
+                        &counters.upstream_retrans_segs,
+                    );
                 }
                 return stats.failed("dc_write_error", error.into());
             }
             Err(error) => {
                 if let Some(counters) = &stats.counters {
-                    sample_fd_retrans(stats.upstream_fd, &mut prev_retrans, &counters.upstream_retrans_segs);
+                    sample_fd_retrans(
+                        stats.upstream_fd,
+                        &mut prev_retrans,
+                        &counters.upstream_retrans_segs,
+                    );
                 }
                 return stats.failed("dc_write_idle", error.into());
             }
         }
         if let Some(counters) = &stats.counters {
             counters.upstream_tx_bytes.fetch_add(n as u64, Relaxed);
-            sample_fd_retrans(stats.upstream_fd, &mut prev_retrans, &counters.upstream_retrans_segs);
+            sample_fd_retrans(
+                stats.upstream_fd,
+                &mut prev_retrans,
+                &counters.upstream_retrans_segs,
+            );
         }
         stats.uploaded.fetch_add(n as u64, Relaxed);
         stats.dc_writes.fetch_add(1, Relaxed);
@@ -2491,13 +2701,18 @@ async fn download<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         if n == 0 {
             let _ = stats.first_eof.compare_exchange(0, 2, Relaxed, Relaxed);
             stats.timeline.close("dc_eof", "fin");
-            let res = match timeout(write_timeout.min(DC_EOF_SHUTDOWN_TIMEOUT), w.shutdown()).await {
+            let res = match timeout(write_timeout.min(DC_EOF_SHUTDOWN_TIMEOUT), w.shutdown()).await
+            {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => stats.failed("client_write_error", error.into()),
                 Err(error) => stats.failed("client_write_idle", error.into()),
             };
             if let Some(counters) = &stats.counters {
-                sample_fd_retrans(stats.client_fd, &mut prev_retrans, &counters.downstream_retrans_segs);
+                sample_fd_retrans(
+                    stats.client_fd,
+                    &mut prev_retrans,
+                    &counters.downstream_retrans_segs,
+                );
             }
             return res;
         }
@@ -2541,20 +2756,34 @@ async fn download<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 if let Some(counters) = &stats.counters {
-                    sample_fd_retrans(stats.client_fd, &mut prev_retrans, &counters.downstream_retrans_segs);
+                    sample_fd_retrans(
+                        stats.client_fd,
+                        &mut prev_retrans,
+                        &counters.downstream_retrans_segs,
+                    );
                 }
                 return stats.failed("client_write_error", error.into());
             }
             Err(error) => {
                 if let Some(counters) = &stats.counters {
-                    sample_fd_retrans(stats.client_fd, &mut prev_retrans, &counters.downstream_retrans_segs);
+                    sample_fd_retrans(
+                        stats.client_fd,
+                        &mut prev_retrans,
+                        &counters.downstream_retrans_segs,
+                    );
                 }
                 return stats.failed("client_write_idle", error.into());
             }
         }
         if let Some(counters) = &stats.counters {
-            counters.downstream_tx_bytes.fetch_add(bytes.len() as u64, Relaxed);
-            sample_fd_retrans(stats.client_fd, &mut prev_retrans, &counters.downstream_retrans_segs);
+            counters
+                .downstream_tx_bytes
+                .fetch_add(bytes.len() as u64, Relaxed);
+            sample_fd_retrans(
+                stats.client_fd,
+                &mut prev_retrans,
+                &counters.downstream_retrans_segs,
+            );
         }
         stats.downloaded.fetch_add(n as u64, Relaxed);
         stats.client_writes.fetch_add(1, Relaxed);
@@ -2796,25 +3025,31 @@ fn validate_res_pq_payload(payload: &[u8], expected_nonce: &[u8; 16]) -> Result<
         "Telegram DC reply too short ({} bytes)",
         payload.len()
     );
-    ensure!(payload[0..8] == [0u8; 8], "unexpected non-zero auth_key_id in resPQ");
+    ensure!(
+        payload[0..8] == [0u8; 8],
+        "unexpected non-zero auth_key_id in resPQ"
+    );
     ensure!(
         payload[20..24] == [0x63, 0x24, 0x16, 0x05],
         "unexpected MTProto constructor (expected resPQ#05162463)"
     );
-    ensure!(
-        &payload[24..40] == expected_nonce,
-        "resPQ nonce mismatch"
-    );
+    ensure!(&payload[24..40] == expected_nonce, "resPQ nonce mismatch");
     Ok(())
 }
 
 async fn read_tls_record_raw(stream: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
     let mut hdr = [0u8; 5];
-    stream.read_exact(&mut hdr).await.context("reading TLS record header")?;
+    stream
+        .read_exact(&mut hdr)
+        .await
+        .context("reading TLS record header")?;
     let n = usize::from(u16::from_be_bytes([hdr[3], hdr[4]]));
     ensure!(n <= wire::MAX_RECORD, "TLS record exceeds bound");
     let mut body = vec![0u8; n];
-    stream.read_exact(&mut body).await.context("reading TLS record body")?;
+    stream
+        .read_exact(&mut body)
+        .await
+        .context("reading TLS record body")?;
     let mut raw = Vec::with_capacity(5 + n);
     raw.extend_from_slice(&hdr);
     raw.extend_from_slice(&body);
@@ -3045,7 +3280,9 @@ async fn connect_upstream(
         for offset in 0..count {
             let idx = (start + offset) % count;
             let claim = if ordered {
-                let Some(c) = EgressHealth::try_claim(&state.egress_health, idx, dc_abs, Instant::now()) else {
+                let Some(c) =
+                    EgressHealth::try_claim(&state.egress_health, idx, dc_abs, Instant::now())
+                else {
                     continue;
                 };
                 Some(c)
@@ -3192,7 +3429,7 @@ async fn connect_upstream(
 
 #[allow(clippy::too_many_arguments)]
 async fn serve_egress(
-    listener: TcpListener,
+    mut listener: impl Acceptor,
     dcs: Arc<HashMap<i16, SocketAddr>>,
     egress_token: [u8; 16],
     max_connections: usize,
@@ -3204,6 +3441,7 @@ async fn serve_egress(
 ) -> Result<()> {
     let permits = Arc::new(Semaphore::new(max_connections));
     let mut tasks = tokio::task::JoinSet::new();
+    let mut accept_state = AcceptLoopState::default();
     tokio::pin!(shutdown);
     loop {
         while tasks.try_join_next().is_some() {}
@@ -3211,25 +3449,32 @@ async fn serve_egress(
             permit = permits.clone().acquire_owned() => permit?,
             _ = &mut shutdown => break,
         };
-        let (mut edge, _) = tokio::select! {
-            accepted = listener.accept() => accepted?,
+        let accepted = tokio::select! {
+            accepted = listener.accept_conn() => accepted,
             _ = &mut shutdown => break,
+        };
+        let mut edge = match accept_state
+            .handle_result(accepted, &counters, &mut shutdown)
+            .await?
+        {
+            AcceptDecision::Accepted((socket, _)) => socket,
+            AcceptDecision::Retry => continue,
+            AcceptDecision::Shutdown => break,
         };
         let dcs = dcs.clone();
         let counters = counters.clone();
         tasks.spawn(async move {
             let _permit = permit;
             let mut session = telemetry::Session::new(&counters);
-            let res = egress_connection(&mut edge, &dcs, &egress_token, handshake, idle, &counters).await;
+            let res =
+                egress_connection(&mut edge, &dcs, &egress_token, handshake, idle, &counters).await;
             session.finish(&res);
         });
     }
     drop(listener);
-    if timeout(drain, async {
-        while tasks.join_next().await.is_some() {}
-    })
-    .await
-    .is_err()
+    if timeout(drain, async { while tasks.join_next().await.is_some() {} })
+        .await
+        .is_err()
     {
         tasks.shutdown().await;
     }

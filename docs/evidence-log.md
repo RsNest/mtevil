@@ -945,3 +945,16 @@ wire-точность. Перебор высоких портов сгорает
 | Публикация стабильного `v0.1.0` | PASS | Тег `v0.1.0` на проверенном коммите `ffa5773`, workflow `#44706563797` — `success`, GitHub Latest = `v0.1.0`, ассеты `install.sh`, `setup.py`, `mtevilctl`, образ `ghcr.io/rsnest/mtevil:v0.1.0` |
 
 Область поддержки `v0.1.0`: Linux (`x86_64`) и IPv4 (`direct` и `edge → egress`). Сквозной IPv6 не проверялся и не заявляется.
+
+
+## 2026-11-21 · Baseline @ v0.1.5 (b2327a2) и Фаза 0 / T1: устойчивый accept-цикл (`F-15`)
+
+- **Baseline (`main @ b2327a2`, `rustc 1.100.0`):**
+  - `cargo test --workspace --locked`: 69 passed (`48` data-plane, `11` harness, `10` proto), 0 failed.
+  - `cargo clippy --workspace --all-targets --locked -- -D warnings`: 0 warnings.
+  - `deploy/failover_bench.py` («до», Linux 4 vCPU Xeon E5-2698 v4, изолированный стенд `edge -> 2x egress` на `ghcr.io/rsnest/mtevil:v0.1.5`):
+    - Warmup (5 клиентов, оба `egress` работают): `reconnected_ok = 5/5`, `wave_total_ms = 2345.2`, `p50 = 2140.9 ms`, `p95 = 2332.0 ms`, `max = 2332.0 ms`.
+    - Failover (30 клиентов через `docker compose exec`, основной `egress` убит `docker kill`): `reconnected_ok = 30/30`, `failed = 0`, `wave_total_ms = 15891.6`, `p50 = 13385.7 ms`, `p95 = 15780.4 ms`, `max = 15789.9 ms`, память `edge`: `1.449 MiB -> 3.113 MiB`.
+- **T1 (`F-15`, accept-цикл в `serve` и `serve_egress`):**
+  - Добавлен трейт `Acceptor`, классификатор `classify_accept_error` и `AcceptLoopState` с экспоненциальным backoff `10 мс -> 1 с` (сброс до `10 мс` после успешного `accept`), rate-limited логированием `accept_error` (не чаще 1/с на каждый `kind` с подсчётом `suppressed`) и счётчиками `Counters::accept_errors` по видам (`emfile`, `enfile`, `enobufs`, `enomem`, `connection_aborted`, `connection_reset`, `interrupted`, `would_block`, `fatal`, `other`).
+  - Тест `accept_loop_survives_emfile_and_econnaborted_bursts_and_shuts_down_cleanly` подтверждает выживание `serve` и `serve_egress` после серии `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM`/`ECONNABORTED`, приём последующих соединений, корректный graceful shutdown и остановку только на фатальной ошибке слушающего сокета (`EBADF`).

@@ -839,7 +839,10 @@ async fn proxy_v2_forwards_client_hello_and_relays() -> Result<()> {
     client
         .write_all(&wire::record(0x17, &fixture("init")?)?)
         .await?;
-    assert_eq!(timeout(Duration::from_secs(1), client.read(&mut [0u8])).await??, 0);
+    assert_eq!(
+        timeout(Duration::from_secs(1), client.read(&mut [0u8])).await??,
+        0
+    );
     timeout(Duration::from_secs(5), task).await???;
     timeout(Duration::from_secs(1), dc_task).await???;
     Ok(())
@@ -1277,8 +1280,16 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         write_users_map_atomic(&users_path, &map)?;
     }
     let deadline = Instant::now() + Duration::from_secs(2);
-    while proxy_state.current_secrets().first().map(|s| s.name.as_str()) != Some("alice") {
-        ensure!(Instant::now() < deadline, "background reloader did not load alice");
+    while proxy_state
+        .current_secrets()
+        .first()
+        .map(|s| s.name.as_str())
+        != Some("alice")
+    {
+        ensure!(
+            Instant::now() < deadline,
+            "background reloader did not load alice"
+        );
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
 
@@ -1548,7 +1559,9 @@ async fn runtime_stats_file_tracks_edge_and_egress_byte_counters() -> Result<()>
     let edge_snap = edge_state.counters.snapshot_json("edge");
     assert_eq!(edge_snap["completed_sessions"].as_u64(), Some(1));
     assert_eq!(edge_snap["failed_sessions"].as_u64(), Some(0));
-    assert!(edge_snap["downstream_rx_bytes"].as_u64().unwrap_or(0) > (raw.len() + bytes.len()) as u64);
+    assert!(
+        edge_snap["downstream_rx_bytes"].as_u64().unwrap_or(0) > (raw.len() + bytes.len()) as u64
+    );
     assert!(edge_snap["downstream_tx_bytes"].as_u64().unwrap_or(0) > DC_REPLY.len() as u64);
     assert_eq!(
         edge_snap["upstream_tx_bytes"].as_u64(),
@@ -1565,7 +1578,10 @@ async fn runtime_stats_file_tracks_edge_and_egress_byte_counters() -> Result<()>
     write_runtime_stats_atomic(&stats_file, &edge_state.counters, "edge")?;
     let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&stats_file)?)?;
     assert_eq!(parsed["role"].as_str(), Some("edge"));
-    assert_eq!(parsed["upstream_tx_bytes"].as_u64(), Some((88 + CLIENT_PAYLOAD.len()) as u64));
+    assert_eq!(
+        parsed["upstream_tx_bytes"].as_u64(),
+        Some((88 + CLIENT_PAYLOAD.len()) as u64)
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = shutdown_tx.send(());
@@ -1693,7 +1709,9 @@ fn alert_webhook_requires_a_success_response() -> Result<()> {
     });
     assert!(send_http_alert_webhook(&url, "{}").is_err());
     send_http_alert_webhook(&url, "{}")?;
-    server.join().map_err(|_| anyhow::anyhow!("webhook server panicked"))??;
+    server
+        .join()
+        .map_err(|_| anyhow::anyhow!("webhook server panicked"))??;
     Ok(())
 }
 
@@ -1739,7 +1757,13 @@ async fn background_egress_alerts_without_client_traffic() -> Result<()> {
         async move {
             timeout(Duration::from_secs(2), async {
                 loop {
-                    if cfg.egress_health.lock().map(|health| health.route_state).ok() == Some(expected) {
+                    if cfg
+                        .egress_health
+                        .lock()
+                        .map(|health| health.route_state)
+                        .ok()
+                        == Some(expected)
+                    {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1832,10 +1856,7 @@ async fn edge_route_alerts_emit_once_per_state_transition() -> Result<()> {
         .filter(|l| !l.trim().is_empty())
         .map(serde_json::from_str)
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let states: Vec<&str> = lines
-        .iter()
-        .filter_map(|v| v["state"].as_str())
-        .collect();
+    let states: Vec<&str> = lines.iter().filter_map(|v| v["state"].as_str()).collect();
     assert_eq!(states, vec!["failover_backup", "all_down", "primary_ok"]);
 
     p_task.abort();
@@ -1929,11 +1950,11 @@ async fn edge_round_robin_alerts_ignore_healthy_alternation_and_track_availabili
         .filter(|l| !l.trim().is_empty())
         .map(serde_json::from_str)
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let states: Vec<&str> = lines
-        .iter()
-        .filter_map(|v| v["state"].as_str())
-        .collect();
-    assert_eq!(states, vec!["degraded", "all_down", "degraded", "primary_ok"]);
+    let states: Vec<&str> = lines.iter().filter_map(|v| v["state"].as_str()).collect();
+    assert_eq!(
+        states,
+        vec!["degraded", "all_down", "degraded", "primary_ok"]
+    );
 
     t1.abort();
     t2.abort();
@@ -1942,7 +1963,8 @@ async fn edge_round_robin_alerts_ignore_healthy_alternation_and_track_availabili
 }
 
 #[tokio::test]
-async fn media_dc_negative_ids_route_to_dedicated_address_with_fallback_and_zero_dc_ping_skips_dc() -> Result<()> {
+async fn media_dc_negative_ids_route_to_dedicated_address_with_fallback_and_zero_dc_ping_skips_dc(
+) -> Result<()> {
     let main_dc2 = TcpListener::bind("127.0.0.1:0").await?;
     let main_dc2_addr = main_dc2.local_addr()?;
     let media_dc2 = TcpListener::bind("127.0.0.1:0").await?;
@@ -1987,7 +2009,9 @@ async fn media_dc_negative_ids_route_to_dedicated_address_with_fallback_and_zero
 
     // Verify no connection was made to main_dc2 or media_dc2 during dc_id=0 probe.
     assert!(
-        timeout(Duration::from_millis(40), main_dc2.accept()).await.is_err(),
+        timeout(Duration::from_millis(40), main_dc2.accept())
+            .await
+            .is_err(),
         "dc_id=0 ping must not dial Telegram DC"
     );
 
@@ -2091,5 +2115,156 @@ async fn dc_candidates_fail_over_when_first_candidate_unreachable() -> Result<()
             SocketAddr::from(([149, 154, 167, 220], 443)),
         ]
     );
+    Ok(())
+}
+
+struct FaultInjectingAcceptor {
+    inner: TcpListener,
+    injected: std::collections::VecDeque<std::io::Error>,
+}
+
+impl Acceptor for FaultInjectingAcceptor {
+    async fn accept_conn(&mut self) -> std::io::Result<(TcpStream, SocketAddr)> {
+        if let Some(err) = self.injected.pop_front() {
+            return Err(err);
+        }
+        self.inner.accept().await
+    }
+}
+
+#[tokio::test]
+async fn accept_loop_survives_emfile_and_econnaborted_bursts_and_shuts_down_cleanly() -> Result<()>
+{
+    use std::collections::VecDeque;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    // 1. Direct/Edge serve() survives a series of EMFILE, ENFILE, ENOBUFS, ENOMEM, and ECONNABORTED
+    let mut cover = cover_mock().await?;
+    let proxy_state = state(cover.addr, closed_port().await?);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_addr = listener.local_addr()?;
+
+    let mut injected = VecDeque::new();
+    injected.push_back(std::io::Error::new(
+        std::io::ErrorKind::ConnectionAborted,
+        "peer aborted before accept",
+    ));
+    injected.push_back(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "peer reset",
+    ));
+    injected.push_back(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "eintr",
+    ));
+    injected.push_back(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "eagain",
+    ));
+    // Burst of 3 EMFILE + 1 ENFILE + 1 ENOBUFS + 1 ENOMEM
+    injected.push_back(std::io::Error::from_raw_os_error(24)); // EMFILE
+    injected.push_back(std::io::Error::from_raw_os_error(24)); // EMFILE
+    injected.push_back(std::io::Error::from_raw_os_error(24)); // EMFILE
+    injected.push_back(std::io::Error::from_raw_os_error(23)); // ENFILE
+    injected.push_back(std::io::Error::from_raw_os_error(105)); // ENOBUFS
+    injected.push_back(std::io::Error::from_raw_os_error(12)); // ENOMEM
+
+    let acceptor = FaultInjectingAcceptor {
+        inner: listener,
+        injected,
+    };
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let srv_state = proxy_state.clone();
+    let srv_task = tokio::spawn(serve(acceptor, srv_state, 8, async move {
+        let _ = stop_rx.await;
+    }));
+
+    // Real client connection must succeed after the error burst is absorbed!
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client.write_all(b"GET / HTTP/1.1\r\n\r\n").await?;
+    client.shutdown().await?;
+    let mut reply = Vec::new();
+    timeout(Duration::from_secs(2), client.read_to_end(&mut reply)).await??;
+    assert_eq!(reply, COVER_REPLY);
+    let _ = timeout(Duration::from_secs(1), cover.received.recv()).await?;
+
+    // Verify per-kind accept_errors counters recorded every injected error.
+    let ae = &proxy_state.counters.accept_errors;
+    assert_eq!(ae.connection_aborted.load(Relaxed), 1);
+    assert_eq!(ae.connection_reset.load(Relaxed), 1);
+    assert_eq!(ae.interrupted.load(Relaxed), 1);
+    assert_eq!(ae.would_block.load(Relaxed), 1);
+    assert_eq!(ae.emfile.load(Relaxed), 3);
+    assert_eq!(ae.enfile.load(Relaxed), 1);
+    assert_eq!(ae.enobufs.load(Relaxed), 1);
+    assert_eq!(ae.enomem.load(Relaxed), 1);
+    assert_eq!(ae.fatal.load(Relaxed), 0);
+    assert_eq!(ae.total(), 10);
+
+    // Shutdown still works cleanly.
+    let _ = stop_tx.send(());
+    timeout(Duration::from_secs(2), srv_task).await???;
+
+    // 2. serve_egress() also survives EMFILE + ECONNABORTED and continues serving MTV2 health probes.
+    let egress_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let egress_addr = egress_listener.local_addr()?;
+    let egress_counters = Arc::new(telemetry::Counters::default());
+    let token = [0x42u8; 16];
+    let mut eg_injected = VecDeque::new();
+    eg_injected.push_back(std::io::Error::new(
+        std::io::ErrorKind::ConnectionAborted,
+        "aborted",
+    ));
+    eg_injected.push_back(std::io::Error::from_raw_os_error(24)); // EMFILE
+    let eg_acceptor = FaultInjectingAcceptor {
+        inner: egress_listener,
+        injected: eg_injected,
+    };
+    let (eg_stop_tx, eg_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let eg_task = tokio::spawn(serve_egress(
+        eg_acceptor,
+        Arc::new(HashMap::from([(2, closed_port().await?)])),
+        token,
+        8,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        Duration::from_millis(50),
+        egress_counters.clone(),
+        async move {
+            let _ = eg_stop_rx.await;
+        },
+    ));
+
+    let probe = probe_egress_endpoint(egress_addr, 0, &token, Duration::from_secs(2)).await;
+    assert!(probe.dc_reachable);
+    assert_eq!(egress_counters.accept_errors.emfile.load(Relaxed), 1);
+    assert_eq!(
+        egress_counters
+            .accept_errors
+            .connection_aborted
+            .load(Relaxed),
+        1
+    );
+    let _ = eg_stop_tx.send(());
+    timeout(Duration::from_secs(2), eg_task).await???;
+
+    // 3. Fatal error (EBADF = 9) terminates the listener with Err and increments fatal counter.
+    let fatal_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let fatal_state = state(cover.addr, closed_port().await?);
+    let mut fatal_injected = VecDeque::new();
+    fatal_injected.push_back(std::io::Error::from_raw_os_error(9)); // EBADF
+    let fatal_acceptor = FaultInjectingAcceptor {
+        inner: fatal_listener,
+        injected: fatal_injected,
+    };
+    let res = serve(
+        fatal_acceptor,
+        fatal_state.clone(),
+        4,
+        std::future::pending(),
+    )
+    .await;
+    assert!(res.is_err());
+    assert_eq!(fatal_state.counters.accept_errors.fatal.load(Relaxed), 1);
     Ok(())
 }

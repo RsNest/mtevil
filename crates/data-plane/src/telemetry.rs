@@ -10,6 +10,67 @@ use std::{
 };
 
 #[derive(Default)]
+pub struct AcceptErrorCounters {
+    pub emfile: AtomicU64,
+    pub enfile: AtomicU64,
+    pub enobufs: AtomicU64,
+    pub enomem: AtomicU64,
+    pub connection_aborted: AtomicU64,
+    pub connection_reset: AtomicU64,
+    pub interrupted: AtomicU64,
+    pub would_block: AtomicU64,
+    pub fatal: AtomicU64,
+    pub other: AtomicU64,
+}
+
+impl AcceptErrorCounters {
+    pub fn record(&self, kind: &str) {
+        let slot = match kind {
+            "emfile" => &self.emfile,
+            "enfile" => &self.enfile,
+            "enobufs" => &self.enobufs,
+            "enomem" => &self.enomem,
+            "connection_aborted" => &self.connection_aborted,
+            "connection_reset" => &self.connection_reset,
+            "interrupted" => &self.interrupted,
+            "would_block" => &self.would_block,
+            "fatal" => &self.fatal,
+            _ => &self.other,
+        };
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn total(&self) -> u64 {
+        self.emfile.load(Ordering::Relaxed)
+            + self.enfile.load(Ordering::Relaxed)
+            + self.enobufs.load(Ordering::Relaxed)
+            + self.enomem.load(Ordering::Relaxed)
+            + self.connection_aborted.load(Ordering::Relaxed)
+            + self.connection_reset.load(Ordering::Relaxed)
+            + self.interrupted.load(Ordering::Relaxed)
+            + self.would_block.load(Ordering::Relaxed)
+            + self.fatal.load(Ordering::Relaxed)
+            + self.other.load(Ordering::Relaxed)
+    }
+
+    pub fn snapshot_json(&self) -> Value {
+        json!({
+            "total": self.total(),
+            "emfile": self.emfile.load(Ordering::Relaxed),
+            "enfile": self.enfile.load(Ordering::Relaxed),
+            "enobufs": self.enobufs.load(Ordering::Relaxed),
+            "enomem": self.enomem.load(Ordering::Relaxed),
+            "connection_aborted": self.connection_aborted.load(Ordering::Relaxed),
+            "connection_reset": self.connection_reset.load(Ordering::Relaxed),
+            "interrupted": self.interrupted.load(Ordering::Relaxed),
+            "would_block": self.would_block.load(Ordering::Relaxed),
+            "fatal": self.fatal.load(Ordering::Relaxed),
+            "other": self.other.load(Ordering::Relaxed),
+        })
+    }
+}
+
+#[derive(Default)]
 pub struct Counters {
     pub next: AtomicU64,
     pub active: AtomicU64,
@@ -22,6 +83,7 @@ pub struct Counters {
     pub downstream_retrans_segs: AtomicU64,
     pub upstream_retrans_segs: AtomicU64,
     pub started_unix_ms: AtomicU64,
+    pub accept_errors: AcceptErrorCounters,
 }
 
 impl Counters {
@@ -34,12 +96,10 @@ impl Counters {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(1);
-        match self.started_unix_ms.compare_exchange(
-            0,
-            now,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match self
+            .started_unix_ms
+            .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed)
+        {
             Ok(_) => now,
             Err(existing) => existing,
         }
@@ -75,6 +135,7 @@ impl Counters {
                 Value::Null
             },
             "retrans_supported": retrans_supported,
+            "accept_errors": self.accept_errors.snapshot_json(),
         })
     }
 }
