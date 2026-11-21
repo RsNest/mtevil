@@ -106,6 +106,20 @@ class SetupValidationTests(unittest.TestCase):
         )
         self.assertNotIn("build:", yaml_text)
         self.assertIn("image:", yaml_text)
+        self.assertIn("soft: 4096", yaml_text)
+        self.assertIn("hard: 4096", yaml_text)
+        self.assertEqual(setup.compute_compose_nofile(256), 4096)
+        self.assertEqual(setup.compute_compose_nofile(2048), 4608)
+        self.assertEqual(setup.compute_compose_nofile(4096), 8704)
+        yaml_high = setup.render_compose(
+            repo_root,
+            repo_root / "deploy" / "wizard",
+            "direct",
+            include_build=False,
+            max_connections=4096,
+        )
+        self.assertIn("soft: 8704", yaml_high)
+        self.assertIn("hard: 8704", yaml_high)
 
     def test_is_port_available_and_restore_backup(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

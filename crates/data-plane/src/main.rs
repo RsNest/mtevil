@@ -731,6 +731,40 @@ fn spawn_users_reloader(
 
 const RUNTIME_STATS_DEFAULT_PATH: &str = "/var/lib/mtevil/runtime-stats.json";
 
+fn parse_proc_self_limits_nofile(text: &str) -> Option<usize> {
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("Max open files") {
+            let first = rest.split_whitespace().next()?;
+            if first.eq_ignore_ascii_case("unlimited") {
+                return Some(usize::MAX);
+            }
+            return first.parse::<usize>().ok();
+        }
+    }
+    None
+}
+
+fn detect_rlimit_nofile() -> Option<usize> {
+    let text = std::fs::read_to_string("/proc/self/limits").ok()?;
+    parse_proc_self_limits_nofile(&text)
+}
+
+fn compute_effective_max_connections(
+    configured_max: usize,
+    rlimit_nofile: Option<usize>,
+) -> Result<usize> {
+    let effective = match rlimit_nofile {
+        Some(nofile) => configured_max.min(nofile.saturating_sub(128) / 2),
+        None => configured_max,
+    };
+    ensure!(
+        effective >= 16,
+        "effective max_connections ({effective}) is below minimum 16 (configured max_connections={configured_max}, rlimit_nofile={rlimit_nofile:?})"
+    );
+    Ok(effective)
+}
+
 // Query TCP_INFO on Linux to measure TCP retransmissions on mtevil's own sockets only,
 // excluding unrelated VPS traffic even when running with network_mode: host.
 #[cfg(unix)]
@@ -1232,6 +1266,9 @@ async fn main() -> Result<()> {
             println!("configuration valid");
             return Ok(());
         }
+        let rlimit_nofile = detect_rlimit_nofile();
+        let effective_max =
+            compute_effective_max_connections(config.max_connections, rlimit_nofile)?;
         let listener = bind_listener(config.listen, None)?;
         telemetry::event(
             "startup",
@@ -1241,6 +1278,8 @@ async fn main() -> Result<()> {
                 "role":"egress",
                 "listen":listener.local_addr()?.to_string(),
                 "max_connections":config.max_connections,
+                "effective_max_connections":effective_max,
+                "rlimit_nofile":rlimit_nofile,
                 "authenticated":config.egress_token_file.is_some(),
                 "test_only":true
             }),
@@ -1262,7 +1301,7 @@ async fn main() -> Result<()> {
             listener,
             Arc::new(dcs),
             egress_token,
-            config.max_connections,
+            effective_max,
             Duration::from_secs(config.handshake_timeout_secs),
             Duration::from_secs(config.idle_timeout_secs),
             Duration::from_secs(config.drain_timeout_secs),
@@ -1287,12 +1326,14 @@ async fn main() -> Result<()> {
         println!("configuration valid");
         return Ok(());
     }
+    let rlimit_nofile = detect_rlimit_nofile();
+    let effective_max = compute_effective_max_connections(config.max_connections, rlimit_nofile)?;
     let replay_ttl = Duration::from_secs(300);
     let replay = match &config.replay_file {
         Some(path) => ReplayCache::load_or_new(path.clone(), 65536, replay_ttl)?,
         None => ReplayCache::new(65536, replay_ttl),
     };
-    let max_cover_connections = (config.max_connections / 4).max(1);
+    let max_cover_connections = (effective_max / 4).max(1);
     let user_count = secrets.len();
     let persistent_replay = config.replay_file.is_some();
     let reload_config = (config.users_file.is_some() || config.allowed_sni_file().is_some())
@@ -1356,6 +1397,8 @@ async fn main() -> Result<()> {
             "role": role_str,
             "listen":listener.local_addr()?.to_string(),
             "max_connections":config.max_connections,
+            "effective_max_connections":effective_max,
+            "rlimit_nofile":rlimit_nofile,
             "max_cover_connections":max_cover_connections,
             "users":user_count,
             "persistent_replay":persistent_replay,
@@ -1413,7 +1456,7 @@ async fn main() -> Result<()> {
         .map(|cfg| spawn_users_reloader(state.clone(), cfg, Duration::from_secs(1), users_stop_rx));
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let res = serve(listener, state.clone(), config.max_connections, async {
+    let res = serve(listener, state.clone(), effective_max, async {
         #[cfg(unix)]
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {},

@@ -2268,3 +2268,38 @@ async fn accept_loop_survives_emfile_and_econnaborted_bursts_and_shuts_down_clea
     assert_eq!(fatal_state.counters.accept_errors.fatal.load(Relaxed), 1);
     Ok(())
 }
+
+#[test]
+fn fd_budget_clamps_effective_max_connections_and_fails_fast_below_16() -> Result<()> {
+    let sample_proc_limits = "\
+Limit                     Soft Limit           Hard Limit           Units     
+Max cpu time              unlimited            unlimited            seconds   
+Max open files            4096                 4096                 files     
+Max processes             128                  128                  processes 
+";
+    assert_eq!(
+        parse_proc_self_limits_nofile(sample_proc_limits),
+        Some(4096)
+    );
+    let unlimited_limits =
+        "Max open files            unlimited            unlimited            files\n";
+    assert_eq!(
+        parse_proc_self_limits_nofile(unlimited_limits),
+        Some(usize::MAX)
+    );
+
+    // configured 4096 with nofile 4096 -> (4096 - 128) / 2 = 1984
+    assert_eq!(compute_effective_max_connections(4096, Some(4096))?, 1984);
+    // configured 256 with nofile 4096 -> min(256, 1984) = 256
+    assert_eq!(compute_effective_max_connections(256, Some(4096))?, 256);
+    // configured 4096 with nofile 8704 (4096*2 + 512) -> min(4096, (8704-128)/2=4288) = 4096
+    assert_eq!(compute_effective_max_connections(4096, Some(8704))?, 4096);
+    // Boundary: nofile = 160 -> (160 - 128) / 2 = 16 -> ok
+    assert_eq!(compute_effective_max_connections(256, Some(160))?, 16);
+    // Below 16: nofile = 159 -> (159 - 128) / 2 = 15 -> fail-fast Err
+    assert!(compute_effective_max_connections(256, Some(159)).is_err());
+    // Configured < 16 -> fail-fast Err
+    assert!(compute_effective_max_connections(15, Some(4096)).is_err());
+    assert!(compute_effective_max_connections(15, None).is_err());
+    Ok(())
+}

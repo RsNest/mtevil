@@ -958,3 +958,7 @@ wire-точность. Перебор высоких портов сгорает
 - **T1 (`F-15`, accept-цикл в `serve` и `serve_egress`):**
   - Добавлен трейт `Acceptor`, классификатор `classify_accept_error` и `AcceptLoopState` с экспоненциальным backoff `10 мс -> 1 с` (сброс до `10 мс` после успешного `accept`), rate-limited логированием `accept_error` (не чаще 1/с на каждый `kind` с подсчётом `suppressed`) и счётчиками `Counters::accept_errors` по видам (`emfile`, `enfile`, `enobufs`, `enomem`, `connection_aborted`, `connection_reset`, `interrupted`, `would_block`, `fatal`, `other`).
   - Тест `accept_loop_survives_emfile_and_econnaborted_bursts_and_shuts_down_cleanly` подтверждает выживание `serve` и `serve_egress` после серии `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM`/`ECONNABORTED`, приём последующих соединений, корректный graceful shutdown и остановку только на фатальной ошибке слушающего сокета (`EBADF`).
+- **T2 (`F-15`, бюджет FD и `RLIMIT_NOFILE`):**
+  - На старте читается `/proc/self/limits` (`Max open files`), вычисляется `effective_max = min(max_connections, (nofile - 128) / 2)` (fail-fast при `effective_max < 16`), в событие `startup` пишутся `max_connections`, `effective_max_connections` и `rlimit_nofile`.
+  - В `deploy/setup.py` (`render_compose`) лимит `ulimits.nofile` рассчитывается как `max(4096, max_connections * 2 + 512)`.
+  - Тесты `fd_budget_clamps_effective_max_connections_and_fails_fast_below_16` и `test_render_compose_without_build` зелёные.

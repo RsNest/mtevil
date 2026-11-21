@@ -26,7 +26,7 @@ Phase 0 (F1–F10 в phase-0.md §9) — подмножество; столбе�
 | F-12 | Budget exhausted (userspace) | PreAuth | relay в cover (дешёвый путь) | budget_refusals | INV-03 | F5 |
 | F-13 | Budget exhausted | PostCommit | пауза чтения (backpressure), не разрыв; emergency reserve на служебные пути | budget_refusals, reserve_usage, paused_duration_p99 | INV-03 | F5 |
 | F-14 | Emergency reserve exhausted | PostCommit | пути освобождения не требуют бюджета; graceful close по deadline | budget_stall_timeout | INV-03 | F5+F1 |
-| F-15 | FD exhaustion на accept | PreAuth | accept fails/backlog с backoff 10 мс..1 с (`EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM`), транзиентные `ECONNABORTED`/`ECONNRESET` игнорируются; установленные сессии не страдают | accept_errors{kind} | §6.1 | F4 |
+| F-15 | FD exhaustion на accept / бюджет FD | PreAuth | На старте `effective_max = min(max_connections, (nofile - 128) / 2)` (fail-fast `< 16`); на accept backoff 10 мс..1 с (`EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM`), транзиентные `ECONNABORTED`/`ECONNRESET` игнорируются; установленные сессии не страдают | accept_errors{kind}, effective_max_connections | §6.1 | F4 |
 | F-16 | Memory pressure (cgroup) | обе | admission-отказы на PreAuth (→cover); PostCommit — backpressure; OOM — вне инварианта | budget_refusals, process_restarts | INV-03, §6.1 | F5 |
 | F-17 | Revoke пользователя | PostCommit | `immediate` (default): close; `grace-drain`: дренаж по deadline | revoked_sessions | §8 | F8 |
 | F-18 | Ротация секрета | обе | default `revoke`: старые сессии закрыты; `keep-until-close` — опция | secret_rotations | §8 | F8 |

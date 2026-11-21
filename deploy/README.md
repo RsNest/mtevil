@@ -24,6 +24,10 @@ docker compose -f deploy/compose.yaml ps
 включается в конфиг/image. Повторный `init` завершается ошибкой, сохраняя
 прежний секрет. Обычная остановка/пересоздание контейнера не меняет ссылку.
 Процесс работает UID/GID 10001, без capabilities, с read-only rootfs и лимитами.
+При старте процесс читает `RLIMIT_NOFILE` (`/proc/self/limits`), ограничивает
+эффективный лимит сессий формулой `effective_max = min(max_connections, (nofile - 128) / 2)`
+(логируя оба значения в событии `startup` и завершаясь с ошибкой при `effective_max < 16`),
+а мастер `deploy/setup.py` выставляет в `compose.yaml` `ulimits.nofile = max(4096, max_connections * 2 + 512)`.
 
 ## Публичный порт и ссылка
 

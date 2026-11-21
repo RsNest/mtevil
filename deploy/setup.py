@@ -670,6 +670,10 @@ def compute_listen_and_health(bind_ip: str, pub_port: int, network_host: bool) -
     return f"{bind_ip}:{pub_port}", ("127.0.0.1" if bind_ip == "0.0.0.0" else bind_ip)
 
 
+def compute_compose_nofile(max_connections: int) -> int:
+    return max(4096, int(max_connections) * 2 + 512)
+
+
 def render_compose(
     repo_root: Path,
     deploy_dir: Path,
@@ -680,6 +684,7 @@ def render_compose(
     health_port: int | None = None,
     include_build: bool = True,
     extra_volumes: list[str] | None = None,
+    max_connections: int | None = None,
 ) -> str:
     try:
         rel_context = os.path.relpath(repo_root, deploy_dir).replace("\\", "/")
@@ -687,6 +692,8 @@ def render_compose(
         rel_context = str(repo_root).replace("\\", "/")
     internal_port = 29443 if role == "egress" else 24443
     hc_port = health_port if (network_host and health_port is not None) else internal_port
+    effective_max_conn = max_connections if max_connections is not None else (512 if role == "egress" else 256)
+    nofile = compute_compose_nofile(effective_max_conn)
     build_block = (
         f"\n  build:\n    context: {rel_context}\n    dockerfile: Dockerfile"
         if include_build
@@ -721,8 +728,8 @@ services:
     pids_limit: 128
     ulimits:
       nofile:
-        soft: 4096
-        hard: 4096
+        soft: {nofile}
+        hard: {nofile}
     stop_grace_period: 10s
     healthcheck:
       test: [CMD, /usr/local/bin/mtevil, health, --address, "{health_host}:{hc_port}"]
@@ -2887,6 +2894,7 @@ def main(argv: list[str] | None = None) -> int:
     compose_ref = f'--env-file "{abs_env}" -f "{abs_compose}"'
     include_build = not args.no_build and (repo_root / "Dockerfile").is_file()
     try:
+        max_conn_val = int(config_data.get("max_connections", 512 if role == "egress" else 256))
         cand_compose.write_text(
             render_compose(
                 repo_root,
@@ -2897,6 +2905,7 @@ def main(argv: list[str] | None = None) -> int:
                 health_host=health_host,
                 health_port=pub_port,
                 include_build=include_build,
+                max_connections=max_conn_val,
             ),
             encoding="utf-8",
         )
@@ -3022,6 +3031,7 @@ def main(argv: list[str] | None = None) -> int:
             health_host=health_host,
             health_port=pub_port,
             include_build=include_build,
+            max_connections=max_conn_val,
         )
     finally:
         if cand_token_in_volume:
@@ -3121,6 +3131,7 @@ def main(argv: list[str] | None = None) -> int:
                         health_host=health_host,
                         health_port=pub_port,
                         include_build=include_build,
+                        max_connections=max_conn_val,
                     ),
                     encoding="utf-8",
                 )
