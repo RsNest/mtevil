@@ -979,3 +979,7 @@ wire-точность. Перебор высоких портов сгорает
   - В `Config` и CLI добавлены `egress_probe_interval_secs` (default `30`) и `egress_probe_degraded_interval_secs` (default `5`).
   - `monitor_edge_egress` ротирует проверяемые DC по кругу (`2, 4, -2, -4`), переключает период с `30 с` на `5 с` при наличии хотя бы одного недоступного узла, ставит cooldown при сбое фоновой пробы и автоматически снимает cooldown/счётчик сбоев при успешной пробе (failback без жертвования живым клиентом). Подтверждение алертов двумя замерами подряд сохранено.
   - Тест `background_probe_rotates_dcs_sets_and_clears_breaker_cooldown_and_switches_interval` зелёный.
+- **T7 (`F-23`, hedged connect в стратегии `ordered`):**
+  - В `Config` и CLI добавлен `egress_hedge_ms` (default `400`, `0` = выкл, `0..=30000`).
+  - В режиме `ordered`, если основной `egress` не прислал ACK за `egress_hedge_ms`, параллельно запускается подключение к следующему доступному узлу (не более одного хеджа на соединение); побеждает первый полученный ACK, проигравшая попытка отменяется и закрывает сокет.
+  - В `Counters` добавлены счётчики `hedge_started` и `hedge_won_by_backup`. Тест `hedged_connect_starts_backup_after_hedge_ms_and_tracks_metrics` зелёный.

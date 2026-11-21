@@ -84,6 +84,8 @@ pub struct Counters {
     pub upstream_retrans_segs: AtomicU64,
     pub started_unix_ms: AtomicU64,
     pub accept_errors: AcceptErrorCounters,
+    pub hedge_started: AtomicU64,
+    pub hedge_won_by_backup: AtomicU64,
 }
 
 impl Counters {
@@ -136,6 +138,8 @@ impl Counters {
             },
             "retrans_supported": retrans_supported,
             "accept_errors": self.accept_errors.snapshot_json(),
+            "hedge_started": self.hedge_started.load(Ordering::Relaxed),
+            "hedge_won_by_backup": self.hedge_won_by_backup.load(Ordering::Relaxed),
         })
     }
 }

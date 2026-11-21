@@ -76,6 +76,7 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         egress_probe_degraded_interval: Duration::from_secs(
             config::default_egress_probe_degraded_interval_secs(),
         ),
+        egress_hedge_ms: config::default_egress_hedge_ms(),
         client_hello: Duration::from_millis(150),
         handshake: Duration::from_millis(150),
         idle: Duration::from_millis(300),
@@ -1255,6 +1256,7 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         egress_cooldown_max_ms: config::default_egress_cooldown_max_ms(),
         egress_probe_interval_secs: config::default_egress_probe_interval_secs(),
         egress_probe_degraded_interval_secs: config::default_egress_probe_degraded_interval_secs(),
+        egress_hedge_ms: config::default_egress_hedge_ms(),
     };
 
     let mut proxy_state = state(cover.addr, dc_addr);
@@ -1685,6 +1687,7 @@ async fn probe_telegram_e2e_verifies_handshake_and_res_pq_reply() -> Result<()> 
         egress_cooldown_max_ms: config::default_egress_cooldown_max_ms(),
         egress_probe_interval_secs: config::default_egress_probe_interval_secs(),
         egress_probe_degraded_interval_secs: config::default_egress_probe_degraded_interval_secs(),
+        egress_hedge_ms: config::default_egress_hedge_ms(),
     };
 
     let rtt_ms = probe_telegram_e2e(&cfg, proxy_addr, 2, Duration::from_secs(3)).await?;
@@ -2084,6 +2087,7 @@ async fn allowed_sni_file_accepts_previous_and_current_sni_without_breaking_link
         egress_cooldown_max_ms: config::default_egress_cooldown_max_ms(),
         egress_probe_interval_secs: config::default_egress_probe_interval_secs(),
         egress_probe_degraded_interval_secs: config::default_egress_probe_degraded_interval_secs(),
+        egress_hedge_ms: config::default_egress_hedge_ms(),
     };
     assert_eq!(cfg.allowed_snis(), "ya.ru,example.com,vk.com");
 
@@ -2719,5 +2723,86 @@ async fn background_probe_rotates_dcs_sets_and_clears_breaker_cooldown_and_switc
     for task in [monitor, primary_task, backup_task] {
         task.abort();
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn hedged_connect_starts_backup_after_hedge_ms_and_tracks_metrics() -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let cover = cover_mock().await?;
+    let token = [0x51u8; 16];
+
+    let primary_delay_ms = Arc::new(AtomicU64::new(500));
+    let backup_delay_ms = Arc::new(AtomicU64::new(0));
+
+    let spawn_delayed_egress = |delay_ms: Arc<AtomicU64>| async move {
+        let l = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = l.local_addr()?;
+        let task = tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let wait = delay_ms.load(Relaxed);
+                tokio::spawn(async move {
+                    let mut preface = [0u8; 88];
+                    if s.read_exact(&mut preface).await.is_ok() {
+                        if wait > 0 {
+                            tokio::time::sleep(Duration::from_millis(wait)).await;
+                        }
+                        let _ = s.write_all(&[EGRESS_ACK_OK]).await;
+                    }
+                });
+            }
+        });
+        Ok::<_, anyhow::Error>((addr, task))
+    };
+
+    let (primary_addr, p_task) = spawn_delayed_egress(primary_delay_ms.clone()).await?;
+    let (backup_addr, b_task) = spawn_delayed_egress(backup_delay_ms.clone()).await?;
+
+    let mut cfg = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut cfg).context("unique state")?;
+        sm.dcs.clear();
+        sm.egress_upstreams = vec![primary_addr, backup_addr];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_token = token;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+        sm.egress_hedge_ms = 40;
+        sm.handshake = Duration::from_secs(2);
+    }
+
+    let hdr = [0u8; 64];
+    // 1. Primary stalls for 500ms (> hedge_ms=40ms), backup responds in 0ms:
+    //    Hedge starts after 40ms, backup wins well before 500ms!
+    let t0 = Instant::now();
+    let (_s1, route1) = connect_upstream(&cfg, 2, &hdr).await?;
+    assert_eq!(route1, "egress");
+    assert!(
+        t0.elapsed() < Duration::from_millis(350),
+        "hedged connect should complete via backup well before primary's 500ms delay"
+    );
+    assert_eq!(cfg.counters.hedge_started.load(Relaxed), 1);
+    assert_eq!(cfg.counters.hedge_won_by_backup.load(Relaxed), 1);
+
+    // Clear cooldown on primary so we can test primary winning after hedge starts.
+    EgressHealth::apply_background_probe(
+        &cfg.egress_health,
+        0,
+        2,
+        true,
+        cfg.egress_cooldown,
+        cfg.egress_cooldown_max,
+    );
+
+    // 2. Primary responds in 80ms (> hedge_ms=40ms), backup responds in 400ms:
+    //    Hedge starts at 40ms (hedge_started=2), but primary wins at 80ms (hedge_won_by_backup stays 1)!
+    primary_delay_ms.store(80, Relaxed);
+    backup_delay_ms.store(400, Relaxed);
+    let (_s2, route2) = connect_upstream(&cfg, 2, &hdr).await?;
+    assert_eq!(route2, "egress");
+    assert_eq!(cfg.counters.hedge_started.load(Relaxed), 2);
+    assert_eq!(cfg.counters.hedge_won_by_backup.load(Relaxed), 1);
+
+    p_task.abort();
+    b_task.abort();
     Ok(())
 }

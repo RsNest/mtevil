@@ -101,6 +101,9 @@ pub struct Config {
     /// Background egress probe interval in seconds while at least one egress node is unavailable.
     #[serde(default = "default_egress_probe_degraded_interval_secs")]
     pub egress_probe_degraded_interval_secs: u64,
+    /// Hedged connect delay in milliseconds for ordered egress strategy (0 = disabled).
+    #[serde(default = "default_egress_hedge_ms")]
+    pub egress_hedge_ms: u64,
 }
 fn default_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 24443))
@@ -137,6 +140,9 @@ pub fn default_egress_probe_interval_secs() -> u64 {
 }
 pub fn default_egress_probe_degraded_interval_secs() -> u64 {
     5
+}
+pub fn default_egress_hedge_ms() -> u64 {
+    400
 }
 
 impl Config {
@@ -200,6 +206,10 @@ impl Config {
             (1..=3600).contains(&self.egress_probe_degraded_interval_secs)
                 && self.egress_probe_degraded_interval_secs <= self.egress_probe_interval_secs,
             "egress_probe_degraded_interval_secs must be 1..=egress_probe_interval_secs"
+        );
+        ensure!(
+            self.egress_hedge_ms <= 30_000,
+            "egress_hedge_ms must be 0..=30000"
         );
         mtevil_proto::ServerFlightProfile {
             cert_bytes: self.fake_tls_cert_bytes,
@@ -390,6 +400,7 @@ mod tests {
         assert_eq!(c.egress_cooldown_max_ms, 60_000);
         assert_eq!(c.egress_probe_interval_secs, 30);
         assert_eq!(c.egress_probe_degraded_interval_secs, 5);
+        assert_eq!(c.egress_hedge_ms, 400);
         assert!(serde_json::from_str::<Config>(r#"{"secret_file":"secret","sni":"example.com","cover":"example.com:443","dc":[],"max_conections":100}"#).is_err());
         Ok(())
     }
@@ -459,6 +470,9 @@ mod tests {
         let mut c = config()?;
         c.egress_probe_interval_secs = 10;
         c.egress_probe_degraded_interval_secs = 20;
+        assert!(c.validate().is_err());
+        let mut c = config()?;
+        c.egress_hedge_ms = 30_001;
         assert!(c.validate().is_err());
 
         let edge: Config = serde_json::from_str(
