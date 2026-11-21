@@ -1,3 +1,4 @@
+import html
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ from urllib.request import Request, urlopen
 
 RELEASE_TAG = re.compile(r"v\d+\.\d+\.\d+(?:-rc\.\d+)?")
 NOTES_DIR = Path(__file__).resolve().parents[1] / "docs" / "releases"
+TELEGRAM_MAX_LEN = 3800
 
 
 def github_api(endpoint, payload=None):
@@ -26,26 +28,103 @@ def github_api(endpoint, payload=None):
     return json.loads(result.stdout)
 
 
+def md_inline_to_html(text):
+    """Convert basic Markdown inline spans (**bold**, `code`, [label](url)) to Telegram HTML."""
+    code_spans = []
+
+    def stash_code(m):
+        idx = len(code_spans)
+        code_spans.append(f"<code>{html.escape(m.group(1))}</code>")
+        return f"\x00CODE{idx}\x00"
+
+    masked = re.sub(r"`([^`]+)`", stash_code, text)
+    escaped = html.escape(masked)
+    escaped = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r'<a href="\2">\1</a>', escaped)
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", escaped)
+    for idx, code_html in enumerate(code_spans):
+        escaped = escaped.replace(f"\x00CODE{idx}\x00", code_html)
+    return escaped
+
+
 def build_message(tag, release):
     notes_file = NOTES_DIR / f"{tag}.md"
     notes = notes_file.read_text(encoding="utf-8") if notes_file.is_file() else (release.get("body") or "")
-    heading = f"mtevil {tag}"
-    bullets = []
-    for line in notes.splitlines():
-        bullet = re.match(r"^\s*[-*]\s+(.+)$", line)
-        if not bullet:
+    is_rc = "-rc." in tag
+    badge = "🧪" if is_rc else "🚀"
+    rc_label = " <i>(предварительный релиз)</i>" if is_rc else ""
+    header = f"{badge} <b>mtevil {html.escape(tag)}</b>{rc_label}"
+
+    blocks = []
+    intro_lines = []
+    current_bullets = []
+    current_section = None
+    seen_section = False
+
+    def flush_section():
+        if not current_bullets:
+            return
+        if current_section:
+            blocks.append(f"<b>{html.escape(current_section)}</b>\n" + "\n".join(current_bullets))
+        else:
+            blocks.append("\n".join(current_bullets))
+        current_bullets.clear()
+
+    for raw_line in notes.splitlines():
+        line = raw_line.strip()
+        if not line:
             continue
-        summary = re.sub(r"\[([^\]]+)\]\(https?://[^)]+\)", r"\1", bullet[1])
-        summary = re.split(r"\s+by @\S+\s+in https?://", summary, maxsplit=1)[0]
-        summary = summary.strip().replace("`", "")
-        if not summary or summary.lower().startswith("full changelog") or summary.startswith(("@", "http")):
+        if line.startswith("# ") and not seen_section and not current_bullets:
             continue
-        bullets.append("• " + (summary if len(summary) <= 180 else summary[:177].rstrip() + "…"))
-        if len(bullets) == 4:
-            break
-    if not bullets:
-        bullets.append("Обновление опубликовано. Список изменений доступен на GitHub.")
-    return heading + "\n\n" + "\n".join(bullets)
+        sec_match = re.match(r"^#{2,3}\s+(.+)$", line)
+        if sec_match:
+            flush_section()
+            seen_section = True
+            current_section = sec_match.group(1).strip()
+            continue
+        bullet = re.match(r"^[-*]\s+(.+)$", line)
+        if bullet:
+            seen_section = True
+            summary = re.split(r"\s+by @\S+\s+in https?://", bullet[1], maxsplit=1)[0].strip()
+            if not summary or summary.lower().startswith("full changelog") or summary.startswith(("@", "http")):
+                continue
+            current_bullets.append("• " + md_inline_to_html(summary))
+            continue
+        if not seen_section:
+            quote = re.sub(r"^>\s*", "", line)
+            intro_lines.append(md_inline_to_html(quote))
+
+    flush_section()
+
+    if not blocks:
+        blocks.append("• Обновление опубликовано. Подробный список изменений доступен на GitHub.")
+
+    update_cmd = "mtevilctl update --prerelease" if is_rc else "mtevilctl update"
+    footer = (
+        "<b>Как обновиться:</b>\n"
+        f"<code>{update_cmd}</code>"
+    )
+
+    parts = [header]
+    if intro_lines:
+        parts.append("<i>" + " ".join(intro_lines) + "</i>")
+    parts.extend(blocks)
+    parts.append(footer)
+
+    message = "\n\n".join(parts)
+    if len(message) > TELEGRAM_MAX_LEN:
+        # Trim middle blocks cleanly if a future changelog is unusually long.
+        trimmed_parts = [header]
+        if intro_lines:
+            trimmed_parts.append("<i>" + " ".join(intro_lines) + "</i>")
+        budget = TELEGRAM_MAX_LEN - len(header) - len(footer) - 64
+        for blk in blocks:
+            if len("\n\n".join(trimmed_parts)) + len(blk) <= budget:
+                trimmed_parts.append(blk)
+            else:
+                break
+        trimmed_parts.append(footer)
+        message = "\n\n".join(trimmed_parts)
+    return message
 
 
 def send_telegram(token, chat, thread_id, text, release_url):
@@ -53,7 +132,16 @@ def send_telegram(token, chat, thread_id, text, release_url):
         "chat_id": chat,
         "message_thread_id": thread_id,
         "text": text,
-        "reply_markup": {"inline_keyboard": [[{"text": "Релиз на GitHub", "url": release_url}]]},
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "reply_markup": {
+            "inline_keyboard": [
+                [
+                    {"text": "📦 Релиз на GitHub", "url": release_url},
+                    {"text": "📖 Документация", "url": "https://github.com/RsNest/mtevil#readme"},
+                ]
+            ]
+        },
     }
     request = Request(
         f"https://api.telegram.org/bot{token}/sendMessage",
