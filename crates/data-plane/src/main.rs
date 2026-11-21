@@ -1567,10 +1567,20 @@ async fn main() -> Result<()> {
     let rlimit_nofile = detect_rlimit_nofile();
     let effective_max = compute_effective_max_connections(config.max_connections, rlimit_nofile)?;
     let replay_ttl = Duration::from_secs(300);
-    let replay = match &config.replay_file {
-        Some(path) => ReplayCache::load_or_new(path.clone(), 65536, replay_ttl)?,
-        None => ReplayCache::new(65536, replay_ttl),
+    let (replay, replay_load_status) = match &config.replay_file {
+        Some(path) => ReplayCache::load_with_status(path.clone(), 65536, replay_ttl),
+        None => (
+            ReplayCache::new(65536, replay_ttl),
+            replay::ReplayLoadStatus::Disabled,
+        ),
     };
+    if replay_load_status == replay::ReplayLoadStatus::CorruptedReinitialized {
+        telemetry::event(
+            "replay_table_reinitialized",
+            0,
+            json!({"reason": "corrupted_or_unreadable_replay_file"}),
+        );
+    }
     let max_cover_connections = (effective_max / 4).max(1);
     let user_count = secrets.len();
     let persistent_replay = config.replay_file.is_some();
@@ -1647,6 +1657,8 @@ async fn main() -> Result<()> {
             "max_cover_connections":max_cover_connections,
             "users":user_count,
             "persistent_replay":persistent_replay,
+            "replay_load_status":replay_load_status.as_str(),
+            "replay_loaded_entries":replay_load_status.loaded_entries(),
             "fake_tls_cert_bytes":config.fake_tls_cert_bytes,
             "fake_tls_cert_jitter":config.fake_tls_cert_jitter,
             "flight_shaping":state.flight_shaping,
@@ -1679,16 +1691,28 @@ async fn main() -> Result<()> {
                     .await
                     {
                         Ok(Ok(())) => state.replay.lock().await.mark_flushed(gen),
-                        Ok(Err(err)) => telemetry::event(
-                            "replay_flush_failed",
-                            0,
-                            json!({"error": format!("{err:#}")}),
-                        ),
-                        Err(err) => telemetry::event(
-                            "replay_flush_failed",
-                            0,
-                            json!({"error": format!("{err:#}")}),
-                        ),
+                        Ok(Err(err)) => {
+                            state
+                                .counters
+                                .replay_flush_failed
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            telemetry::event(
+                                "replay_flush_failed",
+                                0,
+                                json!({"error": format!("{err:#}")}),
+                            );
+                        }
+                        Err(err) => {
+                            state
+                                .counters
+                                .replay_flush_failed
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            telemetry::event(
+                                "replay_flush_failed",
+                                0,
+                                json!({"error": format!("{err:#}")}),
+                            );
+                        }
                     }
                 }
             }
@@ -1728,6 +1752,10 @@ async fn main() -> Result<()> {
         let _ = task.await;
     }
     if let Err(err) = state.replay.lock().await.flush_snapshot() {
+        state
+            .counters
+            .replay_flush_failed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         telemetry::event(
             "replay_flush_failed",
             0,

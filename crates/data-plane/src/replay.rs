@@ -1,5 +1,5 @@
 //! Replay cache with optional file persistence across restarts/upgrades.
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::{
     collections::{HashMap, VecDeque},
     fs,
@@ -11,6 +11,32 @@ use tokio::time::Instant;
 
 const SWEEP_LIMIT: usize = 64;
 const RECORD_BYTES: usize = 40; // 32-byte key + 8-byte BE unix_expiry_secs
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayLoadStatus {
+    Disabled,
+    Fresh,
+    Loaded(usize),
+    CorruptedReinitialized,
+}
+
+impl ReplayLoadStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Fresh => "fresh",
+            Self::Loaded(_) => "loaded",
+            Self::CorruptedReinitialized => "corrupted_reinitialized",
+        }
+    }
+
+    pub fn loaded_entries(self) -> usize {
+        match self {
+            Self::Loaded(n) => n,
+            _ => 0,
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Decision {
@@ -51,29 +77,54 @@ impl ReplayCache {
         }
     }
 
+    #[cfg(test)]
     pub fn load_or_new(path: PathBuf, capacity: usize, ttl: Duration) -> Result<Self> {
-        let mut cache = Self::new(capacity, ttl);
-        if path.exists() {
-            let bytes = fs::read(&path).with_context(|| format!("read replay cache {}", path.display()))?;
-            let now_mono = Instant::now();
-            let now_unix = unix_now_secs();
-            for chunk in bytes.as_chunks::<RECORD_BYTES>().0 {
-                let key: [u8; 32] = chunk[..32].try_into()?;
-                let exp_unix = u64::from_be_bytes(chunk[32..40].try_into()?);
-                if exp_unix <= now_unix {
-                    continue;
-                }
-                let rem = Duration::from_secs((exp_unix - now_unix).min(ttl.as_secs()));
-                let exp_mono = now_mono + rem;
-                if cache.entries.len() >= capacity {
-                    break;
-                }
-                cache.entries.insert(key, (exp_mono, exp_unix));
-                cache.expiry.push_back((key, exp_mono));
-            }
-        }
-        cache.persist_path = Some(path);
+        let (cache, _) = Self::load_with_status(path, capacity, ttl);
         Ok(cache)
+    }
+
+    pub fn load_with_status(
+        path: PathBuf,
+        capacity: usize,
+        ttl: Duration,
+    ) -> (Self, ReplayLoadStatus) {
+        let mut cache = Self::new(capacity, ttl);
+        let status = if path.exists() {
+            match fs::read(&path) {
+                Ok(bytes) if bytes.len().is_multiple_of(RECORD_BYTES) => {
+                    let now_mono = Instant::now();
+                    let now_unix = unix_now_secs();
+                    for chunk in bytes.as_chunks::<RECORD_BYTES>().0 {
+                        let Ok(key): std::result::Result<[u8; 32], _> = chunk[..32].try_into()
+                        else {
+                            break;
+                        };
+                        let Ok(exp_bytes): std::result::Result<[u8; 8], _> =
+                            chunk[32..40].try_into()
+                        else {
+                            break;
+                        };
+                        let exp_unix = u64::from_be_bytes(exp_bytes);
+                        if exp_unix <= now_unix {
+                            continue;
+                        }
+                        let rem = Duration::from_secs((exp_unix - now_unix).min(ttl.as_secs()));
+                        let exp_mono = now_mono + rem;
+                        if cache.entries.len() >= capacity {
+                            break;
+                        }
+                        cache.entries.insert(key, (exp_mono, exp_unix));
+                        cache.expiry.push_back((key, exp_mono));
+                    }
+                    ReplayLoadStatus::Loaded(cache.entries.len())
+                }
+                _ => ReplayLoadStatus::CorruptedReinitialized,
+            }
+        } else {
+            ReplayLoadStatus::Fresh
+        };
+        cache.persist_path = Some(path);
+        (cache, status)
     }
 
     /// Caller holds one async mutex across check and insert. Work per call is bounded.
@@ -163,6 +214,7 @@ pub fn write_snapshot_items(path: &Path, items: &[SnapshotEntry]) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     #[test]
     fn inv02_saturation_does_not_evict_live_keys_and_ttl_is_exact() {
         let now = Instant::now();
@@ -234,6 +286,22 @@ mod tests {
             reloaded.check_and_insert([42; 32], Instant::now()),
             Decision::Duplicate
         );
+
+        // Corrupted (truncated non-multiple of 40 bytes) replay file never fails startup:
+        // it reinitializes an empty cache and reports CorruptedReinitialized status.
+        fs::write(&path, b"corrupted-incomplete-record")?;
+        let (mut recovered, status) = ReplayCache::load_with_status(path.clone(), 64, ttl);
+        assert_eq!(status, ReplayLoadStatus::CorruptedReinitialized);
+        assert_eq!(status.as_str(), "corrupted_reinitialized");
+        assert_eq!(status.loaded_entries(), 0);
+        assert_eq!(
+            recovered.check_and_insert([42; 32], Instant::now()),
+            Decision::Fresh
+        );
+        recovered.flush_snapshot()?;
+        let (_, status_after_flush) = ReplayCache::load_with_status(path.clone(), 64, ttl);
+        assert_eq!(status_after_flush, ReplayLoadStatus::Loaded(1));
+
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }

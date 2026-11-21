@@ -89,7 +89,7 @@ MTEVIL_IMAGE=mtevil:rollback docker compose -f deploy/compose.yaml up -d --no-bu
 
 При откате используйте прежние MTEVIL_BIND/PORT. Том секрета не удаляйте.
 Обновление перезапускает единственный процесс: zero-downtime здесь не обещается,
-replay-cache при перезапуске очищается. Базовые образы закреплены digest'ами;
+а replay-кэш при заданном `replay_file` (`/var/lib/mtevil/replay.bin` в томе `state`, смонтированном на запись при `read_only: true` для корневой ФС контейнера) атомарно сбрасывается каждые 5 с и при остановке (`tmp + fsync + rename`), переживает рестарт, а при повреждении файла переинициализируется с пустой таблицей без падения старта (`replay_load_status` и `replay_loaded_entries` фиксируются в событии `startup`, ошибки записи учитываются в метрике и событии `replay_flush_failed`). Базовые образы закреплены digest'ами;
 байт-идентичность сборки и registry publication пока не заявляются.
 
 Пакет проверен на Linux/amd64. Прикладная проверка Telegram DC — отдельная

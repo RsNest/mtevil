@@ -86,6 +86,7 @@ pub struct Counters {
     pub accept_errors: AcceptErrorCounters,
     pub hedge_started: AtomicU64,
     pub hedge_won_by_backup: AtomicU64,
+    pub replay_flush_failed: AtomicU64,
 }
 
 impl Counters {
@@ -140,6 +141,7 @@ impl Counters {
             "accept_errors": self.accept_errors.snapshot_json(),
             "hedge_started": self.hedge_started.load(Ordering::Relaxed),
             "hedge_won_by_backup": self.hedge_won_by_backup.load(Ordering::Relaxed),
+            "replay_flush_failed": self.replay_flush_failed.load(Ordering::Relaxed),
         })
     }
 }
