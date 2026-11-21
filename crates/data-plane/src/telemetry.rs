@@ -99,6 +99,7 @@ pub struct Counters {
     pub egress_preface_aborted: AtomicU64,
     pub egress_nonce_cache_full: AtomicU64,
     pub egress_failed_tracker_evictions: AtomicU64,
+    pub alert_webhook_dropped: AtomicU64,
 }
 
 impl Counters {
@@ -168,6 +169,7 @@ impl Counters {
             "egress_failed_tracker_evictions": self
                 .egress_failed_tracker_evictions
                 .load(Ordering::Relaxed),
+            "alert_webhook_dropped": self.alert_webhook_dropped.load(Ordering::Relaxed),
         })
     }
 
@@ -305,6 +307,17 @@ impl Counters {
             out,
             "mtevil_egress_failed_tracker_evictions_total {}",
             self.egress_failed_tracker_evictions.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_alert_webhook_dropped_total Alert webhook deliveries dropped because bounded queue (64) was full"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_alert_webhook_dropped_total counter");
+        let _ = writeln!(
+            out,
+            "mtevil_alert_webhook_dropped_total {}",
+            self.alert_webhook_dropped.load(Ordering::Relaxed)
         );
 
         let _ = writeln!(

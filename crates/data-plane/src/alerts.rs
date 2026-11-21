@@ -91,6 +91,79 @@ pub(crate) fn send_http_alert_webhook(url: &str, payload: &str) -> std::io::Resu
     }
 }
 
+pub(crate) const ALERT_WEBHOOK_QUEUE_CAPACITY: usize = 64;
+pub(crate) const ALERT_WEBHOOK_WORKERS: usize = 2;
+
+pub(crate) struct AlertWebhookDispatcher {
+    tx: std::sync::mpsc::SyncSender<(String, String)>,
+}
+
+impl AlertWebhookDispatcher {
+    pub(crate) fn new(capacity: usize, workers: usize) -> Self {
+        Self::new_with_handler(capacity, workers, |url, body| {
+            for delay in [0, 2, 8] {
+                if delay > 0 {
+                    std::thread::sleep(Duration::from_secs(delay));
+                }
+                if send_http_alert_webhook(&url, &body).is_ok() {
+                    return;
+                }
+            }
+            telemetry::event("edge_alert_webhook_failed", 0, json!({"attempts": 3}));
+        })
+    }
+
+    pub(crate) fn new_with_handler<F>(capacity: usize, workers: usize, handler: F) -> Self
+    where
+        F: Fn(String, String) + Send + Sync + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(String, String)>(capacity.max(1));
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let handler = Arc::new(handler);
+        for _ in 0..workers.max(1) {
+            let rx_c = rx.clone();
+            let h_c = handler.clone();
+            let _ = std::thread::Builder::new()
+                .name("mtevil-alert-webhook".into())
+                .spawn(move || loop {
+                    let item = {
+                        let guard = rx_c.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.recv()
+                    };
+                    match item {
+                        Ok((url, body)) => h_c(url, body),
+                        Err(_) => break,
+                    }
+                });
+        }
+        Self { tx }
+    }
+
+    pub(crate) fn try_enqueue(
+        &self,
+        url: String,
+        body: String,
+        counters: &telemetry::Counters,
+    ) -> bool {
+        match self.tx.try_send((url, body)) {
+            Ok(()) => true,
+            Err(_) => {
+                counters
+                    .alert_webhook_dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            }
+        }
+    }
+}
+
+fn global_alert_webhook_dispatcher() -> &'static AlertWebhookDispatcher {
+    static DISPATCHER: std::sync::OnceLock<AlertWebhookDispatcher> = std::sync::OnceLock::new();
+    DISPATCHER.get_or_init(|| {
+        AlertWebhookDispatcher::new(ALERT_WEBHOOK_QUEUE_CAPACITY, ALERT_WEBHOOK_WORKERS)
+    })
+}
+
 pub(crate) fn emit_edge_route_alert(state: &State, ev: EdgeAlertEvent) {
     let ts_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -127,15 +200,7 @@ pub(crate) fn emit_edge_route_alert(state: &State, ev: EdgeAlertEvent) {
 
     if let Some(url) = state.alert_webhook_url.clone() {
         let body = payload.to_string();
-        std::thread::spawn(move || {
-            for delay in [0, 2, 8] {
-                std::thread::sleep(Duration::from_secs(delay));
-                if send_http_alert_webhook(&url, &body).is_ok() {
-                    return;
-                }
-            }
-            telemetry::event("edge_alert_webhook_failed", 0, json!({"attempts": 3}));
-        });
+        let _ = global_alert_webhook_dispatcher().try_enqueue(url, body, &state.counters);
     }
 }
 

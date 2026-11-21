@@ -4085,3 +4085,42 @@ async fn inv10_f23_round_robin_hedge_adaptive_per_try_and_parallel_node_down_sig
     t_live.abort();
     Ok(())
 }
+
+#[test]
+fn alert_webhook_bounded_queue_drops_on_overflow_and_tracks_metric() -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    let gate_rx = Arc::new(std::sync::Mutex::new(gate_rx));
+    let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let started_c = started.clone();
+    let gate_c = gate_rx.clone();
+
+    let dispatcher = AlertWebhookDispatcher::new_with_handler(2, 1, move |_url, _body| {
+        started_c.fetch_add(1, Relaxed);
+        let _ = gate_c
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recv_timeout(Duration::from_secs(2));
+    });
+    let counters = telemetry::Counters::default();
+
+    // Item 1 picked up by the single worker and blocks on gate_rx.
+    assert!(dispatcher.try_enqueue("http://127.0.0.1:1".into(), "1".into(), &counters));
+    for _ in 0..50 {
+        if started.load(Relaxed) >= 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Items 2 and 3 fill the bounded queue (capacity=2).
+    assert!(dispatcher.try_enqueue("http://127.0.0.1:1".into(), "2".into(), &counters));
+    assert!(dispatcher.try_enqueue("http://127.0.0.1:1".into(), "3".into(), &counters));
+    // Item 4 overflows the bounded queue and increments alert_webhook_dropped.
+    assert!(!dispatcher.try_enqueue("http://127.0.0.1:1".into(), "4".into(), &counters));
+    assert_eq!(counters.alert_webhook_dropped.load(Relaxed), 1);
+
+    let _ = gate_tx.send(());
+    let _ = gate_tx.send(());
+    let _ = gate_tx.send(());
+    Ok(())
+}
