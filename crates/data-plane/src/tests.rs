@@ -3491,7 +3491,7 @@ async fn inv10_f23_hedge_zero_disabled_at_most_one_hedge_and_loser_closed() -> R
 
     // 2. egress_hedge_ms = 40 with 3 nodes: at most ONE hedge per connection, loser socket closes cleanly.
     let (p2, p2_hits, p2_closed, t3) = spawn_delay_egress(350).await?;
-    let (b2, b2_hits, _, t4) = spawn_delay_egress(10).await?;
+    let (b2, b2_hits, b2_closed, t4) = spawn_delay_egress(10).await?;
     let (b3, b3_hits, _, t5) = spawn_delay_egress(0).await?;
     let mut st1 = state(cover.addr, "127.0.0.1:1".parse()?);
     {
@@ -3503,7 +3503,6 @@ async fn inv10_f23_hedge_zero_disabled_at_most_one_hedge_and_loser_closed() -> R
         sm.egress_use_mtv3 = false;
         sm.handshake = Duration::from_secs(3);
     }
-    let fd_before = detect_fd_used();
     let s = connect_upstream(&st1, 2, &[0x22; 64]).await?;
     drop(s);
     assert_eq!(st1.counters.hedge_started.load(Relaxed), 1);
@@ -3511,19 +3510,18 @@ async fn inv10_f23_hedge_zero_disabled_at_most_one_hedge_and_loser_closed() -> R
     assert_eq!(p2_hits.load(Relaxed), 1);
     assert_eq!(b2_hits.load(Relaxed), 1);
     assert_eq!(b3_hits.load(Relaxed), 0, "at most one hedge per connection");
-    // Wait briefly and confirm the losing primary socket observed peer close (no FD leak).
+    // Wait briefly and confirm both losing primary and dropped backup sockets observed peer close (no FD leak).
     tokio::time::sleep(Duration::from_millis(450)).await;
     assert_eq!(
         p2_closed.load(Relaxed),
         1,
         "losing primary socket must be closed after backup wins"
     );
-    if let (Some(before), Some(after)) = (fd_before, detect_fd_used()) {
-        assert!(
-            after <= before + 8,
-            "FD leak detected after hedged connect: before={before} after={after}"
-        );
-    }
+    assert_eq!(
+        b2_closed.load(Relaxed),
+        1,
+        "winning backup socket must be closed after stream drop"
+    );
 
     for t in [t1, t2, t3, t4, t5] {
         t.abort();
