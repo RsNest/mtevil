@@ -160,30 +160,40 @@ pub(crate) async fn monitor_edge_egress(state: Arc<State>, period: Duration) {
             let use_mtv3 = state.egress_use_mtv3;
             probes.spawn(async move {
                 let limit = Duration::from_secs(4);
-                let available = timeout(
+                let outcome = match timeout(
                     limit,
                     probe_egress_endpoint_proto(address, probe_dc, &token, limit, use_mtv3),
                 )
                 .await
-                .is_ok_and(|probe| probe.dc_reachable);
-                (idx, available)
+                {
+                    Ok(probe) if probe.dc_reachable => BackgroundProbeOutcome::PositiveAck,
+                    Ok(probe) if probe.tcp_reachable && probe.token_status == "ok" => {
+                        BackgroundProbeOutcome::NegativeAck
+                    }
+                    _ => BackgroundProbeOutcome::TransportFailure,
+                };
+                (idx, outcome)
             });
         }
         let mut available = vec![false; state.egress_upstreams.len()];
+        let mut any_degraded = false;
         while let Some(result) = probes.join_next().await {
-            if let Ok((idx, ok)) = result {
-                available[idx] = ok;
+            if let Ok((idx, outcome)) = result {
+                available[idx] = outcome != BackgroundProbeOutcome::TransportFailure;
+                if outcome != BackgroundProbeOutcome::PositiveAck {
+                    any_degraded = true;
+                }
                 EgressHealth::apply_background_probe(
                     &state.egress_health,
                     idx,
-                    probe_dc.abs(),
-                    ok,
+                    probe_dc,
+                    outcome,
                     state.egress_cooldown,
                     state.egress_cooldown_max,
                 );
             }
         }
-        let any_down = available.iter().any(|ok| !*ok);
+        let any_down = any_degraded || available.iter().any(|ok| !*ok);
         next_wait = if any_down {
             state.egress_probe_degraded_interval.min(period)
         } else {

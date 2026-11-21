@@ -47,6 +47,13 @@ pub(crate) struct EdgeAlertEvent {
     pub(crate) strategy: EgressStrategy,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackgroundProbeOutcome {
+    PositiveAck,
+    NegativeAck,
+    TransportFailure,
+}
+
 impl EgressHealth {
     pub(crate) fn new(node_count: usize) -> Self {
         Self {
@@ -95,8 +102,8 @@ impl EgressHealth {
     pub(crate) fn apply_background_probe(
         health: &std::sync::Mutex<EgressHealth>,
         idx: usize,
-        dc_abs: i16,
-        available: bool,
+        dc_id: i16,
+        outcome: BackgroundProbeOutcome,
         base: Duration,
         max: Duration,
     ) {
@@ -107,24 +114,40 @@ impl EgressHealth {
         while h.node_failed.len() <= idx {
             h.node_failed.push(false);
         }
-        if available {
-            let slot = &mut h.nodes[idx];
-            slot.until = None;
-            slot.probing = false;
-            slot.failures = 0;
-            if let Some(dc_slot) = h.dc_slots.get_mut(&(idx, dc_abs)) {
-                dc_slot.until = None;
-                dc_slot.probing = false;
-                dc_slot.failures = 0;
+        match outcome {
+            BackgroundProbeOutcome::PositiveAck => {
+                let slot = &mut h.nodes[idx];
+                slot.until = None;
+                slot.probing = false;
+                slot.failures = 0;
+                if let Some(dc_slot) = h.dc_slots.get_mut(&(idx, dc_id)) {
+                    dc_slot.until = None;
+                    dc_slot.probing = false;
+                    dc_slot.failures = 0;
+                }
+                h.node_failed[idx] = false;
             }
-            h.node_failed[idx] = false;
-        } else {
-            let slot = &mut h.nodes[idx];
-            slot.failures = slot.failures.saturating_add(1);
-            let cooldown = compute_egress_cooldown(base, max, slot.failures);
-            slot.until = Some(Instant::now() + cooldown);
-            slot.probing = false;
-            h.node_failed[idx] = true;
+            BackgroundProbeOutcome::NegativeAck => {
+                // Node transport is healthy; mark only the (node, dc_id) pair in cooldown.
+                let slot = &mut h.nodes[idx];
+                slot.until = None;
+                slot.probing = false;
+                slot.failures = 0;
+                h.node_failed[idx] = false;
+                let dc_slot = h.dc_slots.entry((idx, dc_id)).or_default();
+                dc_slot.failures = dc_slot.failures.saturating_add(1);
+                let cooldown = compute_egress_cooldown(base, max, dc_slot.failures);
+                dc_slot.until = Some(Instant::now() + cooldown);
+                dc_slot.probing = false;
+            }
+            BackgroundProbeOutcome::TransportFailure => {
+                let slot = &mut h.nodes[idx];
+                slot.failures = slot.failures.saturating_add(1);
+                let cooldown = compute_egress_cooldown(base, max, slot.failures);
+                slot.until = Some(Instant::now() + cooldown);
+                slot.probing = false;
+                h.node_failed[idx] = true;
+            }
         }
     }
 

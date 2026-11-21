@@ -2825,7 +2825,7 @@ async fn hedged_connect_starts_backup_after_hedge_ms_and_tracks_metrics() -> Res
         &cfg.egress_health,
         0,
         2,
-        true,
+        BackgroundProbeOutcome::PositiveAck,
         cfg.egress_cooldown,
         cfg.egress_cooldown_max,
     );
@@ -3910,5 +3910,80 @@ async fn inv10_f24_forced_probe_single_flight_200_concurrent_connections() -> Re
 
     t0.abort();
     t1.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn inv10_f24_background_probe_separates_transport_negative_ack_and_positive_ack() -> Result<()>
+{
+    let health = std::sync::Mutex::new(EgressHealth::new(1));
+    let base = Duration::from_secs(10);
+    let max = Duration::from_secs(60);
+
+    // 1. Node responds PositiveAck on DC 2 and DC 4, and NegativeAck on DC -2.
+    EgressHealth::apply_background_probe(
+        &health,
+        0,
+        2,
+        BackgroundProbeOutcome::PositiveAck,
+        base,
+        max,
+    );
+    EgressHealth::apply_background_probe(
+        &health,
+        0,
+        4,
+        BackgroundProbeOutcome::PositiveAck,
+        base,
+        max,
+    );
+    EgressHealth::apply_background_probe(
+        &health,
+        0,
+        -2,
+        BackgroundProbeOutcome::NegativeAck,
+        base,
+        max,
+    );
+
+    // Routes for DC 2 and DC 4 MUST NOT be skipped; only (node 0, DC -2) is in cooldown!
+    let now = Instant::now();
+    assert!(
+        EgressHealth::try_claim(&health, 0, 2, now).is_some(),
+        "DC 2 must stay available when only DC -2 returned negative ACK"
+    );
+    assert!(
+        EgressHealth::try_claim(&health, 0, 4, now).is_some(),
+        "DC 4 must stay available when only DC -2 returned negative ACK"
+    );
+    assert!(
+        EgressHealth::try_claim(&health, 0, -2, now).is_none(),
+        "DC -2 must be in cooldown after negative ACK"
+    );
+
+    // 2. PositiveAck on DC -2 clears DC -2 cooldown.
+    EgressHealth::apply_background_probe(
+        &health,
+        0,
+        -2,
+        BackgroundProbeOutcome::PositiveAck,
+        base,
+        max,
+    );
+    assert!(EgressHealth::try_claim(&health, 0, -2, Instant::now()).is_some());
+
+    // 3. TransportFailure marks the whole node in cooldown for ALL DCs (2, 4, -2).
+    EgressHealth::apply_background_probe(
+        &health,
+        0,
+        -2,
+        BackgroundProbeOutcome::TransportFailure,
+        base,
+        max,
+    );
+    let now2 = Instant::now();
+    assert!(EgressHealth::try_claim(&health, 0, 2, now2).is_none());
+    assert!(EgressHealth::try_claim(&health, 0, 4, now2).is_none());
+    assert!(EgressHealth::try_claim(&health, 0, -2, now2).is_none());
     Ok(())
 }

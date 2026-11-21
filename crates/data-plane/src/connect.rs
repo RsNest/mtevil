@@ -735,6 +735,7 @@ pub(crate) async fn connect_upstream(
         .max(Duration::from_millis(150))
         .min(Duration::from_secs(2));
     let dc_abs = dc_id.abs();
+    let dc_key = dc_id;
     let ordered = state.egress_strategy == EgressStrategy::Ordered;
     let hedge_delay = (ordered && state.egress_hedge_ms > 0)
         .then(|| Duration::from_millis(state.egress_hedge_ms))
@@ -748,7 +749,7 @@ pub(crate) async fn connect_upstream(
             let idx = (start + offset) % count;
             offset += 1;
             let Some(claim) =
-                EgressHealth::try_claim(&state.egress_health, idx, dc_abs, Instant::now())
+                EgressHealth::try_claim(&state.egress_health, idx, dc_key, Instant::now())
             else {
                 continue;
             };
@@ -788,7 +789,7 @@ pub(crate) async fn connect_upstream(
                     if let Some(c2) = EgressHealth::try_claim(
                         &state.egress_health,
                         cand_idx,
-                        dc_abs,
+                        dc_key,
                         Instant::now(),
                     ) {
                         backup_claim = Some((cand_idx, c2));
@@ -935,7 +936,7 @@ pub(crate) async fn connect_upstream(
             notified.as_mut().enable();
 
             if let Some((idx, claim)) =
-                EgressHealth::try_claim_forced_soonest(&state.egress_health, count, dc_abs)
+                EgressHealth::try_claim_forced_soonest(&state.egress_health, count, dc_key)
             {
                 let _notify_guard = NotifyOnDrop(&state.egress_probe_notify);
                 match dial_egress_candidate(state, idx, dc_id, dc_abs, dc_header, per_try).await {
@@ -972,7 +973,7 @@ pub(crate) async fn connect_upstream(
                         let Some(claim) = EgressHealth::try_claim(
                             &state.egress_health,
                             idx,
-                            dc_abs,
+                            dc_key,
                             Instant::now(),
                         ) else {
                             continue;
