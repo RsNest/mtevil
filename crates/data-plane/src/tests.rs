@@ -1939,3 +1939,58 @@ async fn edge_round_robin_alerts_ignore_healthy_alternation_and_track_availabili
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
+
+#[tokio::test]
+async fn media_dc_negative_ids_route_to_dedicated_address_with_fallback_and_zero_dc_ping_skips_dc() -> Result<()> {
+    let main_dc2 = TcpListener::bind("127.0.0.1:0").await?;
+    let main_dc2_addr = main_dc2.local_addr()?;
+    let media_dc2 = TcpListener::bind("127.0.0.1:0").await?;
+    let media_dc2_addr = media_dc2.local_addr()?;
+    let main_dc4 = TcpListener::bind("127.0.0.1:0").await?;
+    let main_dc4_addr = main_dc4.local_addr()?;
+
+    let mut dcs = HashMap::new();
+    dcs.insert(2, main_dc2_addr);
+    dcs.insert(-2, media_dc2_addr);
+    dcs.insert(4, main_dc4_addr);
+
+    // 1. lookup_dc_addr routes -2 to dedicated media DC, 2 to main DC, and -4 falls back to 4.
+    assert_eq!(lookup_dc_addr(&dcs, -2), Some(media_dc2_addr));
+    assert_eq!(lookup_dc_addr(&dcs, 2), Some(main_dc2_addr));
+    assert_eq!(lookup_dc_addr(&dcs, -4), Some(main_dc4_addr));
+
+    // 2. Real egress server handles dc_id=0 MTV2 health probe with EGRESS_ACK_OK WITHOUT dialing Telegram DC.
+    let token = [0x55u8; 16];
+    let egress_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let egress_addr = egress_listener.local_addr()?;
+    let counters = Arc::new(telemetry::Counters::default());
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let egress_task = tokio::spawn(serve_egress(
+        egress_listener,
+        Arc::new(dcs),
+        token,
+        16,
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+        counters,
+        async {
+            let _ = stop_rx.await;
+        },
+    ));
+
+    let probe = probe_egress_endpoint(egress_addr, 0, &token, Duration::from_secs(2)).await;
+    assert!(probe.tcp_reachable);
+    assert_eq!(probe.token_status, "accepted");
+    assert!(probe.dc_reachable);
+
+    // Verify no connection was made to main_dc2 or media_dc2 during dc_id=0 probe.
+    assert!(
+        timeout(Duration::from_millis(40), main_dc2.accept()).await.is_err(),
+        "dc_id=0 ping must not dial Telegram DC"
+    );
+
+    let _ = stop_tx.send(());
+    let _ = egress_task.await;
+    Ok(())
+}

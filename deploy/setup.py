@@ -974,14 +974,22 @@ def choose_wizard_mode(default: str = "simple") -> str:
 
 def ask_simple_confirm() -> str:
     while True:
-        raw = input("Продолжить? [Enter — установить / a — расширенная настройка / n — отмена] [Y/a/n]: ").strip().lower()
+        raw = (
+            input(
+                "Продолжить? [Enter — установить / s — сменить SNI / a — расширенная настройка / n — отмена] [Y/s/a/n]: "
+            )
+            .strip()
+            .lower()
+        )
         if raw in ("", "y", "yes", "д", "да", "у"):
             return "install"
+        if raw in ("s", "sni", "с"):
+            return "sni"
         if raw in ("a", "adv", "advanced", "2", "р"):
             return "advanced"
         if raw in ("n", "no", "н", "нет"):
             return "cancel"
-        print("Некорректный выбор: введите y (установить), a (расширенная настройка) или n (отмена).")
+        print("Некорректный выбор: введите y (установить), s (сменить SNI), a (расширенная настройка) или n (отмена).")
 
 
 def choose_advanced_role(default_role: str = "direct") -> str:
@@ -1223,6 +1231,28 @@ def download_url_atomic(
                 tmp.unlink()
             except OSError:
                 pass
+
+
+def strip_legacy_default_mss(cfg_file: Path) -> bool:
+    """Remove legacy default client_mss=100 / client_mss_bulk=1380 that clamped client SYN-ACK MSS."""
+    if not cfg_file.is_file():
+        return False
+    try:
+        data = json.loads(cfg_file.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    changed = False
+    if data.get("client_mss") == 100:
+        data.pop("client_mss", None)
+        changed = True
+    if data.get("client_mss_bulk") == 1380:
+        data.pop("client_mss_bulk", None)
+        changed = True
+    if changed:
+        cfg_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return changed
 
 
 def set_env_image(env_text: str, new_image: str) -> str:
@@ -1664,6 +1694,7 @@ def run_update_command(
         print(err_text(str(exc)), file=sys.stderr)
         return 1
 
+    strip_legacy_default_mss(cfg_file)
     orig_env_text = env_file.read_text(encoding="utf-8", errors="ignore")
     env_file.write_text(set_env_image(orig_env_text, target_image), encoding="utf-8")
 
@@ -2249,13 +2280,20 @@ def main(argv: list[str] | None = None) -> int:
         else:
             pub_port = ensure_available_port(deploy_dir, project, bind_ip, default_port, show_link_note=True)
 
-        print()
-        print(heading("Параметры простой установки (direct)"))
-        print(f"  Публичный адрес:  {public_host} ({host_source})")
-        print(f"  Порт:             {pub_port} (свободен)")
-        print(f"  Каталог:          {deploy_dir}")
-        print()
-        action = ask_simple_confirm()
+        while True:
+            print()
+            print(heading("Параметры простой установки (direct)"))
+            print(f"  Публичный адрес:  {public_host} ({host_source})")
+            print(f"  Порт:             {pub_port} (свободен)")
+            print(f"  Маскировка (SNI): {sni}")
+            print(f"  Каталог:          {deploy_dir}")
+            print()
+            action = ask_simple_confirm()
+            if action == "sni":
+                sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, sni)
+                cover = f"{sni}:443"
+                continue
+            break
         if action == "cancel":
             print("Отменено без изменений.")
             return 0
@@ -2263,6 +2301,8 @@ def main(argv: list[str] | None = None) -> int:
             mode = "advanced"
             carry_host = public_host
             carry_port = pub_port
+            default_sni = sni
+            default_cover = cover
         else:
             config_data = {
                 "role": "direct",
@@ -2281,8 +2321,6 @@ def main(argv: list[str] | None = None) -> int:
                 "fake_tls_cert_bytes": 2878,
                 "fake_tls_cert_jitter": 256,
                 "flight_shaping": True,
-                "client_mss": 100,
-                "client_mss_bulk": 1380,
             }
 
     if mode == "advanced":
@@ -2337,8 +2375,6 @@ def main(argv: list[str] | None = None) -> int:
                 "fake_tls_cert_bytes": 2878,
                 "fake_tls_cert_jitter": 256,
                 "flight_shaping": True,
-                "client_mss": 100,
-                "client_mss_bulk": 1380,
             }
         elif role == "egress":
             print("\n" + heading("Шаг 2. Сеть и адрес выхода"))
@@ -2428,8 +2464,6 @@ def main(argv: list[str] | None = None) -> int:
                 "fake_tls_cert_bytes": 2878,
                 "fake_tls_cert_jitter": 256,
                 "flight_shaping": True,
-                "client_mss": 100,
-                "client_mss_bulk": 1380,
             }
 
         print()

@@ -1707,6 +1707,39 @@ class SetupValidationTests(unittest.TestCase):
             self.assertIn("--no-color", called_argv)
             self.assertIn("--tail=30", called_argv)
 
+            # 5. Simple mode 's' shortcut changes SNI/cover inline and omits legacy client_mss=100;
+            #    strip_legacy_default_mss removes legacy 100/1380 on update while keeping custom values.
+            d_sni = d / "simple_sni"
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d_sni), "--image", "mtevil:v0.1.4", "--no-build"]),
+                mock.patch.object(sys, "stdin", io.StringIO("1\ns\nya.ru\ny\n")),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+                mock.patch.object(sys, "stderr", io.StringIO()),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "detect_local_global_ipv4", return_value="203.0.113.55"),
+                mock.patch.object(setup, "is_port_available", return_value=True),
+                mock.patch.object(setup, "deployment_owns_port", return_value=False),
+                mock.patch.object(setup, "ensure_generated_secret", return_value=True),
+                mock.patch.object(setup, "volume_file_exists", return_value=True),
+                mock.patch.object(setup, "check_cover_from_container", return_value=(True, "")),
+                mock.patch.object(setup, "wait_healthy", return_value=None),
+                mock.patch.object(setup, "verify_telegram_e2e", return_value=(True, "ok")),
+                mock.patch.object(setup, "run", return_value=subprocess.CompletedProcess([], 0, stdout="https://t.me/proxy?server=203.0.113.55&port=443&secret=ee00\n", stderr="")),
+            ):
+                self.assertEqual(setup.main(), 0)
+            sni_cfg = setup.json.loads((d_sni / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(sni_cfg["sni"], "ya.ru")
+            self.assertEqual(sni_cfg["cover"], "ya.ru:443")
+            self.assertNotIn("client_mss", sni_cfg)
+            self.assertNotIn("client_mss_bulk", sni_cfg)
+
+            legacy_cfg = d / "legacy_cfg.json"
+            legacy_cfg.write_text('{"role":"direct","client_mss":100,"client_mss_bulk":1380}\n', encoding="utf-8")
+            self.assertTrue(setup.strip_legacy_default_mss(legacy_cfg))
+            cleaned = setup.json.loads(legacy_cfg.read_text(encoding="utf-8"))
+            self.assertNotIn("client_mss", cleaned)
+            self.assertNotIn("client_mss_bulk", cleaned)
+
 
 if __name__ == "__main__":
     prog = unittest.main(verbosity=2, exit=False)

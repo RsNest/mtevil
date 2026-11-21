@@ -228,7 +228,10 @@ impl Config {
         for entry in &self.dc {
             let (id, address) = entry.split_once('=').context("DC must be ID=IP:PORT")?;
             let id: i16 = id.parse().context("invalid DC id")?;
-            ensure!((1..=5).contains(&id), "DC id must be 1..5");
+            ensure!(
+                (-5..=-1).contains(&id) || (1..=5).contains(&id),
+                "DC id must be 1..5 or -5..-1"
+            );
             let address: SocketAddr = address.parse().context("invalid DC address")?;
             ensure!(address.port() > 0, "DC port must not be zero");
             ensure!(dcs.insert(id, address).is_none(), "duplicate DC id");
@@ -357,6 +360,14 @@ mod tests {
         let mut c = config()?;
         c.cover = "example.com:0".into();
         assert!(c.validate().is_err());
+        let mut c = config()?;
+        c.dc.push("-2=149.154.167.151:443".into());
+        c.validate()?;
+        let dcs = c.datacenters()?;
+        assert_eq!(dcs.get(&-2).copied(), Some("149.154.167.151:443".parse()?));
+        let mut c_zero = config()?;
+        c_zero.dc.push("0=149.154.167.51:443".into());
+        assert!(c_zero.validate().is_err());
         let mut c = config()?;
         c.dc.push(c.dc[0].clone());
         assert!(c.validate().is_err());

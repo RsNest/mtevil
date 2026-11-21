@@ -588,7 +588,7 @@ async fn monitor_edge_egress(state: Arc<State>, period: Duration) {
             let token = state.egress_token;
             probes.spawn(async move {
                 let limit = Duration::from_secs(4);
-                let available = timeout(limit, probe_egress_endpoint(address, 2, &token, limit))
+                let available = timeout(limit, probe_egress_endpoint(address, 0, &token, limit))
                     .await
                     .is_ok_and(|probe| probe.dc_reachable);
                 (idx, available)
@@ -2390,12 +2390,15 @@ async fn download<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     stats: &RelayStats,
 ) -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
-    let mut buf = [0u8; wire::MAX_RECORD];
+    let mut frame_buf = vec![0u8; 5 + wire::MAX_RECORD];
+    frame_buf[0] = 0x17;
+    frame_buf[1] = 3;
+    frame_buf[2] = 3;
     let mut prefix = [0u8; 28];
     let mut prefix_len = 0;
     let mut prev_retrans = 0u32;
     loop {
-        let n = match r.read(&mut buf).await {
+        let n = match r.read(&mut frame_buf[5..]).await {
             Ok(n) => n,
             Err(error) => return stats.failed("dc_read_error", error.into()),
         };
@@ -2418,31 +2421,35 @@ async fn download<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         stats.dc_reads.fetch_add(1, Relaxed);
         stats.record_activity();
         stats.timeline.mark("dc_read", n as u64);
-        wire::crypt(&mut decrypt, &mut buf[..n]);
-        // Transient prefix only: recognize public unencrypted handshake types
-        // and transport errors; never emit prefix bytes, key IDs or payload.
-        let take = n.min(prefix.len() - prefix_len);
-        prefix[prefix_len..prefix_len + take].copy_from_slice(&buf[..take]);
-        prefix_len += take;
-        stats.observe_prefix(&prefix[..prefix_len], false);
-        if prefix_len >= 4 {
-            let word = i32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]);
-            let code = if word == 4 && prefix_len >= 8 {
-                i32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]])
-            } else {
-                word
-            };
-            if [-404, -429, -444, -500].contains(&code) {
-                stats.transport_error.store(code, Relaxed);
+        {
+            let buf = &mut frame_buf[5..5 + n];
+            wire::crypt(&mut decrypt, buf);
+            // Transient prefix only: recognize public unencrypted handshake types
+            // and transport errors; never emit prefix bytes, key IDs or payload.
+            let take = n.min(prefix.len() - prefix_len);
+            prefix[prefix_len..prefix_len + take].copy_from_slice(&buf[..take]);
+            prefix_len += take;
+            stats.observe_prefix(&prefix[..prefix_len], false);
+            if prefix_len >= 4 {
+                let word = i32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]);
+                let code = if word == 4 && prefix_len >= 8 {
+                    i32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]])
+                } else {
+                    word
+                };
+                if [-404, -429, -444, -500].contains(&code) {
+                    stats.transport_error.store(code, Relaxed);
+                }
             }
+            wire::crypt(&mut encrypt, buf);
         }
-        wire::crypt(&mut encrypt, &mut buf[..n]);
-        let record;
         let bytes = if framed {
-            record = wire::record(0x17, &buf[..n])?;
-            record.as_slice()
+            let len_bytes = (n as u16).to_be_bytes();
+            frame_buf[3] = len_bytes[0];
+            frame_buf[4] = len_bytes[1];
+            &frame_buf[..5 + n]
         } else {
-            &buf[..n]
+            &frame_buf[5..5 + n]
         };
         match timeout(write_timeout, w.write_all(bytes)).await {
             Ok(Ok(())) => {}
@@ -2562,25 +2569,14 @@ async fn write_server_flight(
             return Ok::<_, std::io::Error>(());
         }
         use rand::Rng;
-        let mut off = 0;
-        let mut first = true;
-        while off < flight.len() {
-            let rem = flight.len() - off;
-            let chunk = if rem <= 240 {
-                rem
-            } else if first {
-                first = false;
-                rand::rngs::OsRng.gen_range(95..=165).min(rem)
-            } else {
-                rand::rngs::OsRng.gen_range(260..=880).min(rem)
-            };
-            client.write_all(&flight[off..off + chunk]).await?;
+        let first_chunk = rand::rngs::OsRng.gen_range(95..=165).min(flight.len());
+        client.write_all(&flight[..first_chunk]).await?;
+        client.flush().await?;
+        if first_chunk < flight.len() {
+            let delay_us = rand::rngs::OsRng.gen_range(300..=1000);
+            tokio::time::sleep(Duration::from_micros(delay_us)).await;
+            client.write_all(&flight[first_chunk..]).await?;
             client.flush().await?;
-            off += chunk;
-            if off < flight.len() {
-                let delay_us = rand::rngs::OsRng.gen_range(300..=2200);
-                tokio::time::sleep(Duration::from_micros(delay_us)).await;
-            }
         }
         Ok(())
     })
@@ -2838,6 +2834,22 @@ async fn probe_telegram_e2e(
     .context("probe_telegram_timeout")?
 }
 
+fn lookup_dc_addr(dcs: &HashMap<i16, SocketAddr>, dc_id: i16) -> Option<SocketAddr> {
+    if let Some(&addr) = dcs.get(&dc_id) {
+        return Some(addr);
+    }
+    let base = *dcs.get(&dc_id.abs())?;
+    // When using the default production signaling DCs, route negative media DC requests (-2, -4)
+    // to Telegram's dedicated media DC endpoints unless overridden in config.
+    if dc_id == -2 && base == SocketAddr::from(([149, 154, 167, 51], 443)) {
+        return Some(SocketAddr::from(([149, 154, 167, 151], 443)));
+    }
+    if dc_id == -4 && base == SocketAddr::from(([149, 154, 167, 91], 443)) {
+        return Some(SocketAddr::from(([149, 154, 166, 120], 443)));
+    }
+    Some(base)
+}
+
 async fn connect_upstream(
     state: &State,
     dc_id: i16,
@@ -2845,7 +2857,7 @@ async fn connect_upstream(
 ) -> Result<(TcpStream, &'static str)> {
     use std::sync::atomic::Ordering::Relaxed;
     if state.egress_upstreams.is_empty() {
-        let address = state.dcs.get(&dc_id.abs()).context("DC not configured")?;
+        let address = lookup_dc_addr(&state.dcs, dc_id).context("DC not configured")?;
         let mut upstream = timeout(state.handshake, TcpStream::connect(address))
             .await
             .context("dc_connect_timeout")?
@@ -3085,8 +3097,22 @@ async fn egress_connection(
     ensure!(hdr[..4] == EGRESS_MAGIC, "invalid egress magic");
     let token: [u8; 16] = hdr[8..24].try_into()?;
     ensure!(ct_eq_16(&token, expected_token), "egress token mismatch");
-    let dc_id = i16::from_le_bytes([hdr[4], hdr[5]]).abs();
-    let Some(addr) = dcs.get(&dc_id) else {
+    let raw_dc_id = i16::from_le_bytes([hdr[4], hdr[5]]);
+    if raw_dc_id == 0 {
+        let mut tail = [0u8; 64];
+        timeout(handshake, edge.read_exact(&mut tail))
+            .await
+            .context("egress_ping_tail_timeout")?
+            .context("egress_ping_tail_eof")?;
+        counters
+            .downstream_rx_bytes
+            .fetch_add(tail.len() as u64, Relaxed);
+        timeout(handshake, edge.write_all(&[EGRESS_ACK_OK])).await??;
+        counters.downstream_tx_bytes.fetch_add(1, Relaxed);
+        let _ = edge.shutdown().await;
+        return Ok(());
+    }
+    let Some(addr) = lookup_dc_addr(dcs, raw_dc_id) else {
         if edge.write_all(&[EGRESS_ACK_ERR]).await.is_ok() {
             counters.downstream_tx_bytes.fetch_add(1, Relaxed);
         }
