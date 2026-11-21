@@ -452,11 +452,15 @@ pub(crate) async fn egress_connection(
     let dc_fd = stream_raw_fd(&dc);
     let (er, ew) = edge.split();
     let (dr, dw) = dc.split();
+    let session_start = Instant::now();
+    let last_activity_ms = std::sync::atomic::AtomicU64::new(0);
     tokio::try_join!(
         counted_copy(
             er,
             dw,
             idle,
+            session_start,
+            &last_activity_ms,
             &counters.downstream_rx_bytes,
             &counters.upstream_tx_bytes,
             dc_fd,
@@ -466,6 +470,8 @@ pub(crate) async fn egress_connection(
             dr,
             ew,
             idle,
+            session_start,
+            &last_activity_ms,
             &counters.upstream_rx_bytes,
             &counters.downstream_tx_bytes,
             edge_fd,

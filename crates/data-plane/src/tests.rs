@@ -4124,3 +4124,104 @@ fn alert_webhook_bounded_queue_drops_on_overflow_and_tracks_metric() -> Result<(
     let _ = gate_tx.send(());
     Ok(())
 }
+
+#[tokio::test]
+async fn inv10_f32_egress_long_download_exceeding_idle_survives_while_true_idle_closes(
+) -> Result<()> {
+    let token = [0x77u8; 16];
+    let idle = Duration::from_millis(300);
+
+    // 1. Mock DC that streams 10 chunks every 80ms (~800ms > 2.5x idle) while client upload is completely silent.
+    let dc_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let dc_addr = dc_listener.local_addr()?;
+    let dc_task = tokio::spawn(async move {
+        let Ok((mut s, _)) = dc_listener.accept().await else {
+            return;
+        };
+        let mut hdr = [0u8; 64];
+        if s.read_exact(&mut hdr).await.is_err() {
+            return;
+        }
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            if s.write_all(b"0123456789abcdef").await.is_err() {
+                return;
+            }
+        }
+        let _ = s.shutdown().await;
+    });
+
+    // 2. Second mock DC that stays completely silent (tests true idle timeout).
+    let silent_dc_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let silent_dc_addr = silent_dc_listener.local_addr()?;
+    let silent_dc_task = tokio::spawn(async move {
+        let Ok((mut s, _)) = silent_dc_listener.accept().await else {
+            return;
+        };
+        let mut hdr = [0u8; 64];
+        let _ = s.read_exact(&mut hdr).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+
+    let egress_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let egress_addr = egress_listener.local_addr()?;
+    let mut dcs = HashMap::new();
+    dcs.insert(2, dc_addr);
+    dcs.insert(4, silent_dc_addr);
+    let counters = Arc::new(telemetry::Counters::default());
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let srv = tokio::spawn(serve_egress_with_security(
+        egress_listener,
+        Arc::new(dcs),
+        token,
+        16,
+        Duration::from_secs(2),
+        idle,
+        Duration::from_secs(1),
+        counters,
+        EgressSecurityConfig::default_for(16),
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+
+    // Case A: Long unidirectional download (> 2.5 * idle) must NOT abort!
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let preface = wire::build_egress_preface_v3(&token, 2, now, &[0x01; 16], &[0xaa; 64])?;
+    let mut s = TcpStream::connect(egress_addr).await?;
+    s.write_all(&preface).await?;
+    let mut ack = [0u8; 1];
+    s.read_exact(&mut ack).await?;
+    assert_eq!(ack[0], EGRESS_ACK_OK);
+    let mut downloaded = Vec::new();
+    timeout(Duration::from_secs(3), s.read_to_end(&mut downloaded)).await??;
+    assert_eq!(
+        downloaded.len(),
+        160,
+        "long unidirectional download through egress exceeding idle_timeout must complete"
+    );
+
+    // Case B: True idle (no progress in either direction) closes right around idle (300ms).
+    let preface_silent = wire::build_egress_preface_v3(&token, 4, now, &[0x02; 16], &[0xbb; 64])?;
+    let mut s2 = TcpStream::connect(egress_addr).await?;
+    s2.write_all(&preface_silent).await?;
+    s2.read_exact(&mut ack).await?;
+    assert_eq!(ack[0], EGRESS_ACK_OK);
+    let t0 = Instant::now();
+    let mut buf = [0u8; 16];
+    let n = timeout(Duration::from_secs(2), s2.read(&mut buf))
+        .await?
+        .unwrap_or(0);
+    let elapsed = t0.elapsed();
+    assert_eq!(n, 0, "true idle egress session must close");
+    assert!(
+        elapsed >= Duration::from_millis(240) && elapsed <= Duration::from_millis(1200),
+        "true idle session should close near idle=300ms (got {elapsed:?})"
+    );
+
+    let _ = stop_tx.send(());
+    let _ = timeout(Duration::from_secs(2), srv).await;
+    dc_task.abort();
+    silent_dc_task.abort();
+    Ok(())
+}

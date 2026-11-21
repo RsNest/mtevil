@@ -861,10 +861,13 @@ pub(crate) async fn plain_copy<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         timeout(idle, w.write_all(&buf[..n])).await??;
     }
 }
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn counted_copy<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut r: R,
     mut w: W,
     idle: Duration,
+    session_start: Instant,
+    last_activity_ms: &std::sync::atomic::AtomicU64,
     rx_counter: &std::sync::atomic::AtomicU64,
     tx_counter: &std::sync::atomic::AtomicU64,
     write_fd: Option<i32>,
@@ -875,8 +878,29 @@ pub(crate) async fn counted_copy<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let mut buf = [0; wire::MAX_RECORD];
     let mut prev_retrans = 0u32;
     let mut last_retrans_sample = Instant::now();
+    let idle_ms = idle.as_millis().min(u128::from(u64::MAX)) as u64;
     loop {
-        let n = timeout(idle, r.read(&mut buf)).await??;
+        let n = loop {
+            let now_ms = session_start
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            let last_ms = last_activity_ms.load(Relaxed);
+            let since_ms = now_ms.saturating_sub(last_ms);
+            if since_ms >= idle_ms {
+                bail!("egress_relay_idle_timeout");
+            }
+            let wait = Duration::from_millis(idle_ms.saturating_sub(since_ms).max(1));
+            match timeout(wait, r.read(&mut buf)).await {
+                Ok(res) => break res?,
+                Err(_) => continue,
+            }
+        };
+        let now_ms = session_start
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        last_activity_ms.store(now_ms, Relaxed);
         if n == 0 {
             let res = timeout(idle, w.shutdown()).await;
             sample_fd_retrans(write_fd, &mut prev_retrans, retrans_counter);
@@ -893,6 +917,11 @@ pub(crate) async fn counted_copy<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             last_retrans_sample = Instant::now();
         }
         res??;
+        let done_ms = session_start
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        last_activity_ms.store(done_ms, Relaxed);
         tx_counter.fetch_add(n as u64, Relaxed);
     }
 }
