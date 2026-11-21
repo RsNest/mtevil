@@ -40,7 +40,7 @@ Phase 0 (F1–F10 в phase-0.md §9) — подмножество; столбе�
 | F-26 | Config retire error | control | лог/ретрай, commit не блокируется; reconcile против сирот | config_retire_errors, config_orphans | INV-06 | тест-фолт |
 | F-27 | Control API flood + blocking-шторм | control vs data | p99 data plane в пределах +10% или ADR-002 триггер | api_flood_p99_delta | INV-07, §3 | нагрузка |
 | F-28 | Cover backend replacement | PreAuth | новые relay-соединения на новый бэкенд; старые доживают | cover_backend_swaps | §8 | нагрузка |
-| F-29 | Upgrade процесса под нагрузкой | обе | zero accept-pause (REUSEPORT/SCM_RIGHTS); drain по deadline; forced close **с подсчётом** | accept_pause_ms, drained_sessions, forced_close_ratio | §9, INV-10 | F7 |
+| F-29 | Upgrade процесса под нагрузкой | обе | zero accept-pause (REUSEPORT/SCM_RIGHTS); drain по deadline; forced close **с подсчётом** (`mtevil_forced_close_total`) | accept_pause_ms, drained_sessions, forced_close | §9, INV-10 | F7 |
 | F-30 | Watchdog kill (OOM/kill -9) | обе | supervisor restart; сессии теряются честно | process_restarts | INV-10 | chaos |
 | F-31 | Guard: подозрительный источник (suspect) / защита `egress` (`MTV3`) | PreAuth | shadow-ban → cover; на `egress`: `MTV3` HMAC-SHA256 + `±30 с` окно + replay-кэш `nonce`, `egress_allow_from` CIDR, лимит неудачных попыток на IP (`egress_max_failed_per_ip`) и отдельный лимит незавершённых handshake | suspects_shadow_banned | guard | нагрузка |
 | F-32 | Half-close (client SHUT_WR) | PostCommit | дожитие в drain-семантике §5.5, без преждевременного close | close_reasons | INV-04 | N/A (probe) |

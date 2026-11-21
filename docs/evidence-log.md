@@ -1009,3 +1009,7 @@ wire-точность. Перебор высоких портов сгорает
 - В `upload()`, `download()` и `counted_copy()` опрос `sample_fd_retrans` (`getsockopt(TCP_INFO)` на Linux) переведён с вызова на каждый чанк на таймер `1 с` на сессию + обязательный финальный вызов при закрытии/ошибке записи.
 - Локальный release-замер (`bench_t12_relay_loopback_throughput`, 64 MiB через loopback `download()` с AES-CTR + FakeTLS framing): `diagnostics=true` — `71.8 мс` (`891.8 MiB/s`), `diagnostics=false` — `71.5 мс` (`895.4 MiB/s`); на Linux дополнительно устраняются ~4096 системных вызовов `getsockopt(TCP_INFO)` на каждые 64 MiB трафика.
 - Тест `diagnostics_flag_gates_timeline_marks_and_preserves_close_attribution` зелёный (81/81 тестов workspace).
+- **T13 (`F-29`, опциональный localhost-only Prometheus `/metrics`):**
+  - В `Config` и CLI добавлен `metrics_listen: Option<SocketAddr>` (выключен по умолчанию, валидация требует loopback `127.0.0.1` / `::1`).
+  - В `Counters` добавлены `egress_failover_total`, `cover_rejected`, `replay_full`, `forced_close` и метод `render_prometheus` (Prometheus text exposition `0.0.4`, без внешних HTTP-зависимостей, работает в отдельной задаче `spawn_metrics_server`).
+  - Тест `metrics_endpoint_serves_prometheus_text_and_returns_404_on_other_paths` и валидация non-loopback адреса в `config::tests` зелёные (82/82 тестов workspace).

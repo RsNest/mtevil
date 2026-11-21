@@ -34,7 +34,7 @@ const BUILD_VERSION: &str = match option_env!("MTEVIL_BUILD_VERSION") {
 struct Args {
     #[command(subcommand)]
     command: Option<Action>,
-    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms","egress_probe_interval_secs","egress_probe_degraded_interval_secs","egress_hedge_ms","egress_accept_legacy","egress_use_mtv3","egress_allow_from","egress_max_failed_per_ip","dc_media_override","dc_probe_interval_secs","cover_dns_ttl_secs","diagnostics"])]
+    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms","egress_probe_interval_secs","egress_probe_degraded_interval_secs","egress_hedge_ms","egress_accept_legacy","egress_use_mtv3","egress_allow_from","egress_max_failed_per_ip","dc_media_override","dc_probe_interval_secs","cover_dns_ttl_secs","diagnostics","metrics_listen"])]
     config: Option<PathBuf>,
     #[arg(long)]
     check_config: bool,
@@ -128,6 +128,9 @@ struct Args {
     /// Enable per-chunk timeline diagnostic marks on relay paths.
     #[arg(long)]
     diagnostics: bool,
+    /// Optional localhost-only Prometheus `/metrics` HTTP listener (disabled by default).
+    #[arg(long)]
+    metrics_listen: Option<SocketAddr>,
 }
 
 #[derive(Subcommand)]
@@ -273,6 +276,7 @@ impl Args {
                 .cover_dns_ttl_secs
                 .unwrap_or_else(config::default_cover_dns_ttl_secs),
             diagnostics: self.diagnostics,
+            metrics_listen: self.metrics_listen,
         };
         config.validate()?;
         Ok(config)
@@ -370,6 +374,26 @@ impl EgressHealth {
         let total = h.node_failed.len();
         let healthy = h.node_failed.iter().filter(|failed| !**failed).count();
         (healthy, total)
+    }
+
+    fn snapshot_breaker_states(
+        health: &std::sync::Mutex<EgressHealth>,
+        upstreams: &[SocketAddr],
+    ) -> Vec<(String, u8)> {
+        let now = Instant::now();
+        let h = health.lock().unwrap_or_else(|e| e.into_inner());
+        upstreams
+            .iter()
+            .enumerate()
+            .map(|(idx, addr)| {
+                let code = match h.nodes.get(idx) {
+                    Some(slot) if slot.probing => 2,
+                    Some(slot) if slot.until.is_some_and(|u| now < u) => 1,
+                    _ => 0,
+                };
+                (addr.to_string(), code)
+            })
+            .collect()
     }
 
     fn apply_background_probe(
@@ -1104,6 +1128,75 @@ fn detect_rlimit_nofile() -> Option<usize> {
     parse_proc_self_limits_nofile(&text)
 }
 
+fn detect_fd_used() -> Option<usize> {
+    std::fs::read_dir("/proc/self/fd").ok().map(|rd| rd.count())
+}
+
+fn spawn_metrics_server(
+    listener: TcpListener,
+    counters: Arc<telemetry::Counters>,
+    breaker_source: Option<Arc<State>>,
+    fd_limit: Option<usize>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let accepted = tokio::select! {
+                res = listener.accept() => res,
+                _ = &mut stop_rx => break,
+            };
+            let Ok((mut stream, _)) = accepted else {
+                continue;
+            };
+            let counters = counters.clone();
+            let breaker_source = breaker_source.clone();
+            tokio::spawn(async move {
+                let mut req_buf = [0u8; 1024];
+                let Ok(Ok(n)) = timeout(Duration::from_secs(2), stream.read(&mut req_buf)).await
+                else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                let first_line = std::str::from_utf8(&req_buf[..n])
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .unwrap_or("");
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let path = parts.next().unwrap_or("");
+                let resp = if method == "GET"
+                    && (path == "/metrics" || path.starts_with("/metrics?"))
+                {
+                    let breaker_states = breaker_source
+                        .as_ref()
+                        .map(|st| {
+                            EgressHealth::snapshot_breaker_states(
+                                &st.egress_health,
+                                &st.egress_upstreams,
+                            )
+                        })
+                        .unwrap_or_default();
+                    let body =
+                        counters.render_prometheus(&breaker_states, detect_fd_used(), fd_limit);
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = timeout(Duration::from_secs(2), stream.write_all(resp.as_bytes())).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    })
+}
+
 fn compute_effective_max_connections(
     configured_max: usize,
     rlimit_nofile: Option<usize>,
@@ -1671,6 +1764,22 @@ async fn main() -> Result<()> {
             Duration::from_millis(500),
             stats_stop_rx,
         );
+        let (metrics_stop_tx, metrics_stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let metrics_task = match config.metrics_listen {
+            Some(addr) => {
+                let m_listener = TcpListener::bind(addr)
+                    .await
+                    .with_context(|| format!("binding metrics listener on {addr}"))?;
+                Some(spawn_metrics_server(
+                    m_listener,
+                    counters.clone(),
+                    None,
+                    rlimit_nofile,
+                    metrics_stop_rx,
+                ))
+            }
+            None => None,
+        };
         let security = EgressSecurityConfig {
             accept_legacy: config.egress_accept_legacy,
             allow_from,
@@ -1714,6 +1823,10 @@ async fn main() -> Result<()> {
         .await;
         if let Some(task) = dc_monitor {
             task.abort();
+            let _ = task.await;
+        }
+        let _ = metrics_stop_tx.send(());
+        if let Some(task) = metrics_task {
             let _ = task.await;
         }
         let _ = stats_stop_tx.send(());
@@ -1812,6 +1925,22 @@ async fn main() -> Result<()> {
         Duration::from_millis(500),
         stats_stop_rx,
     );
+    let (metrics_stop_tx, metrics_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let metrics_task = match config.metrics_listen {
+        Some(addr) => {
+            let m_listener = TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("binding metrics listener on {addr}"))?;
+            Some(spawn_metrics_server(
+                m_listener,
+                state.counters.clone(),
+                Some(state.clone()),
+                rlimit_nofile,
+                metrics_stop_rx,
+            ))
+        }
+        None => None,
+    };
     let listener = bind_listener(config.listen, config.client_mss)?;
     telemetry::event(
         "startup",
@@ -1926,6 +2055,10 @@ async fn main() -> Result<()> {
     .await;
     let _ = stats_stop_tx.send(());
     let _ = stats_task.await;
+    let _ = metrics_stop_tx.send(());
+    if let Some(task) = metrics_task {
+        let _ = task.await;
+    }
     if let Some(task) = egress_monitor {
         task.abort();
         let _ = task.await;
@@ -2171,6 +2304,13 @@ async fn serve(
     .await
     .is_err()
     {
+        let remaining = tasks.len() as u64;
+        if remaining > 0 {
+            state
+                .counters
+                .forced_close
+                .fetch_add(remaining, std::sync::atomic::Ordering::Relaxed);
+        }
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
     }
@@ -2405,13 +2545,18 @@ async fn connection_inner(client: &mut TcpStream, state: &State, session_id: u64
             // The first eight bytes do not affect the cipher. Key replays on the
             // wire key/IV so that changing those bytes does not reset the cache.
             let key = Sha256::digest(&frame[8..56]).into();
-            if state
+            let decision = state
                 .replay
                 .lock()
                 .await
-                .check_and_insert(key, Instant::now())
-                != Decision::Fresh
-            {
+                .check_and_insert(key, Instant::now());
+            if decision != Decision::Fresh {
+                if decision == Decision::Full {
+                    state
+                        .counters
+                        .replay_full
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 telemetry::event(
                     "dd_rejected",
                     session_id,
@@ -2496,11 +2641,17 @@ async fn connection_inner(client: &mut TcpStream, state: &State, session_id: u64
         );
         return bounded_cover(client, raw, state, session_id).await;
     };
-    let accepted = {
+    let decision = {
         let mut cache = state.replay.lock().await;
-        cache.check_and_insert(hello.replay_key, Instant::now()) == Decision::Fresh
+        cache.check_and_insert(hello.replay_key, Instant::now())
     };
-    if !accepted {
+    if decision != Decision::Fresh {
+        if decision == Decision::Full {
+            state
+                .counters
+                .replay_full
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         telemetry::event(
             "cover_selected",
             session_id,
@@ -3383,6 +3534,10 @@ async fn bounded_cover(
 ) -> Result<()> {
     // An HTTPS fallback must not queue while holding a slot from the shared listener.
     let Ok(_permit) = state.cover_permits.try_acquire() else {
+        state
+            .counters
+            .cover_rejected
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         telemetry::event("cover_rejected", session_id, json!({"reason":"capacity"}));
         return Ok(());
     };
@@ -3784,6 +3939,7 @@ fn default_media_override_map() -> HashMap<i16, Vec<SocketAddr>> {
         dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
         diagnostics: false,
+        metrics_listen: None,
     }
     .dc_media_overrides()
     .unwrap_or_default()
@@ -4085,6 +4241,10 @@ fn finalize_egress_success(
                 Some(addr),
             )
         } else {
+            state
+                .counters
+                .egress_failover_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (
                 EdgeRouteState::FailoverBackup(idx),
                 last_err
@@ -4614,6 +4774,12 @@ async fn serve_egress_with_security(
         .await
         .is_err()
     {
+        let remaining = tasks.len() as u64;
+        if remaining > 0 {
+            counters
+                .forced_close
+                .fetch_add(remaining, std::sync::atomic::Ordering::Relaxed);
+        }
         tasks.shutdown().await;
     }
     Ok(())

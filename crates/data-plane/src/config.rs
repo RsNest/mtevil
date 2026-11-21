@@ -214,6 +214,9 @@ pub struct Config {
     /// Enable per-chunk timeline diagnostic marks on relay paths (default false).
     #[serde(default)]
     pub diagnostics: bool,
+    /// Optional localhost-only Prometheus `/metrics` HTTP listener (disabled by default).
+    #[serde(default)]
+    pub metrics_listen: Option<SocketAddr>,
 }
 fn default_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 24443))
@@ -358,6 +361,13 @@ impl Config {
             (1..=86400).contains(&self.cover_dns_ttl_secs),
             "cover_dns_ttl_secs must be 1..=86400"
         );
+        if let Some(addr) = self.metrics_listen {
+            ensure!(
+                addr.ip().is_loopback(),
+                "metrics_listen must bind to a loopback address (127.0.0.1 or ::1)"
+            );
+            ensure!(addr.port() > 0, "metrics_listen port must not be zero");
+        }
         self.parsed_egress_allow_from()?;
         self.dc_media_overrides()?;
         mtevil_proto::ServerFlightProfile {
@@ -591,6 +601,7 @@ mod tests {
         assert_eq!(c.dc_probe_interval_secs, 60);
         assert_eq!(c.cover_dns_ttl_secs, 60);
         assert!(!c.diagnostics);
+        assert!(c.metrics_listen.is_none());
         assert!(serde_json::from_str::<Config>(r#"{"secret_file":"secret","sni":"example.com","cover":"example.com:443","dc":[],"max_conections":100}"#).is_err());
         Ok(())
     }
@@ -685,6 +696,11 @@ mod tests {
         assert!(c.validate().is_err());
         let mut c = config()?;
         c.cover_dns_ttl_secs = 0;
+        assert!(c.validate().is_err());
+        let mut c = config()?;
+        c.metrics_listen = Some("127.0.0.1:9108".parse()?);
+        c.validate()?;
+        c.metrics_listen = Some("0.0.0.0:9108".parse()?);
         assert!(c.validate().is_err());
 
         let edge: Config = serde_json::from_str(

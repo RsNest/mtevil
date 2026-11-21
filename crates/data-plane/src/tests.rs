@@ -1271,6 +1271,7 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
         diagnostics: false,
+        metrics_listen: None,
     };
 
     let mut proxy_state = state(cover.addr, dc_addr);
@@ -1710,6 +1711,7 @@ async fn probe_telegram_e2e_verifies_handshake_and_res_pq_reply() -> Result<()> 
         dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
         diagnostics: false,
+        metrics_listen: None,
     };
 
     let rtt_ms = probe_telegram_e2e(&cfg, proxy_addr, 2, Duration::from_secs(3)).await?;
@@ -2118,6 +2120,7 @@ async fn allowed_sni_file_accepts_previous_and_current_sni_without_breaking_link
         dc_probe_interval_secs: config::default_dc_probe_interval_secs(),
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
         diagnostics: false,
+        metrics_listen: None,
     };
     assert_eq!(cfg.allowed_snis(), "ya.ru,example.com,vk.com");
 
@@ -3278,5 +3281,80 @@ async fn bench_t12_relay_loopback_throughput() -> Result<()> {
             mib_per_s
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn metrics_endpoint_serves_prometheus_text_and_returns_404_on_other_paths() -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let cover = cover_mock().await?;
+    let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut st).context("unique state")?;
+        sm.egress_upstreams = vec!["10.203.0.1:29443".parse()?, "10.203.0.2:29443".parse()?];
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+        // Put node 0 in open cooldown to verify breaker_state{node} = 1 vs 0.
+        let mut h = sm.egress_health.lock().unwrap_or_else(|e| e.into_inner());
+        h.nodes[0].until = Some(Instant::now() + Duration::from_secs(30));
+    }
+    st.counters.active.store(3, Relaxed);
+    st.counters.accept_errors.record("emfile");
+    st.counters.egress_failover_total.store(2, Relaxed);
+    st.counters.hedge_started.store(4, Relaxed);
+    st.counters.hedge_won_by_backup.store(1, Relaxed);
+    st.counters.cover_rejected.store(5, Relaxed);
+    st.counters.replay_full.store(6, Relaxed);
+    st.counters.replay_flush_failed.store(7, Relaxed);
+    st.counters.forced_close.store(8, Relaxed);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let srv = spawn_metrics_server(
+        listener,
+        st.counters.clone(),
+        Some(st.clone()),
+        Some(4096),
+        stop_rx,
+    );
+
+    // 1. GET /metrics returns HTTP 200 and Prometheus text metrics.
+    let mut s = TcpStream::connect(addr).await?;
+    s.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    let mut resp = String::new();
+    timeout(Duration::from_secs(2), s.read_to_string(&mut resp)).await??;
+    assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+    for needle in [
+        "mtevil_active_sessions 3",
+        "mtevil_accept_errors_total{kind=\"emfile\"} 1",
+        "mtevil_breaker_state{node=\"10.203.0.1:29443\"} 1",
+        "mtevil_breaker_state{node=\"10.203.0.2:29443\"} 0",
+        "mtevil_egress_failover_total 2",
+        "mtevil_hedge_started_total 4",
+        "mtevil_hedge_won_by_backup_total 1",
+        "mtevil_cover_rejected_total 5",
+        "mtevil_replay_full_total 6",
+        "mtevil_replay_flush_failed_total 7",
+        "mtevil_forced_close_total 8",
+        "mtevil_fd_limit 4096",
+        "mtevil_fd_used ",
+    ] {
+        assert!(
+            resp.contains(needle),
+            "missing metric line: {needle}\n{resp}"
+        );
+    }
+
+    // 2. Non-/metrics path returns HTTP 404.
+    let mut s404 = TcpStream::connect(addr).await?;
+    s404.write_all(b"GET /secret HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    let mut resp404 = String::new();
+    timeout(Duration::from_secs(2), s404.read_to_string(&mut resp404)).await??;
+    assert!(resp404.starts_with("HTTP/1.1 404 Not Found\r\n"));
+
+    let _ = stop_tx.send(());
+    timeout(Duration::from_secs(2), srv).await??;
     Ok(())
 }

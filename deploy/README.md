@@ -69,6 +69,7 @@ docker compose -f deploy/compose.yaml down
 SIGTERM прекращает приём, затем даёт сессиям drain_timeout_secs (5 с по умолчанию).
 Ошибки `accept()` классифицируются: транзиентные (`ECONNABORTED`/`ECONNRESET`/`EINTR`/`EAGAIN`) игнорируются сразу, ресурсные (`EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM`) обрабатываются с экспоненциальным backoff `10 мс .. 1 с` и rate-limited событием `accept_error` (1/с на вид) без завершения процесса и без разрыва активных сессий.
 Счётчик TCP-ретрансмиссий (`TCP_INFO`) в `upload()`/`download()`/`counted_copy()` опрашивается не на каждый пакет, а раз в `1 с` на сессию и при её закрытии; детальная покадровая трассировка `timeline.mark` выключена по умолчанию и включается флагом `diagnostics: true` (`--diagnostics`).
+Опциональный Prometheus-эндпоинт `/metrics` включается через `metrics_listen` (`--metrics-listen`, строго loopback `127.0.0.1` / `::1`, выключен по умолчанию) и отдаёт в отдельной задаче tokio метрики `mtevil_active_sessions`, `mtevil_accept_errors_total{kind}`, `mtevil_breaker_state{node}`, `mtevil_egress_failover_total`, `mtevil_hedge_*`, `mtevil_cover_rejected_total`, `mtevil_replay_full_total`, `mtevil_replay_flush_failed_total`, `mtevil_forced_close_total`, `mtevil_fd_used`, `mtevil_fd_limit`.
 Оставшиеся сессии закрываются; клиентам потребуется reconnect. Секрет остаётся
 в томе. `down -v` удаляет том и секрет — для обычной остановки его не используйте.
 Перед удалением тома обеспечьте защищённую резервную копию секрета.

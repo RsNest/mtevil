@@ -86,7 +86,11 @@ pub struct Counters {
     pub accept_errors: AcceptErrorCounters,
     pub hedge_started: AtomicU64,
     pub hedge_won_by_backup: AtomicU64,
+    pub egress_failover_total: AtomicU64,
+    pub cover_rejected: AtomicU64,
+    pub replay_full: AtomicU64,
     pub replay_flush_failed: AtomicU64,
+    pub forced_close: AtomicU64,
     pub dc_self_check_ok: AtomicU64,
     pub dc_self_check_failed: AtomicU64,
     pub cover_dns_fail: AtomicU64,
@@ -144,11 +148,176 @@ impl Counters {
             "accept_errors": self.accept_errors.snapshot_json(),
             "hedge_started": self.hedge_started.load(Ordering::Relaxed),
             "hedge_won_by_backup": self.hedge_won_by_backup.load(Ordering::Relaxed),
+            "egress_failover_total": self.egress_failover_total.load(Ordering::Relaxed),
+            "cover_rejected": self.cover_rejected.load(Ordering::Relaxed),
+            "replay_full": self.replay_full.load(Ordering::Relaxed),
             "replay_flush_failed": self.replay_flush_failed.load(Ordering::Relaxed),
+            "forced_close": self.forced_close.load(Ordering::Relaxed),
             "dc_self_check_ok": self.dc_self_check_ok.load(Ordering::Relaxed),
             "dc_self_check_failed": self.dc_self_check_failed.load(Ordering::Relaxed),
             "cover_dns_fail": self.cover_dns_fail.load(Ordering::Relaxed),
         })
+    }
+
+    pub fn render_prometheus(
+        &self,
+        breaker_states: &[(String, u8)],
+        fd_used: Option<usize>,
+        fd_limit: Option<usize>,
+    ) -> String {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(2048);
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_active_sessions Currently active sessions"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_active_sessions gauge");
+        let _ = writeln!(
+            out,
+            "mtevil_active_sessions {}",
+            self.active.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_accept_errors_total Listener accept errors by classification"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_accept_errors_total counter");
+        let accept_kinds = [
+            ("emfile", self.accept_errors.emfile.load(Ordering::Relaxed)),
+            ("enfile", self.accept_errors.enfile.load(Ordering::Relaxed)),
+            (
+                "enobufs",
+                self.accept_errors.enobufs.load(Ordering::Relaxed),
+            ),
+            ("enomem", self.accept_errors.enomem.load(Ordering::Relaxed)),
+            (
+                "connection_aborted",
+                self.accept_errors
+                    .connection_aborted
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "connection_reset",
+                self.accept_errors.connection_reset.load(Ordering::Relaxed),
+            ),
+            (
+                "interrupted",
+                self.accept_errors.interrupted.load(Ordering::Relaxed),
+            ),
+            (
+                "would_block",
+                self.accept_errors.would_block.load(Ordering::Relaxed),
+            ),
+            ("fatal", self.accept_errors.fatal.load(Ordering::Relaxed)),
+            ("other", self.accept_errors.other.load(Ordering::Relaxed)),
+        ];
+        for (kind, count) in accept_kinds {
+            let _ = writeln!(out, "mtevil_accept_errors_total{{kind=\"{kind}\"}} {count}");
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_breaker_state Egress circuit breaker state (0=healthy, 1=open, 2=probing)"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_breaker_state gauge");
+        for (node, state) in breaker_states {
+            let escaped = node.replace('\\', "\\\\").replace('"', "\\\"");
+            let _ = writeln!(out, "mtevil_breaker_state{{node=\"{escaped}\"}} {state}");
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_egress_failover_total Connections served by backup/failover egress"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_egress_failover_total counter");
+        let _ = writeln!(
+            out,
+            "mtevil_egress_failover_total {}",
+            self.egress_failover_total.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_hedge_started_total Hedged backup connect attempts started"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_hedge_started_total counter");
+        let _ = writeln!(
+            out,
+            "mtevil_hedge_started_total {}",
+            self.hedge_started.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_hedge_won_by_backup_total Hedged connects won by backup egress"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_hedge_won_by_backup_total counter");
+        let _ = writeln!(
+            out,
+            "mtevil_hedge_won_by_backup_total {}",
+            self.hedge_won_by_backup.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_cover_rejected_total Cover fallback attempts rejected at capacity"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_cover_rejected_total counter");
+        let _ = writeln!(
+            out,
+            "mtevil_cover_rejected_total {}",
+            self.cover_rejected.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_replay_full_total ClientHellos rejected because replay cache was full"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_replay_full_total counter");
+        let _ = writeln!(
+            out,
+            "mtevil_replay_full_total {}",
+            self.replay_full.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_replay_flush_failed_total Failed replay cache snapshot flushes"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_replay_flush_failed_total counter");
+        let _ = writeln!(
+            out,
+            "mtevil_replay_flush_failed_total {}",
+            self.replay_flush_failed.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_forced_close_total Sessions forcibly closed after drain timeout"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_forced_close_total counter");
+        let _ = writeln!(
+            out,
+            "mtevil_forced_close_total {}",
+            self.forced_close.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_fd_used Open file descriptors of the process (0 if unavailable)"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_fd_used gauge");
+        let _ = writeln!(out, "mtevil_fd_used {}", fd_used.unwrap_or(0));
+
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_fd_limit Soft RLIMIT_NOFILE of the process (0 if unavailable)"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_fd_limit gauge");
+        let _ = writeln!(out, "mtevil_fd_limit {}", fd_limit.unwrap_or(0));
+
+        out
     }
 }
 
