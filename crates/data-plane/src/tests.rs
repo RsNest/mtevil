@@ -2404,3 +2404,86 @@ async fn round_robin_circuit_breaker_skips_cooldown_node_and_preserves_rr_offset
     t2.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn all_nodes_in_cooldown_fail_open_forces_soonest_probe_with_storm_protection() -> Result<()>
+{
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    let cover = cover_mock().await?;
+    let token = [0x44u8; 16];
+
+    let n0_up = Arc::new(AtomicBool::new(false));
+    let n1_up = Arc::new(AtomicBool::new(false));
+    let h0 = Arc::new(AtomicUsize::new(0));
+    let h1 = Arc::new(AtomicUsize::new(0));
+
+    let spawn_node = |up: Arc<AtomicBool>, hits: Arc<AtomicUsize>| async move {
+        let l = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = l.local_addr()?;
+        let task = tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                hits.fetch_add(1, SeqCst);
+                if !up.load(SeqCst) {
+                    let _ = s.shutdown().await;
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let mut preface = [0u8; 88];
+                    if s.read_exact(&mut preface).await.is_ok() {
+                        let _ = s.write_all(&[EGRESS_ACK_OK]).await;
+                    }
+                });
+            }
+        });
+        Ok::<_, anyhow::Error>((addr, task))
+    };
+
+    let (addr0, t0) = spawn_node(n0_up.clone(), h0.clone()).await?;
+    let (addr1, t1) = spawn_node(n1_up.clone(), h1.clone()).await?;
+
+    let mut cfg = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut cfg).context("unique state")?;
+        sm.dcs.clear();
+        sm.egress_upstreams = vec![addr0, addr1];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_token = token;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+        // Long 15-second cooldown to prove we do NOT wait 15s when all nodes are in cooldown!
+        sm.egress_cooldown = Duration::from_secs(15);
+        sm.handshake = Duration::from_secs(2);
+    }
+
+    let hdr = [0u8; 64];
+    // 1. Both nodes fail -> both enter 15-second cooldown (node 0 fails first, so node 0 has the soonest expiry).
+    assert!(connect_upstream(&cfg, 2, &hdr).await.is_err());
+    assert_eq!((h0.load(SeqCst), h1.load(SeqCst)), (1, 1));
+
+    // 2. Verify storm protection on try_claim_forced_soonest:
+    //    First claim gets node 0 (soonest expiry); second concurrent claim gets node 1;
+    //    third concurrent claim gets None (at most 1 concurrent forced probe per node!).
+    {
+        let c1 = EgressHealth::try_claim_forced_soonest(&cfg.egress_health, 2, 2);
+        let c2 = EgressHealth::try_claim_forced_soonest(&cfg.egress_health, 2, 2);
+        let c3 = EgressHealth::try_claim_forced_soonest(&cfg.egress_health, 2, 2);
+        assert_eq!(c1.as_ref().map(|(idx, _)| *idx), Some(0));
+        assert_eq!(c2.as_ref().map(|(idx, _)| *idx), Some(1));
+        assert!(
+            c3.is_none(),
+            "at most one concurrent forced probe per node allowed"
+        );
+        // Dropping c1 and c2 without completion releases probing flags cleanly.
+    }
+
+    // 3. Immediately (0ms sleep, while 15s cooldown is active!) bring node 0 back up.
+    //    The next client connection MUST succeed immediately via forced probe on node 0!
+    n0_up.store(true, SeqCst);
+    let (_s, route) = connect_upstream(&cfg, 2, &hdr).await?;
+    assert_eq!(route, "egress");
+    assert_eq!(h0.load(SeqCst), 2);
+    assert_eq!(h1.load(SeqCst), 1);
+
+    t0.abort();
+    t1.abort();
+    Ok(())
+}

@@ -376,6 +376,71 @@ impl EgressHealth {
             completed: false,
         })
     }
+
+    fn try_claim_forced_soonest<'a>(
+        health: &'a std::sync::Mutex<EgressHealth>,
+        node_count: usize,
+        dc: i16,
+    ) -> Option<(usize, EgressAttemptClaim<'a>)> {
+        let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
+        while h.nodes.len() < node_count {
+            h.nodes.push(CooldownSlot::default());
+        }
+        let mut best: Option<(usize, Option<Instant>)> = None;
+        for idx in 0..node_count {
+            let node_slot = &h.nodes[idx];
+            if node_slot.probing {
+                continue;
+            }
+            let dc_slot = h.dc_slots.get(&(idx, dc));
+            if dc_slot.is_some_and(|s| s.probing) {
+                continue;
+            }
+            let eff_until = match (node_slot.until, dc_slot.and_then(|s| s.until)) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            let is_better = match (&best, eff_until) {
+                (None, _) => true,
+                (Some((_, Some(_))), None) => true,
+                (Some((_, Some(cur_min))), Some(cand)) => cand < *cur_min,
+                (Some((_, None)), _) => false,
+            };
+            if is_better {
+                best = Some((idx, eff_until));
+            }
+        }
+        let (idx, _) = best?;
+        let mut node_probe = false;
+        if h.nodes[idx].until.is_some() {
+            h.nodes[idx].probing = true;
+            node_probe = true;
+        }
+        let mut dc_probe = false;
+        if let Some(dc_slot) = h.dc_slots.get_mut(&(idx, dc)) {
+            if dc_slot.until.is_some() {
+                dc_slot.probing = true;
+                dc_probe = true;
+            }
+        }
+        if !node_probe && !dc_probe {
+            h.nodes[idx].probing = true;
+            node_probe = true;
+        }
+        Some((
+            idx,
+            EgressAttemptClaim {
+                health,
+                idx,
+                dc,
+                node_probe,
+                dc_probe,
+                completed: false,
+            },
+        ))
+    }
 }
 
 impl<'a> EgressAttemptClaim<'a> {
@@ -3319,7 +3384,9 @@ async fn connect_upstream(
     let dc_abs = dc_id.abs();
     let ordered = state.egress_strategy == EgressStrategy::Ordered;
     timeout(state.handshake, async {
-        let mut last_err = None;
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut attempted_any = false;
+        let mut candidates: Vec<(usize, EgressAttemptClaim<'_>)> = Vec::with_capacity(1);
         for offset in 0..count {
             let idx = (start + offset) % count;
             let Some(claim) =
@@ -3327,115 +3394,232 @@ async fn connect_upstream(
             else {
                 continue;
             };
-            let addr = state.egress_upstreams[idx];
-            enum AttemptErr {
-                Node(anyhow::Error),
-                Dc(anyhow::Error),
-            }
-            let attempt = timeout(per_try, async {
-                let mut upstream = TcpStream::connect(addr)
-                    .await
-                    .map_err(|e| AttemptErr::Node(e.into()))?;
-                configure_tcp_socket(&upstream).map_err(AttemptErr::Node)?;
-                let mut preface = [0u8; 88];
-                preface[..4].copy_from_slice(&EGRESS_MAGIC);
-                preface[4..6].copy_from_slice(&dc_id.to_le_bytes());
-                preface[8..24].copy_from_slice(&state.egress_token);
-                preface[24..88].copy_from_slice(dc_header);
-                upstream
-                    .write_all(&preface)
-                    .await
-                    .map_err(|e| AttemptErr::Node(e.into()))?;
-                state
-                    .counters
-                    .upstream_tx_bytes
-                    .fetch_add(preface.len() as u64, Relaxed);
-                let mut ack = [0u8; 1];
-                upstream
-                    .read_exact(&mut ack)
-                    .await
-                    .map_err(|e| AttemptErr::Node(e.into()))?;
-                state
-                    .counters
-                    .upstream_rx_bytes
-                    .fetch_add(ack.len() as u64, Relaxed);
-                if ack[0] == EGRESS_ACK_OK {
-                    Ok(upstream)
-                } else if ack[0] == EGRESS_ACK_ERR {
-                    Err(AttemptErr::Dc(anyhow::anyhow!(
-                        "egress DC {dc_abs} unreachable (negative ACK)"
-                    )))
-                } else {
-                    Err(AttemptErr::Node(anyhow::anyhow!(
-                        "egress upstream invalid ACK byte"
-                    )))
+            candidates.push((idx, claim));
+            while let Some((idx, claim)) = candidates.pop() {
+                attempted_any = true;
+                let addr = state.egress_upstreams[idx];
+                enum AttemptErr {
+                    Node(anyhow::Error),
+                    Dc(anyhow::Error),
                 }
-            })
-            .await;
-            match attempt {
-                Ok(Ok(upstream)) => {
-                    claim.record_success();
-                    let (healthy, total) =
-                        EgressHealth::set_node_availability(&state.egress_health, idx, true);
-                    let (next_state, reason, active_override) = if ordered {
-                        if idx == 0 {
+                let attempt = timeout(per_try, async {
+                    let mut upstream = TcpStream::connect(addr)
+                        .await
+                        .map_err(|e| AttemptErr::Node(e.into()))?;
+                    configure_tcp_socket(&upstream).map_err(AttemptErr::Node)?;
+                    let mut preface = [0u8; 88];
+                    preface[..4].copy_from_slice(&EGRESS_MAGIC);
+                    preface[4..6].copy_from_slice(&dc_id.to_le_bytes());
+                    preface[8..24].copy_from_slice(&state.egress_token);
+                    preface[24..88].copy_from_slice(dc_header);
+                    upstream
+                        .write_all(&preface)
+                        .await
+                        .map_err(|e| AttemptErr::Node(e.into()))?;
+                    state
+                        .counters
+                        .upstream_tx_bytes
+                        .fetch_add(preface.len() as u64, Relaxed);
+                    let mut ack = [0u8; 1];
+                    upstream
+                        .read_exact(&mut ack)
+                        .await
+                        .map_err(|e| AttemptErr::Node(e.into()))?;
+                    state
+                        .counters
+                        .upstream_rx_bytes
+                        .fetch_add(ack.len() as u64, Relaxed);
+                    if ack[0] == EGRESS_ACK_OK {
+                        Ok(upstream)
+                    } else if ack[0] == EGRESS_ACK_ERR {
+                        Err(AttemptErr::Dc(anyhow::anyhow!(
+                            "egress DC {dc_abs} unreachable (negative ACK)"
+                        )))
+                    } else {
+                        Err(AttemptErr::Node(anyhow::anyhow!(
+                            "egress upstream invalid ACK byte"
+                        )))
+                    }
+                })
+                .await;
+                match attempt {
+                    Ok(Ok(upstream)) => {
+                        claim.record_success();
+                        let (healthy, total) =
+                            EgressHealth::set_node_availability(&state.egress_health, idx, true);
+                        let (next_state, reason, active_override) = if ordered {
+                            if idx == 0 {
+                                (
+                                    EdgeRouteState::PrimaryOk,
+                                    "primary_recovered".to_string(),
+                                    Some(addr),
+                                )
+                            } else {
+                                (
+                                    EdgeRouteState::FailoverBackup(idx),
+                                    last_err
+                                        .as_ref()
+                                        .map(|e| format!("{e:#}"))
+                                        .unwrap_or_else(|| "primary_in_cooldown".to_string()),
+                                    Some(addr),
+                                )
+                            }
+                        } else if healthy == total {
                             (
                                 EdgeRouteState::PrimaryOk,
-                                "primary_recovered".to_string(),
+                                "all_egress_recovered".to_string(),
                                 Some(addr),
                             )
                         } else {
                             (
-                                EdgeRouteState::FailoverBackup(idx),
+                                EdgeRouteState::Degraded { healthy, total },
                                 last_err
                                     .as_ref()
                                     .map(|e| format!("{e:#}"))
-                                    .unwrap_or_else(|| "primary_in_cooldown".to_string()),
+                                    .unwrap_or_else(|| "egress_node_unavailable".to_string()),
                                 Some(addr),
                             )
+                        };
+                        if let Some(ev) = EgressHealth::transition_route_state(
+                            &state.egress_health,
+                            next_state,
+                            &state.egress_upstreams,
+                            reason,
+                            state.egress_strategy,
+                            active_override,
+                        ) {
+                            emit_edge_route_alert(state, ev);
                         }
-                    } else if healthy == total {
-                        (
-                            EdgeRouteState::PrimaryOk,
-                            "all_egress_recovered".to_string(),
-                            Some(addr),
-                        )
-                    } else {
-                        (
-                            EdgeRouteState::Degraded { healthy, total },
-                            last_err
-                                .as_ref()
-                                .map(|e| format!("{e:#}"))
-                                .unwrap_or_else(|| "egress_node_unavailable".to_string()),
-                            Some(addr),
-                        )
-                    };
-                    if let Some(ev) = EgressHealth::transition_route_state(
-                        &state.egress_health,
-                        next_state,
-                        &state.egress_upstreams,
-                        reason,
-                        state.egress_strategy,
-                        active_override,
-                    ) {
-                        emit_edge_route_alert(state, ev);
+                        return Ok((upstream, "egress"));
                     }
-                    return Ok((upstream, "egress"));
+                    Ok(Err(AttemptErr::Dc(err))) => {
+                        claim.record_dc_failure(state.egress_cooldown);
+                        EgressHealth::set_node_availability(&state.egress_health, idx, false);
+                        last_err = Some(err);
+                    }
+                    Ok(Err(AttemptErr::Node(err))) => {
+                        claim.record_node_failure(state.egress_cooldown);
+                        EgressHealth::set_node_availability(&state.egress_health, idx, false);
+                        last_err = Some(err);
+                    }
+                    Err(_) => {
+                        claim.record_node_failure(state.egress_cooldown);
+                        EgressHealth::set_node_availability(&state.egress_health, idx, false);
+                        last_err = Some(anyhow::anyhow!("egress_connect_timeout"));
+                    }
                 }
-                Ok(Err(AttemptErr::Dc(err))) => {
-                    claim.record_dc_failure(state.egress_cooldown);
-                    EgressHealth::set_node_availability(&state.egress_health, idx, false);
-                    last_err = Some(err);
+            }
+        }
+        // Fail-open when all nodes were in cooldown: force a single probe on the node
+        // whose cooldown expires soonest (at most 1 concurrent forced probe per node).
+        if !attempted_any {
+            if let Some((idx, claim)) =
+                EgressHealth::try_claim_forced_soonest(&state.egress_health, count, dc_abs)
+            {
+                let addr = state.egress_upstreams[idx];
+                enum AttemptErr {
+                    Node(anyhow::Error),
+                    Dc(anyhow::Error),
                 }
-                Ok(Err(AttemptErr::Node(err))) => {
-                    claim.record_node_failure(state.egress_cooldown);
-                    EgressHealth::set_node_availability(&state.egress_health, idx, false);
-                    last_err = Some(err);
-                }
-                Err(_) => {
-                    claim.record_node_failure(state.egress_cooldown);
-                    EgressHealth::set_node_availability(&state.egress_health, idx, false);
-                    last_err = Some(anyhow::anyhow!("egress_connect_timeout"));
+                let attempt = timeout(per_try, async {
+                    let mut upstream = TcpStream::connect(addr)
+                        .await
+                        .map_err(|e| AttemptErr::Node(e.into()))?;
+                    configure_tcp_socket(&upstream).map_err(AttemptErr::Node)?;
+                    let mut preface = [0u8; 88];
+                    preface[..4].copy_from_slice(&EGRESS_MAGIC);
+                    preface[4..6].copy_from_slice(&dc_id.to_le_bytes());
+                    preface[8..24].copy_from_slice(&state.egress_token);
+                    preface[24..88].copy_from_slice(dc_header);
+                    upstream
+                        .write_all(&preface)
+                        .await
+                        .map_err(|e| AttemptErr::Node(e.into()))?;
+                    state
+                        .counters
+                        .upstream_tx_bytes
+                        .fetch_add(preface.len() as u64, Relaxed);
+                    let mut ack = [0u8; 1];
+                    upstream
+                        .read_exact(&mut ack)
+                        .await
+                        .map_err(|e| AttemptErr::Node(e.into()))?;
+                    state
+                        .counters
+                        .upstream_rx_bytes
+                        .fetch_add(ack.len() as u64, Relaxed);
+                    if ack[0] == EGRESS_ACK_OK {
+                        Ok(upstream)
+                    } else if ack[0] == EGRESS_ACK_ERR {
+                        Err(AttemptErr::Dc(anyhow::anyhow!(
+                            "egress DC {dc_abs} unreachable (negative ACK)"
+                        )))
+                    } else {
+                        Err(AttemptErr::Node(anyhow::anyhow!(
+                            "egress upstream invalid ACK byte"
+                        )))
+                    }
+                })
+                .await;
+                match attempt {
+                    Ok(Ok(upstream)) => {
+                        claim.record_success();
+                        let (healthy, total) =
+                            EgressHealth::set_node_availability(&state.egress_health, idx, true);
+                        let (next_state, reason, active_override) = if ordered {
+                            if idx == 0 {
+                                (
+                                    EdgeRouteState::PrimaryOk,
+                                    "primary_recovered".to_string(),
+                                    Some(addr),
+                                )
+                            } else {
+                                (
+                                    EdgeRouteState::FailoverBackup(idx),
+                                    "forced_probe_recovered".to_string(),
+                                    Some(addr),
+                                )
+                            }
+                        } else if healthy == total {
+                            (
+                                EdgeRouteState::PrimaryOk,
+                                "all_egress_recovered".to_string(),
+                                Some(addr),
+                            )
+                        } else {
+                            (
+                                EdgeRouteState::Degraded { healthy, total },
+                                "forced_probe_recovered".to_string(),
+                                Some(addr),
+                            )
+                        };
+                        if let Some(ev) = EgressHealth::transition_route_state(
+                            &state.egress_health,
+                            next_state,
+                            &state.egress_upstreams,
+                            reason,
+                            state.egress_strategy,
+                            active_override,
+                        ) {
+                            emit_edge_route_alert(state, ev);
+                        }
+                        return Ok((upstream, "egress"));
+                    }
+                    Ok(Err(AttemptErr::Dc(err))) => {
+                        claim.record_dc_failure(state.egress_cooldown);
+                        EgressHealth::set_node_availability(&state.egress_health, idx, false);
+                        last_err = Some(err);
+                    }
+                    Ok(Err(AttemptErr::Node(err))) => {
+                        claim.record_node_failure(state.egress_cooldown);
+                        EgressHealth::set_node_availability(&state.egress_health, idx, false);
+                        last_err = Some(err);
+                    }
+                    Err(_) => {
+                        claim.record_node_failure(state.egress_cooldown);
+                        EgressHealth::set_node_availability(&state.egress_health, idx, false);
+                        last_err = Some(anyhow::anyhow!("egress_connect_timeout"));
+                    }
                 }
             }
         }
