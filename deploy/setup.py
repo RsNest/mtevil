@@ -718,7 +718,8 @@ services:
 {net_block}
     volumes:
       - ./{config_name}:/etc/mtevil/config.json:ro
-      - state:/var/lib/mtevil{extra_vol_lines}
+      - state:/var/lib/mtevil:ro
+      - replay:/var/lib/mtevil-replay{extra_vol_lines}
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -743,8 +744,20 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  init:
+    <<: *image
+    profiles: [tools]
+    volumes:
+      - state:/var/lib/mtevil
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    pids_limit: 32
+
 volumes:
   state:
+  replay:
 """
 
 
@@ -758,6 +771,13 @@ def deployment_service(deploy_dir: Path) -> str:
 
 def compose_service(base: list[str]) -> str:
     return deployment_service(Path(base[-1]).parent)
+
+
+def compose_write_service(base: list[str]) -> str:
+    compose = Path(base[-1])
+    if compose.is_file() and "\n  init:\n" in compose.read_text(encoding="utf-8"):
+        return "init"
+    return compose_service(base)
 
 
 def compose_cmd(deploy_dir: Path, project: str, compose_name: str = "compose.yaml", env_name: str = ".env") -> list[str]:
@@ -803,7 +823,7 @@ def ensure_generated_secret(base: list[str], path_in_container: str) -> bool:
             "--no-deps",
             "--entrypoint",
             "/usr/local/bin/mtevil",
-            compose_service(base),
+            compose_write_service(base),
             "secret",
             "--output",
             path_in_container,
@@ -823,7 +843,7 @@ def write_volume_secret_stdin(base: list[str], path_in_container: str, hex_secre
             "--no-deps",
             "--entrypoint",
             "/bin/sh",
-            compose_service(base),
+            compose_write_service(base),
             "-c",
             f"umask 077 && cat > {path_in_container}",
         ],
@@ -1982,17 +2002,19 @@ def run_status_command(deploy_dir: Path) -> int:
 
 
 def read_container_runtime_stats(base: list[str], svc: str) -> dict[str, object] | None:
-    proc = run(
-        base + ["exec", "-T", svc, "/bin/cat", "/var/lib/mtevil/runtime-stats.json"],
-        check=False,
-    )
-    if proc.returncode != 0 or not proc.stdout.strip():
-        return None
-    try:
-        data = json.loads(proc.stdout)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
+    for path in ("/var/lib/mtevil-replay/runtime-stats.json", "/var/lib/mtevil/runtime-stats.json"):
+        proc = run(
+            base + ["exec", "-T", svc, "/bin/cat", path],
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            try:
+                data = json.loads(proc.stdout)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+    return None
 
 
 def direction_labels_for_role(role: str) -> tuple[str, str, str, str, str, str]:
@@ -2267,6 +2289,7 @@ def run_link_command(
 
     cid = run(base + ["ps", "-q", svc], check=False).stdout.strip()
     cmd_prefix = base + (["exec", "-T", svc] if cid else ["run", "--rm", "-T", "--no-deps", svc])
+    write_prefix = base + ["run", "--rm", "-T", "--no-deps", compose_write_service(base)]
     link_args = [
         "mtevil",
         "link",
@@ -2424,6 +2447,7 @@ def run_user_command(deploy_dir: Path, action: str, name: str | None = None, sni
     svc = compose_service(base)
     cid = run(base + ["ps", "-q", svc], check=False).stdout.strip()
     cmd_prefix = base + (["exec", "-T", svc] if cid else ["run", "--rm", "-T", "--no-deps", svc])
+    write_prefix = base + ["run", "--rm", "-T", "--no-deps", compose_write_service(base)]
 
     act = (action or "list").strip().lower()
     if act in ("list", "ls"):
@@ -2445,7 +2469,7 @@ def run_user_command(deploy_dir: Path, action: str, name: str | None = None, sni
         if not name:
             print(err_text("Укажите имя пользователя: mtevilctl user add <имя>"), file=sys.stderr)
             return 1
-        proc = run(cmd_prefix + ["mtevil", "user-add", "--users-file", users_file, "--name", name], check=False)
+        proc = run(write_prefix + ["mtevil", "user-add", "--users-file", users_file, "--name", name], check=False)
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()
             print(err_text(f"Не удалось добавить пользователя '{name}': {detail}"), file=sys.stderr)
@@ -2457,7 +2481,7 @@ def run_user_command(deploy_dir: Path, action: str, name: str | None = None, sni
         if not name:
             print(err_text("Укажите имя пользователя: mtevilctl user del <имя>"), file=sys.stderr)
             return 1
-        proc = run(cmd_prefix + ["mtevil", "user-del", "--users-file", users_file, "--name", name], check=False)
+        proc = run(write_prefix + ["mtevil", "user-del", "--users-file", users_file, "--name", name], check=False)
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()
             print(err_text(f"Не удалось удалить пользователя '{name}': {detail}"), file=sys.stderr)
@@ -2674,7 +2698,7 @@ def main(argv: list[str] | None = None) -> int:
                 "listen": "0.0.0.0:24443",
                 "secret_file": "/var/lib/mtevil/proxy-secret",
                 "users_file": "/var/lib/mtevil/users.json",
-                "replay_file": "/var/lib/mtevil/replay.bin",
+                "replay_file": "/var/lib/mtevil-replay/replay.bin",
                 "sni": sni,
                 "cover": cover,
                 "dc": DEFAULT_DCS,
@@ -2728,7 +2752,7 @@ def main(argv: list[str] | None = None) -> int:
                 "listen": "0.0.0.0:24443",
                 "secret_file": "/var/lib/mtevil/proxy-secret",
                 "users_file": "/var/lib/mtevil/users.json",
-                "replay_file": "/var/lib/mtevil/replay.bin",
+                "replay_file": "/var/lib/mtevil-replay/replay.bin",
                 "sni": sni,
                 "cover": cover,
                 "dc": DEFAULT_DCS,
@@ -2815,7 +2839,7 @@ def main(argv: list[str] | None = None) -> int:
                 "listen": "0.0.0.0:24443",
                 "secret_file": "/var/lib/mtevil/proxy-secret",
                 "users_file": "/var/lib/mtevil/users.json",
-                "replay_file": "/var/lib/mtevil/replay.bin",
+                "replay_file": "/var/lib/mtevil-replay/replay.bin",
                 "sni": sni,
                 "cover": cover,
                 "egress_upstreams": upstreams,
@@ -3044,7 +3068,7 @@ def main(argv: list[str] | None = None) -> int:
                         "--no-deps",
                         "--entrypoint",
                         "/bin/rm",
-                        compose_service(cand_base),
+                        compose_write_service(cand_base),
                         "-f",
                         "/var/lib/mtevil/egress-token.candidate",
                     ],

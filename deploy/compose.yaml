@@ -15,7 +15,8 @@ services:
       - "${MTEVIL_BIND:-127.0.0.1}:${MTEVIL_PORT:-24443}:24443/tcp"
     volumes:
       - ./config.json:/etc/mtevil/config.json:ro
-      - state:/var/lib/mtevil
+      - state:/var/lib/mtevil:ro
+      - replay:/var/lib/mtevil-replay
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -54,3 +55,4 @@ services:
 
 volumes:
   state:
+  replay:

@@ -3358,3 +3358,33 @@ async fn metrics_endpoint_serves_prometheus_text_and_returns_404_on_other_paths(
     timeout(Duration::from_secs(2), srv).await??;
     Ok(())
 }
+
+#[tokio::test]
+async fn inv02_replay_flush_failure_increments_metric() -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    // Point replay_file to an impossible path (existing regular file as parent dir) so flush fails.
+    let dir = std::env::temp_dir().join(format!(
+        "mtevil-replay-fail-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    ));
+    std::fs::create_dir_all(&dir)?;
+    let blocker = dir.join("not-a-dir");
+    std::fs::write(&blocker, b"block")?;
+    let bad_path = blocker.join("replay.bin");
+
+    let (mut cache, _status) =
+        ReplayCache::load_with_status(bad_path, 64, Duration::from_secs(120));
+    assert_eq!(
+        cache.check_and_insert([0xabu8; 32], Instant::now()),
+        Decision::Fresh
+    );
+    let counters = telemetry::Counters::default();
+    if cache.flush_snapshot().is_err() {
+        counters.replay_flush_failed.fetch_add(1, Relaxed);
+    }
+    assert_eq!(counters.replay_flush_failed.load(Relaxed), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}

@@ -21,8 +21,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 mtevil \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin mtevil \
-    && mkdir -p /var/lib/mtevil /etc/mtevil \
-    && chown 10001:10001 /var/lib/mtevil
+    && mkdir -p /var/lib/mtevil /var/lib/mtevil-replay /etc/mtevil \
+    && chown 10001:10001 /var/lib/mtevil /var/lib/mtevil-replay \
+    && chmod 0700 /var/lib/mtevil-replay
 COPY --from=build /src/target/release/mtevil /usr/local/bin/mtevil
 USER 10001:10001
 EXPOSE 24443

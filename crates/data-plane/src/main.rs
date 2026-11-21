@@ -412,7 +412,17 @@ fn spawn_users_reloader(
     })
 }
 
-const RUNTIME_STATS_DEFAULT_PATH: &str = "/var/lib/mtevil/runtime-stats.json";
+const RUNTIME_STATS_DEFAULT_PATH: &str = "/var/lib/mtevil-replay/runtime-stats.json";
+const RUNTIME_STATS_LEGACY_PATH: &str = "/var/lib/mtevil/runtime-stats.json";
+
+fn default_runtime_stats_path() -> PathBuf {
+    let preferred = PathBuf::from(RUNTIME_STATS_DEFAULT_PATH);
+    if preferred.parent().is_some_and(|p| p.is_dir()) {
+        preferred
+    } else {
+        PathBuf::from(RUNTIME_STATS_LEGACY_PATH)
+    }
+}
 
 fn write_runtime_stats_atomic(
     path: &std::path::Path,
@@ -814,7 +824,7 @@ async fn main() -> Result<()> {
                 .or(config.egress_token_file.as_ref())
                 .and_then(|p| p.parent().map(|dir| dir.join("runtime-stats.json")))
         })
-        .unwrap_or_else(|| PathBuf::from(RUNTIME_STATS_DEFAULT_PATH));
+        .unwrap_or_else(default_runtime_stats_path);
     if config.role == Role::Egress {
         if check_config {
             println!("configuration valid");
