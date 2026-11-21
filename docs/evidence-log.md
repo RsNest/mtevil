@@ -971,3 +971,7 @@ wire-точность. Перебор высоких портов сгорает
 - **T4 (`F-24`, fail-open при «все узлы в cooldown»):**
   - Добавлен `EgressHealth::try_claim_forced_soonest`: если в основном проходе все узлы `egress` оказались в cooldown, выполняется принудительная проба узла с ближайшим сроком окончания cooldown (в пределах общего бюджета `handshake`), с защитой от шторма (не более одной принудительной пробы на узел одновременно через флаг `probing` и автоматический сброс в `Drop` у `EgressAttemptClaim`).
   - Тест `all_nodes_in_cooldown_fail_open_forces_soonest_probe_with_storm_protection` подтверждает мгновенное восстановление трафика после кратковременного падения всех узлов без ожидания 15-секундного окна cooldown и защиту от шторма при параллельных запросах.
+- **T5 (`F-23`, экспоненциальный backoff cooldown с jitter и конфигурацией):**
+  - В `Config` и CLI добавлены `egress_cooldown_base_ms` (default `3000`, `50..=300000`) и `egress_cooldown_max_ms` (default `60000`, `>= base_ms`, `<= 600000`) с полной обратной совместимостью для существующих `config.json`.
+  - В `CooldownSlot` добавлен счётчик подряд идущих сбоев `failures`: длительность cooldown растёт `×2` за каждый подряд сбой до `egress_cooldown_max_ms` с jitter `±20%` и сбрасывается в `0` при успешном соединении. Сбои узла (TCP/timeout/invalid ACK) и сбои конкретного DC (negative ACK) ведутся раздельно.
+  - Тест `egress_cooldown_exponential_backoff_jitter_reset_and_node_vs_dc_separation` зелёный.

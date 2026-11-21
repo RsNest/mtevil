@@ -89,6 +89,12 @@ pub struct Config {
     /// (primary_ok, failover_backup, all_down).
     #[serde(default)]
     pub alert_webhook_url: Option<String>,
+    /// Base cooldown in milliseconds for an egress upstream or DC after a failure.
+    #[serde(default = "default_egress_cooldown_base_ms")]
+    pub egress_cooldown_base_ms: u64,
+    /// Maximum exponential backoff cooldown in milliseconds for an egress upstream or DC.
+    #[serde(default = "default_egress_cooldown_max_ms")]
+    pub egress_cooldown_max_ms: u64,
 }
 fn default_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 24443))
@@ -113,6 +119,12 @@ fn default_fake_tls_cert_bytes() -> usize {
 }
 fn default_fake_tls_cert_jitter() -> usize {
     0
+}
+pub fn default_egress_cooldown_base_ms() -> u64 {
+    3_000
+}
+pub fn default_egress_cooldown_max_ms() -> u64 {
+    60_000
 }
 
 impl Config {
@@ -159,6 +171,15 @@ impl Config {
             (1..=300).contains(&self.drain_timeout_secs),
             "drain timeout must be 1..300 seconds"
         );
+        ensure!(
+            (50..=300_000).contains(&self.egress_cooldown_base_ms),
+            "egress_cooldown_base_ms must be 50..=300000"
+        );
+        ensure!(
+            (50..=600_000).contains(&self.egress_cooldown_max_ms)
+                && self.egress_cooldown_max_ms >= self.egress_cooldown_base_ms,
+            "egress_cooldown_max_ms must be >= egress_cooldown_base_ms and <= 600000"
+        );
         mtevil_proto::ServerFlightProfile {
             cert_bytes: self.fake_tls_cert_bytes,
             jitter: self.fake_tls_cert_jitter,
@@ -175,10 +196,7 @@ impl Config {
             );
         }
         if self.role == Role::Egress {
-            ensure!(
-                !self.dc.is_empty(),
-                "egress role requires at least one DC"
-            );
+            ensure!(!self.dc.is_empty(), "egress role requires at least one DC");
             self.datacenters()?;
             return Ok(());
         }
@@ -347,6 +365,8 @@ mod tests {
         assert!(!c.enable_dd);
         assert_eq!(c.fake_tls_cert_bytes, mtevil_proto::DEFAULT_CERT_BYTES);
         assert_eq!(c.fake_tls_cert_jitter, 0);
+        assert_eq!(c.egress_cooldown_base_ms, 3_000);
+        assert_eq!(c.egress_cooldown_max_ms, 60_000);
         assert!(serde_json::from_str::<Config>(r#"{"secret_file":"secret","sni":"example.com","cover":"example.com:443","dc":[],"max_conections":100}"#).is_err());
         Ok(())
     }
@@ -405,6 +425,13 @@ mod tests {
         assert!(c.validate().is_err());
         let mut c = config()?;
         c.client_mss_bulk = Some(1461);
+        assert!(c.validate().is_err());
+        let mut c = config()?;
+        c.egress_cooldown_base_ms = 5_000;
+        c.egress_cooldown_max_ms = 3_000;
+        assert!(c.validate().is_err());
+        let mut c = config()?;
+        c.egress_cooldown_base_ms = 10;
         assert!(c.validate().is_err());
 
         let edge: Config = serde_json::from_str(

@@ -34,7 +34,7 @@ const BUILD_VERSION: &str = match option_env!("MTEVIL_BUILD_VERSION") {
 struct Args {
     #[command(subcommand)]
     command: Option<Action>,
-    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk"])]
+    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms"])]
     config: Option<PathBuf>,
     #[arg(long)]
     check_config: bool,
@@ -89,6 +89,12 @@ struct Args {
     /// Bulk-phase TCP MSS applied to the client socket after handshake.
     #[arg(long)]
     client_mss_bulk: Option<u16>,
+    /// Base cooldown in milliseconds for an egress upstream or DC after a failure.
+    #[arg(long)]
+    egress_cooldown_base_ms: Option<u64>,
+    /// Maximum exponential backoff cooldown in milliseconds for an egress upstream or DC.
+    #[arg(long)]
+    egress_cooldown_max_ms: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -197,6 +203,12 @@ impl Args {
             client_mss: self.client_mss,
             client_mss_bulk: self.client_mss_bulk,
             alert_webhook_url: None,
+            egress_cooldown_base_ms: self
+                .egress_cooldown_base_ms
+                .unwrap_or_else(config::default_egress_cooldown_base_ms),
+            egress_cooldown_max_ms: self
+                .egress_cooldown_max_ms
+                .unwrap_or_else(config::default_egress_cooldown_max_ms),
         };
         config.validate()?;
         Ok(config)
@@ -207,6 +219,28 @@ impl Args {
 struct CooldownSlot {
     until: Option<Instant>,
     probing: bool,
+    failures: u32,
+}
+
+fn compute_egress_cooldown_unclamped_ms(base_ms: u64, max_ms: u64, failures: u32) -> u64 {
+    let shift = failures.saturating_sub(1).min(20);
+    let scaled = base_ms.saturating_mul(1u64 << shift);
+    scaled.min(max_ms.max(base_ms))
+}
+
+fn apply_cooldown_jitter_ms(clamped_ms: u64, sample_permille: i64) -> u64 {
+    let factor = (1000 + sample_permille.clamp(-200, 200)) as u128;
+    let out = (u128::from(clamped_ms) * factor) / 1000;
+    (out as u64).max(1)
+}
+
+fn compute_egress_cooldown(base: Duration, max: Duration, failures: u32) -> Duration {
+    use rand::Rng;
+    let base_ms = base.as_millis().min(u128::from(u64::MAX)) as u64;
+    let max_ms = max.as_millis().min(u128::from(u64::MAX)) as u64;
+    let clamped_ms = compute_egress_cooldown_unclamped_ms(base_ms, max_ms, failures);
+    let sample = rand::rngs::OsRng.gen_range(-200..=200);
+    Duration::from_millis(apply_cooldown_jitter_ms(clamped_ms, sample))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -450,17 +484,21 @@ impl<'a> EgressAttemptClaim<'a> {
         if let Some(slot) = h.nodes.get_mut(self.idx) {
             slot.until = None;
             slot.probing = false;
+            slot.failures = 0;
         }
         if let Some(slot) = h.dc_slots.get_mut(&(self.idx, self.dc)) {
             slot.until = None;
             slot.probing = false;
+            slot.failures = 0;
         }
     }
 
-    fn record_node_failure(mut self, cooldown: Duration) {
+    fn record_node_failure(mut self, base: Duration, max: Duration) {
         self.completed = true;
         let mut h = self.health.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = h.nodes.get_mut(self.idx) {
+            slot.failures = slot.failures.saturating_add(1);
+            let cooldown = compute_egress_cooldown(base, max, slot.failures);
             slot.until = Some(Instant::now() + cooldown);
             slot.probing = false;
         }
@@ -471,22 +509,21 @@ impl<'a> EgressAttemptClaim<'a> {
         }
     }
 
-    fn record_dc_failure(mut self, cooldown: Duration) {
+    fn record_dc_failure(mut self, base: Duration, max: Duration) {
         self.completed = true;
         let mut h = self.health.lock().unwrap_or_else(|e| e.into_inner());
         if self.node_probe {
             if let Some(slot) = h.nodes.get_mut(self.idx) {
                 slot.until = None;
                 slot.probing = false;
+                slot.failures = 0;
             }
         }
-        h.dc_slots.insert(
-            (self.idx, self.dc),
-            CooldownSlot {
-                until: Some(Instant::now() + cooldown),
-                probing: false,
-            },
-        );
+        let dc_slot = h.dc_slots.entry((self.idx, self.dc)).or_default();
+        dc_slot.failures = dc_slot.failures.saturating_add(1);
+        let cooldown = compute_egress_cooldown(base, max, dc_slot.failures);
+        dc_slot.until = Some(Instant::now() + cooldown);
+        dc_slot.probing = false;
     }
 }
 
@@ -505,6 +542,7 @@ struct State {
     egress_rr: std::sync::atomic::AtomicUsize,
     egress_health: std::sync::Mutex<EgressHealth>,
     egress_cooldown: Duration,
+    egress_cooldown_max: Duration,
     client_hello: Duration,
     handshake: Duration,
     idle: Duration,
@@ -1424,7 +1462,8 @@ async fn main() -> Result<()> {
         egress_token,
         egress_rr: std::sync::atomic::AtomicUsize::new(0),
         egress_health: std::sync::Mutex::new(EgressHealth::new(egress_count)),
-        egress_cooldown: Duration::from_secs(15),
+        egress_cooldown: Duration::from_millis(config.egress_cooldown_base_ms),
+        egress_cooldown_max: Duration::from_millis(config.egress_cooldown_max_ms),
         client_hello: Duration::from_secs(config.client_hello_timeout_secs),
         handshake: Duration::from_secs(config.handshake_timeout_secs),
         idle: Duration::from_secs(config.idle_timeout_secs),
@@ -3493,17 +3532,17 @@ async fn connect_upstream(
                         return Ok((upstream, "egress"));
                     }
                     Ok(Err(AttemptErr::Dc(err))) => {
-                        claim.record_dc_failure(state.egress_cooldown);
+                        claim.record_dc_failure(state.egress_cooldown, state.egress_cooldown_max);
                         EgressHealth::set_node_availability(&state.egress_health, idx, false);
                         last_err = Some(err);
                     }
                     Ok(Err(AttemptErr::Node(err))) => {
-                        claim.record_node_failure(state.egress_cooldown);
+                        claim.record_node_failure(state.egress_cooldown, state.egress_cooldown_max);
                         EgressHealth::set_node_availability(&state.egress_health, idx, false);
                         last_err = Some(err);
                     }
                     Err(_) => {
-                        claim.record_node_failure(state.egress_cooldown);
+                        claim.record_node_failure(state.egress_cooldown, state.egress_cooldown_max);
                         EgressHealth::set_node_availability(&state.egress_health, idx, false);
                         last_err = Some(anyhow::anyhow!("egress_connect_timeout"));
                     }
@@ -3606,17 +3645,17 @@ async fn connect_upstream(
                         return Ok((upstream, "egress"));
                     }
                     Ok(Err(AttemptErr::Dc(err))) => {
-                        claim.record_dc_failure(state.egress_cooldown);
+                        claim.record_dc_failure(state.egress_cooldown, state.egress_cooldown_max);
                         EgressHealth::set_node_availability(&state.egress_health, idx, false);
                         last_err = Some(err);
                     }
                     Ok(Err(AttemptErr::Node(err))) => {
-                        claim.record_node_failure(state.egress_cooldown);
+                        claim.record_node_failure(state.egress_cooldown, state.egress_cooldown_max);
                         EgressHealth::set_node_availability(&state.egress_health, idx, false);
                         last_err = Some(err);
                     }
                     Err(_) => {
-                        claim.record_node_failure(state.egress_cooldown);
+                        claim.record_node_failure(state.egress_cooldown, state.egress_cooldown_max);
                         EgressHealth::set_node_availability(&state.egress_health, idx, false);
                         last_err = Some(anyhow::anyhow!("egress_connect_timeout"));
                     }

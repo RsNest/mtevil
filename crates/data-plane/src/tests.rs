@@ -70,7 +70,8 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         egress_token: [0u8; 16],
         egress_rr: std::sync::atomic::AtomicUsize::new(0),
         egress_health: std::sync::Mutex::new(EgressHealth::new(0)),
-        egress_cooldown: Duration::from_secs(15),
+        egress_cooldown: Duration::from_millis(config::default_egress_cooldown_base_ms()),
+        egress_cooldown_max: Duration::from_millis(config::default_egress_cooldown_max_ms()),
         client_hello: Duration::from_millis(150),
         handshake: Duration::from_millis(150),
         idle: Duration::from_millis(300),
@@ -1246,6 +1247,8 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         client_mss: None,
         client_mss_bulk: None,
         alert_webhook_url: None,
+        egress_cooldown_base_ms: config::default_egress_cooldown_base_ms(),
+        egress_cooldown_max_ms: config::default_egress_cooldown_max_ms(),
     };
 
     let mut proxy_state = state(cover.addr, dc_addr);
@@ -1425,7 +1428,8 @@ async fn ordered_egress_cooldown_8_parallel_skip_primary_and_single_probe_recove
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_token = token;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
-        sm.egress_cooldown = Duration::from_millis(350);
+        sm.egress_cooldown = Duration::from_millis(250);
+        sm.egress_cooldown_max = Duration::from_millis(250);
         sm.handshake = Duration::from_secs(2);
     }
 
@@ -1671,6 +1675,8 @@ async fn probe_telegram_e2e_verifies_handshake_and_res_pq_reply() -> Result<()> 
         client_mss: None,
         client_mss_bulk: None,
         alert_webhook_url: None,
+        egress_cooldown_base_ms: config::default_egress_cooldown_base_ms(),
+        egress_cooldown_max_ms: config::default_egress_cooldown_max_ms(),
     };
 
     let rtt_ms = probe_telegram_e2e(&cfg, proxy_addr, 2, Duration::from_secs(3)).await?;
@@ -1829,7 +1835,8 @@ async fn edge_route_alerts_emit_once_per_state_transition() -> Result<()> {
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_token = token;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
-        sm.egress_cooldown = Duration::from_millis(200);
+        sm.egress_cooldown = Duration::from_millis(80);
+        sm.egress_cooldown_max = Duration::from_millis(160);
         sm.handshake = Duration::from_secs(2);
         sm.alerts_file = Some(alerts_path.clone());
     }
@@ -1912,7 +1919,8 @@ async fn edge_round_robin_alerts_ignore_healthy_alternation_and_track_availabili
         sm.egress_strategy = EgressStrategy::RoundRobin;
         sm.egress_token = token;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
-        sm.egress_cooldown = Duration::from_millis(100);
+        sm.egress_cooldown = Duration::from_millis(80);
+        sm.egress_cooldown_max = Duration::from_millis(80);
         sm.handshake = Duration::from_secs(2);
         sm.alerts_file = Some(alerts_path.clone());
     }
@@ -2064,6 +2072,8 @@ async fn allowed_sni_file_accepts_previous_and_current_sni_without_breaking_link
         client_mss: None,
         client_mss_bulk: None,
         alert_webhook_url: None,
+        egress_cooldown_base_ms: config::default_egress_cooldown_base_ms(),
+        egress_cooldown_max_ms: config::default_egress_cooldown_max_ms(),
     };
     assert_eq!(cfg.allowed_snis(), "ya.ru,example.com,vk.com");
 
@@ -2352,7 +2362,8 @@ async fn round_robin_circuit_breaker_skips_cooldown_node_and_preserves_rr_offset
         sm.egress_strategy = EgressStrategy::RoundRobin;
         sm.egress_token = token;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(3));
-        sm.egress_cooldown = Duration::from_millis(300);
+        sm.egress_cooldown = Duration::from_millis(250);
+        sm.egress_cooldown_max = Duration::from_millis(250);
         sm.handshake = Duration::from_secs(2);
     }
 
@@ -2485,5 +2496,96 @@ async fn all_nodes_in_cooldown_fail_open_forces_soonest_probe_with_storm_protect
 
     t0.abort();
     t1.abort();
+    Ok(())
+}
+
+#[test]
+fn egress_cooldown_exponential_backoff_jitter_reset_and_node_vs_dc_separation() -> Result<()> {
+    // 1. Exponential growth ×2 up to max
+    assert_eq!(
+        compute_egress_cooldown_unclamped_ms(3_000, 60_000, 1),
+        3_000
+    );
+    assert_eq!(
+        compute_egress_cooldown_unclamped_ms(3_000, 60_000, 2),
+        6_000
+    );
+    assert_eq!(
+        compute_egress_cooldown_unclamped_ms(3_000, 60_000, 3),
+        12_000
+    );
+    assert_eq!(
+        compute_egress_cooldown_unclamped_ms(3_000, 60_000, 4),
+        24_000
+    );
+    assert_eq!(
+        compute_egress_cooldown_unclamped_ms(3_000, 60_000, 5),
+        48_000
+    );
+    assert_eq!(
+        compute_egress_cooldown_unclamped_ms(3_000, 60_000, 6),
+        60_000
+    );
+    assert_eq!(
+        compute_egress_cooldown_unclamped_ms(3_000, 60_000, 99),
+        60_000
+    );
+
+    // 2. ±20% jitter boundaries (-200..=200 permille)
+    assert_eq!(apply_cooldown_jitter_ms(3_000, -200), 2_400);
+    assert_eq!(apply_cooldown_jitter_ms(3_000, 0), 3_000);
+    assert_eq!(apply_cooldown_jitter_ms(3_000, 200), 3_600);
+    for _ in 0..64 {
+        let d = compute_egress_cooldown(Duration::from_millis(3_000), Duration::from_secs(60), 1);
+        assert!(
+            (2_400..=3_600).contains(&(d.as_millis() as u64)),
+            "jitter out of ±20% range: {d:?}"
+        );
+    }
+
+    // 3. Separate failure counters for node failure vs DC failure, and reset on success.
+    let health = std::sync::Mutex::new(EgressHealth::new(1));
+    let base = Duration::from_millis(1_000);
+    let max = Duration::from_millis(10_000);
+
+    // First node failure -> failures = 1
+    let c1 = EgressHealth::try_claim(&health, 0, 2, Instant::now()).context("claim 1")?;
+    c1.record_node_failure(base, max);
+    assert_eq!(
+        health.lock().unwrap_or_else(|e| e.into_inner()).nodes[0].failures,
+        1
+    );
+
+    // Second forced node failure -> failures = 2
+    let (_, c2) =
+        EgressHealth::try_claim_forced_soonest(&health, 1, 2).context("forced claim 2")?;
+    c2.record_node_failure(base, max);
+    assert_eq!(
+        health.lock().unwrap_or_else(|e| e.into_inner()).nodes[0].failures,
+        2
+    );
+
+    // DC failure on DC 2 clears node probe & node failures (since node accepted TCP+token)
+    // and increments DC 2 failure counter to 1 while leaving DC 4 untouched!
+    let (_, c3) =
+        EgressHealth::try_claim_forced_soonest(&health, 1, 2).context("forced claim 3")?;
+    c3.record_dc_failure(base, max);
+    {
+        let h = health.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(h.nodes[0].failures, 0);
+        assert!(h.nodes[0].until.is_none());
+        assert_eq!(h.dc_slots.get(&(0, 2)).map(|s| s.failures), Some(1));
+        assert!(!h.dc_slots.contains_key(&(0, 4)));
+    }
+
+    // Success on DC 2 resets DC 2 failure counter to 0.
+    let (_, c4) =
+        EgressHealth::try_claim_forced_soonest(&health, 1, 2).context("forced claim 4")?;
+    c4.record_success();
+    {
+        let h = health.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(h.dc_slots.get(&(0, 2)).map(|s| s.failures), Some(0));
+        assert!(h.dc_slots.get(&(0, 2)).and_then(|s| s.until).is_none());
+    }
     Ok(())
 }
