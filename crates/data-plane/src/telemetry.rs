@@ -100,6 +100,9 @@ pub struct Counters {
     pub egress_nonce_cache_full: AtomicU64,
     pub egress_failed_tracker_evictions: AtomicU64,
     pub alert_webhook_dropped: AtomicU64,
+    pub me_active_sessions: AtomicU64,
+    pub me_fallback_direct_total: AtomicU64,
+    pub me_refresh_errors: AtomicU64,
 }
 
 impl Counters {
@@ -121,13 +124,53 @@ impl Counters {
         }
     }
 
+    #[cfg(test)]
     pub fn snapshot_json(&self, role: &str) -> Value {
+        self.snapshot_json_with_me(role, None)
+    }
+
+    pub fn snapshot_json_with_me(
+        &self,
+        role: &str,
+        me: Option<&crate::me::MeTelemetrySnapshot>,
+    ) -> Value {
         let started_unix_ms = self.ensure_started();
         let now_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(started_unix_ms);
         let retrans_supported = cfg!(target_os = "linux");
+        let me_json = match me {
+            Some(m) if m.enabled => {
+                let mode = if !m.degraded {
+                    "me"
+                } else if m.fallback_to_direct {
+                    "me_degraded_fallback_direct"
+                } else {
+                    "me_degraded_strict"
+                };
+                json!({
+                    "enabled": true,
+                    "mode": mode,
+                    "degraded": m.degraded,
+                    "fallback_to_direct": m.fallback_to_direct,
+                    "alive_connections": m.alive_connections,
+                    "total_slots": m.total_slots,
+                    "configured_dcs": m.configured_dcs,
+                    "active_sessions": self.me_active_sessions.load(Ordering::Relaxed),
+                    "fallback_direct_total": self.me_fallback_direct_total.load(Ordering::Relaxed),
+                    "config_age_secs": m.config_age_secs,
+                    "backpressure_drops": m.backpressure_drops,
+                    "dropped_close_ext": m.dropped_close_ext,
+                    "refresh_errors": self.me_refresh_errors.load(Ordering::Relaxed),
+                    "ad_tag": if m.ad_tag_configured { "configured" } else { "disabled" },
+                })
+            }
+            _ => json!({
+                "enabled": false,
+                "mode": "disabled",
+            }),
+        };
         json!({
             "role": role,
             "started_unix_ms": started_unix_ms,
@@ -170,14 +213,16 @@ impl Counters {
                 .egress_failed_tracker_evictions
                 .load(Ordering::Relaxed),
             "alert_webhook_dropped": self.alert_webhook_dropped.load(Ordering::Relaxed),
+            "me": me_json,
         })
     }
 
-    pub fn render_prometheus(
+    pub fn render_prometheus_with_me(
         &self,
         breaker_states: &[(String, u8)],
         fd_used: Option<usize>,
         fd_limit: Option<usize>,
+        me: Option<&crate::me::MeTelemetrySnapshot>,
     ) -> String {
         use std::fmt::Write;
         let mut out = String::with_capacity(2048);
@@ -399,6 +444,89 @@ impl Counters {
         );
         let _ = writeln!(out, "# TYPE mtevil_fd_limit gauge");
         let _ = writeln!(out, "mtevil_fd_limit {}", fd_limit.unwrap_or(0));
+
+        if let Some(m) = me.filter(|m| m.enabled) {
+            let _ = writeln!(
+                out,
+                "# HELP mtevil_me_active_sessions Currently active client sessions over Telegram ME"
+            );
+            let _ = writeln!(out, "# TYPE mtevil_me_active_sessions gauge");
+            let _ = writeln!(
+                out,
+                "mtevil_me_active_sessions {}",
+                self.me_active_sessions.load(Ordering::Relaxed)
+            );
+            let _ = writeln!(
+                out,
+                "# HELP mtevil_me_pool_degraded 1 if ME pool has fewer live connections than configured slots"
+            );
+            let _ = writeln!(out, "# TYPE mtevil_me_pool_degraded gauge");
+            let _ = writeln!(
+                out,
+                "mtevil_me_pool_degraded {}",
+                if m.degraded { 1 } else { 0 }
+            );
+            let _ = writeln!(
+                out,
+                "# HELP mtevil_me_pool_alive_connections Currently alive ME TCP connections"
+            );
+            let _ = writeln!(out, "# TYPE mtevil_me_pool_alive_connections gauge");
+            let _ = writeln!(
+                out,
+                "mtevil_me_pool_alive_connections {}",
+                m.alive_connections
+            );
+            let _ = writeln!(
+                out,
+                "# HELP mtevil_me_config_age_seconds Age in seconds of last loaded ME config"
+            );
+            let _ = writeln!(out, "# TYPE mtevil_me_config_age_seconds gauge");
+            let _ = writeln!(
+                out,
+                "mtevil_me_config_age_seconds {}",
+                m.config_age_secs.unwrap_or(0)
+            );
+            let _ = writeln!(
+                out,
+                "# HELP mtevil_me_fallback_direct_total Sessions that fell back from ME to Direct"
+            );
+            let _ = writeln!(out, "# TYPE mtevil_me_fallback_direct_total counter");
+            let _ = writeln!(
+                out,
+                "mtevil_me_fallback_direct_total {}",
+                self.me_fallback_direct_total.load(Ordering::Relaxed)
+            );
+            let _ = writeln!(
+                out,
+                "# HELP mtevil_me_backpressure_drops_total ME sessions dropped due to slow-client inbound queue overflow"
+            );
+            let _ = writeln!(out, "# TYPE mtevil_me_backpressure_drops_total counter");
+            let _ = writeln!(
+                out,
+                "mtevil_me_backpressure_drops_total {}",
+                m.backpressure_drops
+            );
+            let _ = writeln!(
+                out,
+                "# HELP mtevil_me_dropped_close_ext_total Dropped RPC_CLOSE_EXT notifications when ME outbound queue was full"
+            );
+            let _ = writeln!(out, "# TYPE mtevil_me_dropped_close_ext_total counter");
+            let _ = writeln!(
+                out,
+                "mtevil_me_dropped_close_ext_total {}",
+                m.dropped_close_ext
+            );
+            let _ = writeln!(
+                out,
+                "# HELP mtevil_me_refresh_errors_total Failed ME proxy-secret/proxy-multi.conf refresh attempts"
+            );
+            let _ = writeln!(out, "# TYPE mtevil_me_refresh_errors_total counter");
+            let _ = writeln!(
+                out,
+                "mtevil_me_refresh_errors_total {}",
+                self.me_refresh_errors.load(Ordering::Relaxed)
+            );
+        }
 
         out
     }

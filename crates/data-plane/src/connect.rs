@@ -343,6 +343,7 @@ pub(crate) fn default_media_override_map() -> HashMap<i16, Vec<SocketAddr>> {
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
         diagnostics: false,
         metrics_listen: None,
+        me: config::MeConfig::default(),
     }
     .dc_media_overrides()
     .unwrap_or_default()

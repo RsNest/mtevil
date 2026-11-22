@@ -7,12 +7,12 @@ use anyhow::{bail, ensure, Context, Result};
 use rand::RngCore;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 
 /// Bounded per-session inbound frame queue (INV-03 backpressure).
@@ -51,8 +51,25 @@ pub(crate) struct MeConnCounters {
     pub dropped_close_ext: AtomicU64,
 }
 
+/// Event received for a multiplexed client session from Telegram ME.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MeInboundEvent {
+    Payload(Vec<u8>),
+    QuickAck(u32),
+}
+
 struct SessionEntry {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<MeInboundEvent>,
+}
+
+struct TaskGuard {
+    active_tasks: Arc<AtomicUsize>,
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.active_tasks.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 struct ConnShared {
@@ -62,7 +79,8 @@ struct ConnShared {
     our_addr: SocketAddrV4,
     out_tx: mpsc::Sender<Vec<u8>>,
     counters: Arc<MeConnCounters>,
-    shutdown_notify: Notify,
+    shutdown_tx: watch::Sender<bool>,
+    active_tasks: Arc<AtomicUsize>,
 }
 
 /// Active multiplexed connection to a single Telegram Middle-End server.
@@ -77,7 +95,7 @@ pub struct MeSession {
     remote_addr: Option<SocketAddrV4>,
     ad_tag: Option<[u8; 16]>,
     shared: Arc<ConnShared>,
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<MeInboundEvent>,
     closed: bool,
 }
 
@@ -105,8 +123,110 @@ impl MeSession {
             .map_err(|_| anyhow::anyhow!("ME writer closed"))
     }
 
-    pub async fn recv_frame(&mut self) -> Option<Vec<u8>> {
+    pub async fn recv_event(&mut self) -> Option<MeInboundEvent> {
         self.rx.recv().await
+    }
+
+    pub async fn recv_frame(&mut self) -> Option<Vec<u8>> {
+        while let Some(ev) = self.rx.recv().await {
+            if let MeInboundEvent::Payload(payload) = ev {
+                return Some(payload);
+            }
+        }
+        None
+    }
+
+    pub fn close(mut self) {
+        self.send_close_once();
+    }
+
+    /// Split into independent receiver and sender halves for concurrent upload/download tasks.
+    pub fn into_split(mut self) -> (MeSessionReceiver, MeSessionSender) {
+        self.closed = true;
+        let (_dummy_tx, dummy_rx) = mpsc::channel(1);
+        let rx = std::mem::replace(&mut self.rx, dummy_rx);
+        let sender = MeSessionSender {
+            conn_id: self.conn_id,
+            remote_addr: self.remote_addr,
+            ad_tag: self.ad_tag,
+            shared: self.shared.clone(),
+            closed: false,
+        };
+        (MeSessionReceiver { rx }, sender)
+    }
+
+    fn send_close_once(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        {
+            let mut map = self
+                .shared
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            map.remove(&self.conn_id);
+        }
+        if self.shared.alive.load(Ordering::Relaxed) {
+            if let Err(mpsc::error::TrySendError::Full(_)) = self
+                .shared
+                .out_tx
+                .try_send(encode_close_ext(self.conn_id).to_vec())
+            {
+                self.shared
+                    .counters
+                    .dropped_close_ext
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl Drop for MeSession {
+    fn drop(&mut self) {
+        self.send_close_once();
+    }
+}
+
+/// Receive half of a split `MeSession`.
+pub struct MeSessionReceiver {
+    rx: mpsc::Receiver<MeInboundEvent>,
+}
+
+impl MeSessionReceiver {
+    pub async fn recv_event(&mut self) -> Option<MeInboundEvent> {
+        self.rx.recv().await
+    }
+}
+
+/// Send half of a split `MeSession`; emits `RPC_CLOSE_EXT` once when closed or dropped.
+pub struct MeSessionSender {
+    conn_id: u64,
+    remote_addr: Option<SocketAddrV4>,
+    ad_tag: Option<[u8; 16]>,
+    shared: Arc<ConnShared>,
+    closed: bool,
+}
+
+impl MeSessionSender {
+    pub async fn send_frame(&self, mtproto_payload: &[u8]) -> Result<()> {
+        ensure!(
+            self.shared.alive.load(Ordering::Relaxed),
+            "ME connection is closed"
+        );
+        let req = encode_proxy_req(
+            self.conn_id,
+            self.remote_addr,
+            self.shared.our_addr,
+            self.ad_tag.as_ref(),
+            mtproto_payload,
+        )?;
+        self.shared
+            .out_tx
+            .send(req)
+            .await
+            .map_err(|_| anyhow::anyhow!("ME writer closed"))
     }
 
     pub fn close(mut self) {
@@ -141,7 +261,7 @@ impl MeSession {
     }
 }
 
-impl Drop for MeSession {
+impl Drop for MeSessionSender {
     fn drop(&mut self) {
         self.send_close_once();
     }
@@ -280,6 +400,8 @@ impl MeConnection {
         let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(ME_OUTBOUND_QUEUE_CAP);
         let mut init_id = [0u8; 8];
         rand::rngs::OsRng.fill_bytes(&mut init_id);
+        let (shutdown_tx, _) = watch::channel(false);
+        let active_tasks = Arc::new(AtomicUsize::new(0));
         let shared = Arc::new(ConnShared {
             sessions: Mutex::new(HashMap::new()),
             alive: AtomicBool::new(true),
@@ -287,7 +409,8 @@ impl MeConnection {
             our_addr,
             out_tx: out_tx.clone(),
             counters,
-            shutdown_notify: Notify::new(),
+            shutdown_tx,
+            active_tasks,
         });
 
         let (mut rd, mut wr) = stream.into_split();
@@ -295,16 +418,18 @@ impl MeConnection {
 
         // Writer task: serializes seq_no = 0, 1, 2, ... and encrypts with continuous AES-256-CBC.
         let shared_w = shared.clone();
+        let mut shutdown_rx_w = shared.shutdown_tx.subscribe();
         let write_timeout = opts.write_timeout;
+        shared.active_tasks.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
+            let _guard = TaskGuard {
+                active_tasks: shared_w.active_tasks.clone(),
+            };
             let mut seq_no: i32 = 0;
             loop {
-                if !shared_w.alive.load(Ordering::Relaxed) {
-                    break;
-                }
                 let payload = tokio::select! {
                     biased;
-                    () = shared_w.shutdown_notify.notified() => break,
+                    () = wait_shutdown(&mut shutdown_rx_w) => break,
                     maybe = out_rx.recv() => match maybe {
                         Some(p) => p,
                         None => break,
@@ -319,7 +444,7 @@ impl MeConnection {
                 }
                 let write_ok = tokio::select! {
                     biased;
-                    () = shared_w.shutdown_notify.notified() => false,
+                    () = wait_shutdown(&mut shutdown_rx_w) => false,
                     res = timeout(write_timeout, wr.write_all(&frame)) => matches!(res, Ok(Ok(()))),
                 };
                 if !write_ok {
@@ -329,17 +454,19 @@ impl MeConnection {
             shutdown_shared(&shared_w);
         });
 
-        // Reader task: decrypts frames and demultiplexes RPC_PROXY_ANS / RPC_CLOSE_EXT / RPC_PING / RPC_PONG.
+        // Reader task: decrypts frames and demultiplexes RPC_PROXY_ANS / RPC_SIMPLE_ACK / RPC_CLOSE_EXT / RPC_PING / RPC_PONG.
         let shared_r = shared.clone();
+        let mut shutdown_rx_r = shared.shutdown_tx.subscribe();
         let out_tx_r = out_tx.clone();
+        shared.active_tasks.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
+            let _guard = TaskGuard {
+                active_tasks: shared_r.active_tasks.clone(),
+            };
             loop {
-                if !shared_r.alive.load(Ordering::Relaxed) {
-                    break;
-                }
                 let read_res = tokio::select! {
                     biased;
-                    () = shared_r.shutdown_notify.notified() => break,
+                    () = wait_shutdown(&mut shutdown_rx_r) => break,
                     res = read_encrypted_frame(&mut rd, &mut dec, &mut read_buf) => res,
                 };
                 let Ok((_seq, payload)) = read_res else {
@@ -352,42 +479,23 @@ impl MeConnection {
                     RpcMessage::ProxyAns {
                         conn_id, payload, ..
                     } => {
-                        let tx_opt = {
-                            let map = shared_r.sessions.lock().unwrap_or_else(|e| e.into_inner());
-                            map.get(&conn_id).map(|e| e.tx.clone())
-                        };
-                        if let Some(tx) = tx_opt {
-                            match tx.try_send(payload) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    // INV-03: slow client must never stall the shared ME reader loop.
-                                    shared_r
-                                        .counters
-                                        .backpressure_drops
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    {
-                                        let mut map = shared_r
-                                            .sessions
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner());
-                                        map.remove(&conn_id);
-                                    }
-                                    if let Err(mpsc::error::TrySendError::Full(_)) =
-                                        out_tx_r.try_send(encode_close_ext(conn_id).to_vec())
-                                    {
-                                        shared_r
-                                            .counters
-                                            .dropped_close_ext
-                                            .fetch_add(1, Ordering::Relaxed);
-                                    }
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    let mut map =
-                                        shared_r.sessions.lock().unwrap_or_else(|e| e.into_inner());
-                                    map.remove(&conn_id);
-                                }
-                            }
-                        }
+                        deliver_session_event(
+                            &shared_r,
+                            &out_tx_r,
+                            conn_id,
+                            MeInboundEvent::Payload(payload),
+                        );
+                    }
+                    RpcMessage::SimpleAck {
+                        conn_id,
+                        confirm_key,
+                    } => {
+                        deliver_session_event(
+                            &shared_r,
+                            &out_tx_r,
+                            conn_id,
+                            MeInboundEvent::QuickAck(confirm_key),
+                        );
                     }
                     RpcMessage::CloseExt { conn_id } => {
                         let mut map = shared_r.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -399,8 +507,7 @@ impl MeConnection {
                     RpcMessage::Pong { ping_id } => {
                         let _ = pong_tx.try_send(ping_id);
                     }
-                    RpcMessage::SimpleAck { .. }
-                    | RpcMessage::Nonce { .. }
+                    RpcMessage::Nonce { .. }
                     | RpcMessage::Handshake { .. }
                     | RpcMessage::Unknown { .. } => {}
                 }
@@ -412,32 +519,31 @@ impl MeConnection {
         // RPC_PONG does not complete within ping_timeout.
         if !opts.ping_interval.is_zero() {
             let shared_p = shared.clone();
+            let mut shutdown_rx_p = shared.shutdown_tx.subscribe();
             let out_tx_p = out_tx;
             let ping_interval = opts.ping_interval;
             let ping_timeout = opts.ping_timeout;
+            shared.active_tasks.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
+                let _guard = TaskGuard {
+                    active_tasks: shared_p.active_tasks.clone(),
+                };
                 let mut ticker = tokio::time::interval(ping_interval);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 ticker.tick().await; // skip immediate first tick
                 let mut next_ping_id: i64 = 1;
                 loop {
-                    if !shared_p.alive.load(Ordering::Relaxed) {
-                        break;
-                    }
                     tokio::select! {
                         biased;
-                        () = shared_p.shutdown_notify.notified() => break,
+                        () = wait_shutdown(&mut shutdown_rx_p) => break,
                         _ = ticker.tick() => {}
-                    }
-                    if !shared_p.alive.load(Ordering::Relaxed) {
-                        break;
                     }
                     let pid = next_ping_id;
                     next_ping_id = next_ping_id.wrapping_add(1);
                     let ping_frame = encode_ping(pid).to_vec();
                     let sent = tokio::select! {
                         biased;
-                        () = shared_p.shutdown_notify.notified() => break,
+                        () = wait_shutdown(&mut shutdown_rx_p) => break,
                         res = timeout(ping_timeout, out_tx_p.send(ping_frame)) => matches!(res, Ok(Ok(()))),
                     };
                     if !sent {
@@ -446,7 +552,7 @@ impl MeConnection {
                     }
                     let got_pong = tokio::select! {
                         biased;
-                        () = shared_p.shutdown_notify.notified() => break,
+                        () = wait_shutdown(&mut shutdown_rx_p) => break,
                         res = timeout(ping_timeout, async {
                             while let Some(id) = pong_rx.recv().await {
                                 if id == pid {
@@ -471,15 +577,13 @@ impl MeConnection {
         self.shared.alive.load(Ordering::Relaxed)
     }
 
+    pub fn active_tasks(&self) -> usize {
+        self.shared.active_tasks.load(Ordering::Relaxed)
+    }
+
     pub async fn wait_closed(&self) {
-        if !self.is_alive() {
-            return;
-        }
-        let notified = self.shared.shutdown_notify.notified();
-        if !self.is_alive() {
-            return;
-        }
-        notified.await;
+        let mut rx = self.shared.shutdown_tx.subscribe();
+        wait_shutdown(&mut rx).await;
     }
 
     pub fn backpressure_drops(&self) -> u64 {
@@ -535,13 +639,60 @@ impl MeConnection {
     }
 }
 
+fn deliver_session_event(
+    shared: &Arc<ConnShared>,
+    out_tx: &mpsc::Sender<Vec<u8>>,
+    conn_id: u64,
+    event: MeInboundEvent,
+) {
+    let tx_opt = {
+        let map = shared.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&conn_id).map(|e| e.tx.clone())
+    };
+    if let Some(tx) = tx_opt {
+        match tx.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // INV-03: slow client must never stall the shared ME reader loop.
+                shared
+                    .counters
+                    .backpressure_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                {
+                    let mut map = shared.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                    map.remove(&conn_id);
+                }
+                if let Err(mpsc::error::TrySendError::Full(_)) =
+                    out_tx.try_send(encode_close_ext(conn_id).to_vec())
+                {
+                    shared
+                        .counters
+                        .dropped_close_ext
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                let mut map = shared.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                map.remove(&conn_id);
+            }
+        }
+    }
+}
+
+async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
+    if *rx.borrow_and_update() {
+        return;
+    }
+    let _ = rx.wait_for(|&closed| closed).await;
+}
+
 fn shutdown_shared(shared: &Arc<ConnShared>) {
     shared.alive.store(false, Ordering::Relaxed);
     {
         let mut map = shared.sessions.lock().unwrap_or_else(|e| e.into_inner());
         map.clear();
     }
-    shared.shutdown_notify.notify_waiters();
+    let _ = shared.shutdown_tx.send(true);
 }
 
 async fn read_plain_frame<R: AsyncReadExt + Unpin>(

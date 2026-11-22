@@ -95,6 +95,7 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         alert_webhook_url: None,
         alerts_file: None,
         diagnostics: false,
+        me: None,
     })
 }
 
@@ -1274,6 +1275,7 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
         diagnostics: false,
         metrics_listen: None,
+        me: config::MeConfig::default(),
     };
 
     let mut proxy_state = state(cover.addr, dc_addr);
@@ -1604,7 +1606,7 @@ async fn runtime_stats_file_tracks_edge_and_egress_byte_counters() -> Result<()>
     let dir = std::env::temp_dir().join(format!("mtevil-stats-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let stats_file = dir.join("runtime-stats.json");
-    write_runtime_stats_atomic(&stats_file, &edge_state.counters, "edge")?;
+    write_runtime_stats_atomic(&stats_file, &edge_state.counters, "edge", None)?;
     let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&stats_file)?)?;
     assert_eq!(parsed["role"].as_str(), Some("edge"));
     assert_eq!(
@@ -1715,6 +1717,7 @@ async fn probe_telegram_e2e_verifies_handshake_and_res_pq_reply() -> Result<()> 
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
         diagnostics: false,
         metrics_listen: None,
+        me: config::MeConfig::default(),
     };
 
     let rtt_ms = probe_telegram_e2e(&cfg, proxy_addr, 2, Duration::from_secs(3)).await?;
@@ -2125,6 +2128,7 @@ async fn allowed_sni_file_accepts_previous_and_current_sni_without_breaking_link
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
         diagnostics: false,
         metrics_listen: None,
+        me: config::MeConfig::default(),
     };
     assert_eq!(cfg.allowed_snis(), "ya.ru,example.com,vk.com");
 

@@ -146,10 +146,44 @@ pub(crate) async fn relay_client(
         diag,
     } = session;
     apply_bulk_mss(client, state.client_mss_bulk);
+    if let Some(me_rt) = &state.me {
+        let remote_addr = if me_rt.send_client_ip() {
+            me::extract_client_ipv4(client.peer_addr().ok())
+        } else {
+            None
+        };
+        match me_rt.open_session(transport.dc, remote_addr) {
+            Ok(me_session) => {
+                let ad_tag_configured = me_rt.current_ad_tag().is_some();
+                return me::relay_me_session(
+                    client,
+                    state,
+                    session_id,
+                    t0,
+                    user,
+                    transport,
+                    tls,
+                    hello_read_us,
+                    flight_written_us,
+                    diag,
+                    me_session,
+                    ad_tag_configured,
+                )
+                .await;
+            }
+            Err(err) => {
+                if me_rt.fallback_to_direct() {
+                    me_rt.record_fallback_to_direct(session_id, transport.dc, &err.to_string());
+                } else {
+                    return Err(err.context("me_strict_no_healthy_connection"));
+                }
+            }
+        }
+    }
     let us = || t0.elapsed().as_micros() as u64;
     let framed = tls.is_some();
     let inner_header_us = us();
-    let dc = wire::dc_transport()?;
+    let dc = wire::dc_transport_for(transport.kind)?;
     let (upstream, route) = connect_upstream(state, transport.dc, &dc.header).await?;
     let dc_connected_us = us();
     telemetry::event(
@@ -159,7 +193,7 @@ pub(crate) async fn relay_client(
             "user":user,
             "dc":transport.dc,
             "route":route,
-            "transport":"padded-intermediate",
+            "transport":transport.kind.as_str(),
             "mode": if framed { "ee" } else { "dd" },
             "hello_read_us":hello_read_us,
             "flight_written_us":flight_written_us,

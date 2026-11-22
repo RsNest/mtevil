@@ -53,3 +53,10 @@ path = "fuzz_targets/fuzz_me_proxy_conf.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_client_transport_frame"
+path = "fuzz_targets/fuzz_client_transport_frame.rs"
+test = false
+doc = false
+bench = false

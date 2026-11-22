@@ -70,8 +70,15 @@ pub(crate) fn spawn_metrics_server(
                             )
                         })
                         .unwrap_or_default();
-                    let body =
-                        counters.render_prometheus(&breaker_states, detect_fd_used(), fd_limit);
+                    let me_snap = breaker_source
+                        .as_ref()
+                        .and_then(|st| st.me.as_ref().map(|m| m.telemetry_snapshot()));
+                    let body = counters.render_prometheus_with_me(
+                        &breaker_states,
+                        detect_fd_used(),
+                        fd_limit,
+                        me_snap.as_ref(),
+                    );
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),

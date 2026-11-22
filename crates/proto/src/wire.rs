@@ -604,15 +604,14 @@ pub struct ClientTransport {
     pub decrypt: AesCtr,
     pub encrypt: AesCtr,
     pub dc: i16,
+    pub kind: crate::ClientProtoKind,
 }
 pub fn client_transport(wire: &[u8; 64], secret: &[u8; 16]) -> Result<ClientTransport> {
     let mut decrypt = cipher(&wire[8..40], &wire[40..56], secret)?;
     let mut plain = *wire;
     decrypt.apply_keystream(&mut plain);
-    ensure!(
-        plain[56..60] == [0xdd; 4],
-        "only padded intermediate supported"
-    );
+    let kind = crate::ClientProtoKind::from_tag([plain[56], plain[57], plain[58], plain[59]])
+        .ok_or_else(|| anyhow::anyhow!("unsupported inner transport"))?;
     let dc = i16::from_le_bytes([plain[60], plain[61]]);
     ensure!(
         (1..=5).contains(&dc.checked_abs().unwrap_or(0)),
@@ -624,6 +623,7 @@ pub fn client_transport(wire: &[u8; 64], secret: &[u8; 16]) -> Result<ClientTran
         decrypt,
         encrypt,
         dc,
+        kind,
     })
 }
 
@@ -633,6 +633,9 @@ pub struct DcTransport {
     pub decrypt: AesCtr,
 }
 pub fn dc_transport() -> Result<DcTransport> {
+    dc_transport_for(crate::ClientProtoKind::PaddedIntermediate)
+}
+pub fn dc_transport_for(kind: crate::ClientProtoKind) -> Result<DcTransport> {
     let mut plain = [0u8; 64];
     loop {
         OsRng.fill_bytes(&mut plain);
@@ -650,7 +653,7 @@ pub fn dc_transport() -> Result<DcTransport> {
             break;
         }
     }
-    plain[56..60].fill(0xdd);
+    plain[56..60].copy_from_slice(&kind.tag());
     let mut encrypt = cipher(&plain[8..40], &plain[40..56], &[])?;
     let reversed: Vec<_> = plain[8..56].iter().rev().copied().collect();
     let decrypt = cipher(&reversed[..32], &reversed[32..], &[])?;
@@ -763,6 +766,16 @@ pub fn verify_server_flight(
 /// Build the 64-byte obfuscated2 client init header for padded-intermediate mode (`0xdddddddd`)
 /// targeting `dc` and return `(wire_header, encrypt_cipher, decrypt_cipher)`.
 pub fn build_client_init(secret: &[u8; 16], dc: i16) -> Result<([u8; 64], AesCtr, AesCtr)> {
+    build_client_init_with_kind(secret, dc, crate::ClientProtoKind::PaddedIntermediate)
+}
+
+/// Build the 64-byte obfuscated2 client init header for the specified inner transport `kind`
+/// targeting `dc` and return `(wire_header, encrypt_cipher, decrypt_cipher)`.
+pub fn build_client_init_with_kind(
+    secret: &[u8; 16],
+    dc: i16,
+    kind: crate::ClientProtoKind,
+) -> Result<([u8; 64], AesCtr, AesCtr)> {
     ensure!(
         (1..=5).contains(&dc.checked_abs().unwrap_or(0)),
         "invalid DC"
@@ -784,7 +797,7 @@ pub fn build_client_init(secret: &[u8; 16], dc: i16) -> Result<([u8; 64], AesCtr
             break;
         }
     }
-    plain[56..60].fill(0xdd);
+    plain[56..60].copy_from_slice(&kind.tag());
     plain[60..62].copy_from_slice(&dc.to_le_bytes());
     let mut encrypt = cipher(&plain[8..40], &plain[40..56], secret)?;
     let reversed: Vec<_> = plain[8..56].iter().rev().copied().collect();

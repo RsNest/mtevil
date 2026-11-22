@@ -5,7 +5,10 @@ pub mod pool;
 pub mod wire;
 
 pub use config::{is_global_ipv4, parse_ad_tag_hex, MeConfigBundle, MeDiskCache, ProxyMultiConfig};
-pub use conn::{MeConnOptions, MeConnection, MeSession, DEFAULT_WRITE_TIMEOUT};
+pub use conn::{
+    MeConnOptions, MeConnection, MeInboundEvent, MeSession, MeSessionReceiver, MeSessionSender,
+    DEFAULT_WRITE_TIMEOUT,
+};
 pub use crypto::{derive_me_aes_key_iv, KdfPurpose, MeCbcDecryptor, MeCbcEncryptor};
 pub use pool::{MePool, MePoolConfig, MePoolHealth};
 pub use wire::{
@@ -46,6 +49,7 @@ mod tests {
         drop_pongs: Arc<AtomicBool>,
         burst_count: Arc<AtomicUsize>,
         accepts: Arc<AtomicUsize>,
+        open_sockets: Arc<AtomicUsize>,
         freeze_first_n: Arc<AtomicUsize>,
         refuse_all: Arc<AtomicBool>,
         task: tokio::task::JoinHandle<()>,
@@ -68,6 +72,7 @@ mod tests {
         let drop_pongs = Arc::new(AtomicBool::new(false));
         let burst_count = Arc::new(AtomicUsize::new(1));
         let accepts = Arc::new(AtomicUsize::new(0));
+        let open_sockets = Arc::new(AtomicUsize::new(0));
         let freeze_first_n = Arc::new(AtomicUsize::new(0));
         let refuse_all = Arc::new(AtomicBool::new(false));
 
@@ -77,6 +82,7 @@ mod tests {
         let dp_cl = drop_pongs.clone();
         let bc_cl = burst_count.clone();
         let acc_cl = accepts.clone();
+        let open_cl = open_sockets.clone();
         let frz_cl = freeze_first_n.clone();
         let ref_cl = refuse_all.clone();
 
@@ -100,7 +106,16 @@ mod tests {
                 let dp = dp_cl.clone();
                 let bc = bc_cl.clone();
                 let should_freeze = conn_idx <= frz_cl.load(Ordering::Relaxed);
+                let open_sock = open_cl.clone();
+                open_sock.fetch_add(1, Ordering::Relaxed);
+                struct OpenSockGuard(Arc<AtomicUsize>);
+                impl Drop for OpenSockGuard {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
                 tokio::spawn(async move {
+                    let _sock_guard = OpenSockGuard(open_sock);
                     let mut plain_buf = Vec::new();
                     let mut tmp = [0u8; 256];
                     let (seq, payload) = loop {
@@ -293,6 +308,7 @@ mod tests {
             drop_pongs,
             burst_count,
             accepts,
+            open_sockets,
             freeze_first_n,
             refuse_all,
             task,
@@ -863,6 +879,49 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(pool.active_workers(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rapid_connect_shutdown_no_task_or_socket_leak() -> Result<()> {
+        let secret = vec![0x33; 128];
+        let srv = spawn_mock_me_server(secret.clone()).await?;
+        let mut conns = Vec::with_capacity(50);
+        for _ in 0..50 {
+            let conn = MeConnection::connect(
+                srv.addr,
+                &secret,
+                MeConnOptions {
+                    handshake_timeout: Duration::from_secs(2),
+                    ping_interval: Duration::from_secs(60),
+                    ping_timeout: Duration::from_secs(5),
+                    ..MeConnOptions::default()
+                },
+            )
+            .await?;
+            // Close immediately after start (exercising the race window before tasks poll select!).
+            conn.close();
+            conns.push(conn);
+        }
+        // Every connection's reader/writer/ping tasks must terminate and every server socket must close.
+        for _ in 0..80 {
+            let live_tasks: usize = conns.iter().map(MeConnection::active_tasks).sum();
+            let open_socks = srv.open_sockets.load(Ordering::Relaxed);
+            if live_tasks == 0 && open_socks == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        let live_tasks: usize = conns.iter().map(MeConnection::active_tasks).sum();
+        assert_eq!(
+            live_tasks, 0,
+            "all connection background tasks must terminate without lost shutdown wakeups"
+        );
+        assert_eq!(
+            srv.open_sockets.load(Ordering::Relaxed),
+            0,
+            "all TCP sockets must be closed cleanly with zero FD leaks"
+        );
         Ok(())
     }
 
