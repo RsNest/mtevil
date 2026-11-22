@@ -4825,3 +4825,109 @@ async fn inv10_f23_hung_egress_ack_timeout_escalation_and_isolated_dc_isolation(
     }
     Ok(())
 }
+
+#[tokio::test(start_paused = true)]
+async fn inv10_f23_hung_egress_30_parallel_single_escalation_and_base_cooldown() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let cover = cover_mock().await?;
+
+    // Hung egress accepts all 30 TCP connections, reads full preface, never sends ACK.
+    let l_hung = TcpListener::bind("127.0.0.1:0").await?;
+    let a_hung = l_hung.local_addr()?;
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let all_ready = Arc::new(tokio::sync::Notify::new());
+    let hold_open = Arc::new(tokio::sync::Notify::new());
+
+    let inf_srv = in_flight.clone();
+    let ar_srv = all_ready.clone();
+    let ho_srv = hold_open.clone();
+    let t_hung = tokio::spawn(async move {
+        for _ in 0..30usize {
+            let Ok((mut s, _)) = l_hung.accept().await else {
+                break;
+            };
+            let inf = inf_srv.clone();
+            let ar = ar_srv.clone();
+            let ho = ho_srv.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 88];
+                if s.read_exact(&mut buf).await.is_ok() {
+                    if inf.fetch_add(1, Relaxed) + 1 == 30 {
+                        ar.notify_one();
+                    }
+                    ho.notified().await;
+                    drop(s);
+                }
+            });
+        }
+    });
+
+    let base_cd = Duration::from_secs(3);
+    let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut st).context("unique state")?;
+        sm.egress_upstreams = vec![a_hung];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(1));
+        sm.egress_cooldown = base_cd;
+        sm.egress_cooldown_max = Duration::from_secs(60);
+        sm.egress_use_mtv3 = false;
+        sm.handshake = Duration::from_secs(10);
+    }
+
+    let dcs: [i16; 7] = [2, 4, -2, -4, 1, 3, 5];
+    let mut joins = Vec::with_capacity(30);
+    for i in 0..30usize {
+        let st_c = st.clone();
+        let dc = dcs[i % dcs.len()];
+        joins.push(tokio::spawn(async move {
+            let Some(claim) = EgressHealth::try_claim(&st_c.egress_health, 0, dc, Instant::now())
+            else {
+                return Err(anyhow::anyhow!(
+                    "node 0 must be claimable before first timeout"
+                ));
+            };
+            let res = dial_egress_candidate(
+                &st_c,
+                0,
+                dc,
+                dc.abs(),
+                &[0x11; 64],
+                Duration::from_millis(300),
+            )
+            .await;
+            let Err(err) = res else {
+                return Err(anyhow::anyhow!("all 30 attempts to hung egress must fail"));
+            };
+            let _ = finalize_egress_error(&st_c, 0, claim, err);
+            Ok(())
+        }));
+    }
+
+    // Confirm all 30 attempts started and wrote preface BEFORE the first 300ms timeout fires.
+    all_ready.notified().await;
+    assert_eq!(in_flight.load(Relaxed), 30);
+
+    let before_timeout = Instant::now();
+    for j in joins {
+        j.await??;
+    }
+    hold_open.notify_waiters();
+    t_hung.abort();
+
+    let h = st.egress_health.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(
+        h.nodes[0].failures, 1,
+        "30 concurrent hung-egress attempts must trigger exactly ONE escalation (failures == 1)"
+    );
+    let until = h.nodes[0].until.context("node 0 must be in cooldown")?;
+    // Account for the 300ms per_try before escalation fired + base_cd (3s ± 20% jitter = [2400ms, 3600ms]).
+    let assigned_from_esc =
+        until.saturating_duration_since(before_timeout + Duration::from_millis(300));
+    assert!(
+        assigned_from_esc >= Duration::from_millis(2400)
+            && assigned_from_esc <= Duration::from_millis(3650),
+        "assigned cooldown must equal base ±20% jitter (got {assigned_from_esc:?})"
+    );
+    Ok(())
+}

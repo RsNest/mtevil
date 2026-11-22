@@ -38,6 +38,14 @@ pub(crate) const ACK_TIMEOUT_ESCALATION_CONSECUTIVE: usize = 3;
 pub(crate) struct AckTimeoutWindow {
     pub(crate) entries: std::collections::VecDeque<(Instant, i16)>,
     pub(crate) last_success: Option<Instant>,
+    pub(crate) last_escalated_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AckTimeoutEscalation {
+    DcOnly,
+    EscalateNode,
+    AlreadyEscalated,
 }
 
 #[derive(Default)]
@@ -108,20 +116,24 @@ impl EgressHealth {
         h.node_ack_timeouts[idx].last_success = Some(now);
     }
 
-    /// Record a post-preface ACK timeout on `(idx, dc)` and return `true` if the node should
-    /// escalate to node-level cooldown + `node_down` (>=2 distinct DCs or >=3 consecutive
-    /// ACK timeouts within 10s with no successful ACK in that window).
+    /// Record a post-preface ACK timeout on `(idx, dc)` for an attempt started at `started_at`.
+    /// Attempts that started at or before the node's `last_escalated_at` return `AlreadyEscalated`
+    /// (treated as no-op like `SignaledDown`) so concurrent timeouts never cascade `failures`.
     pub(crate) fn record_ack_timeout_and_check_escalation(
         health: &std::sync::Mutex<Self>,
         idx: usize,
         dc: i16,
+        started_at: Instant,
         now: Instant,
-    ) -> bool {
+    ) -> AckTimeoutEscalation {
         let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
         while h.node_ack_timeouts.len() <= idx {
             h.node_ack_timeouts.push(AckTimeoutWindow::default());
         }
         let win = &mut h.node_ack_timeouts[idx];
+        if win.last_escalated_at.is_some_and(|esc| started_at <= esc) {
+            return AckTimeoutEscalation::AlreadyEscalated;
+        }
         while let Some(&(ts, _)) = win.entries.front() {
             if now.saturating_duration_since(ts) > ACK_TIMEOUT_ESCALATION_WINDOW {
                 win.entries.pop_front();
@@ -143,9 +155,10 @@ impl EgressHealth {
                 || win.entries.len() >= ACK_TIMEOUT_ESCALATION_CONSECUTIVE)
         {
             win.entries.clear();
-            true
+            win.last_escalated_at = Some(now);
+            AckTimeoutEscalation::EscalateNode
         } else {
-            false
+            AckTimeoutEscalation::DcOnly
         }
     }
 
@@ -321,6 +334,7 @@ pub(crate) struct EgressAttemptClaim<'a> {
     pub(crate) health: &'a std::sync::Mutex<EgressHealth>,
     pub(crate) idx: usize,
     pub(crate) dc: i16,
+    pub(crate) started_at: Instant,
     pub(crate) node_probe: bool,
     pub(crate) dc_probe: bool,
     pub(crate) completed: bool,
@@ -382,6 +396,7 @@ impl EgressHealth {
             health,
             idx,
             dc,
+            started_at: now,
             node_probe,
             dc_probe,
             completed: false,
@@ -451,6 +466,7 @@ impl EgressHealth {
                 health,
                 idx,
                 dc,
+                started_at: Instant::now(),
                 node_probe,
                 dc_probe,
                 completed: false,

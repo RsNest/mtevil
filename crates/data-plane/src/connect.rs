@@ -728,18 +728,24 @@ pub(crate) fn finalize_egress_error(
             e
         }
         EgressAttemptErr::DcAckTimeout(e) => {
-            let escalated = EgressHealth::record_ack_timeout_and_check_escalation(
+            match EgressHealth::record_ack_timeout_and_check_escalation(
                 &state.egress_health,
                 idx,
                 claim.dc,
+                claim.started_at,
                 Instant::now(),
-            );
-            if escalated {
-                EgressHealth::set_node_availability(&state.egress_health, idx, false);
-                claim.record_node_failure(state.egress_cooldown, state.egress_cooldown_max);
-                EgressHealth::notify_node_down(&state.egress_health, idx);
-            } else {
-                claim.record_dc_failure(state.egress_cooldown, state.egress_cooldown_max);
+            ) {
+                AckTimeoutEscalation::EscalateNode => {
+                    EgressHealth::set_node_availability(&state.egress_health, idx, false);
+                    claim.record_node_failure(state.egress_cooldown, state.egress_cooldown_max);
+                    EgressHealth::notify_node_down(&state.egress_health, idx);
+                }
+                AckTimeoutEscalation::DcOnly => {
+                    claim.record_dc_failure(state.egress_cooldown, state.egress_cooldown_max);
+                }
+                AckTimeoutEscalation::AlreadyEscalated => {
+                    drop(claim);
+                }
             }
             e
         }
