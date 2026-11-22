@@ -232,6 +232,135 @@ pub struct Config {
     /// Optional localhost-only Prometheus `/metrics` HTTP listener (disabled by default).
     #[serde(default)]
     pub metrics_listen: Option<SocketAddr>,
+    /// Optional Telegram Middle-End (ME) pool & `ad_tag` configuration (disabled by default).
+    #[serde(default)]
+    pub me: MeConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_me_fallback_to_direct")]
+    pub fallback_to_direct: bool,
+    #[serde(default = "default_me_send_client_ip")]
+    pub send_client_ip: bool,
+    #[serde(default)]
+    pub public_ipv4: Option<std::net::Ipv4Addr>,
+    #[serde(default = "default_me_pool_size")]
+    pub pool_size: usize,
+    #[serde(default = "default_me_refresh_interval_secs")]
+    pub refresh_interval_secs: u64,
+    #[serde(default = "default_me_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
+    #[serde(default)]
+    pub ad_tag_file: Option<PathBuf>,
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
+    #[serde(default = "default_me_secret_url")]
+    pub proxy_secret_url: String,
+    #[serde(default = "default_me_config_url")]
+    pub proxy_config_url: String,
+}
+
+impl Default for MeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fallback_to_direct: default_me_fallback_to_direct(),
+            send_client_ip: default_me_send_client_ip(),
+            public_ipv4: None,
+            pool_size: default_me_pool_size(),
+            refresh_interval_secs: default_me_refresh_interval_secs(),
+            drain_timeout_secs: default_me_drain_timeout_secs(),
+            ad_tag_file: None,
+            cache_dir: None,
+            proxy_secret_url: default_me_secret_url(),
+            proxy_config_url: default_me_config_url(),
+        }
+    }
+}
+
+fn default_me_fallback_to_direct() -> bool {
+    true
+}
+fn default_me_send_client_ip() -> bool {
+    true
+}
+fn default_me_pool_size() -> usize {
+    2
+}
+fn default_me_refresh_interval_secs() -> u64 {
+    43_200
+}
+fn default_me_drain_timeout_secs() -> u64 {
+    60
+}
+fn default_me_secret_url() -> String {
+    "https://core.telegram.org/getProxySecret".to_string()
+}
+fn default_me_config_url() -> String {
+    "https://core.telegram.org/getProxyConfig".to_string()
+}
+
+/// Validate ME config URL: `https://` is allowed for any host, while `http://` is permitted
+/// strictly for loopback endpoints (`127.0.0.1`, `[::1]`, `localhost`) used in local tests.
+pub fn validate_me_config_url(url: &str) -> Result<()> {
+    if let Some(rest) = url.strip_prefix("https://") {
+        ensure!(!rest.is_empty(), "empty https:// URL");
+        return Ok(());
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        let authority = rest.split('/').next().unwrap_or("");
+        ensure!(!authority.is_empty(), "empty http:// authority");
+        let host = if let Some(bracketed) = authority.strip_prefix('[') {
+            bracketed
+                .split(']')
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("malformed IPv6 host in http:// URL"))?
+        } else {
+            authority.split(':').next().unwrap_or("")
+        };
+        let is_loopback = host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
+        ensure!(
+            is_loopback,
+            "plain http:// ME config URL is only allowed for loopback addresses; use https://"
+        );
+        return Ok(());
+    }
+    anyhow::bail!("ME config URL must start with https:// (or http:// for loopback tests)");
+}
+
+/// Read and validate an `ad_tag` file (32 hex chars, Unix mode `0600`).
+/// Returns `Ok(None)` if the file is empty/whitespace-only; never includes the tag in error text.
+pub fn load_ad_tag_file(path: &Path) -> Result<Option<[u8; 16]>> {
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("ad_tag_file metadata '{}'", path.display()))?;
+    ensure!(meta.len() <= 256, "ad_tag_file exceeds 256 bytes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        ensure!(
+            (mode & 0o077) == 0,
+            "ad_tag_file '{}' must have mode 0600 (no group/other access), got {:04o}",
+            path.display(),
+            mode
+        );
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading ad_tag_file '{}'", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let tag = mtevil_me_pool::parse_ad_tag_hex(&raw)
+        .map_err(|_| anyhow::anyhow!("ad_tag_file must contain exactly 32 hex characters"))?;
+    Ok(Some(tag))
 }
 fn default_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 24443))
@@ -313,6 +442,8 @@ impl Config {
             &mut config.users_file,
             &mut config.replay_file,
             &mut config.egress_token_file,
+            &mut config.me.ad_tag_file,
+            &mut config.me.cache_dir,
         ]
         .into_iter()
         .flatten()
@@ -408,6 +539,29 @@ impl Config {
                 (88..=1460).contains(&mss),
                 "client_mss_bulk must be 88..=1460"
             );
+        }
+        if self.me.enabled {
+            ensure!(
+                (1..=16).contains(&self.me.pool_size),
+                "me.pool_size must be 1..=16"
+            );
+            ensure!(
+                (60..=86_400).contains(&self.me.refresh_interval_secs),
+                "me.refresh_interval_secs must be 60..=86400"
+            );
+            ensure!(
+                (1..=300).contains(&self.me.drain_timeout_secs),
+                "me.drain_timeout_secs must be 1..=300"
+            );
+            validate_me_config_url(&self.me.proxy_secret_url)
+                .context("invalid me.proxy_secret_url")?;
+            validate_me_config_url(&self.me.proxy_config_url)
+                .context("invalid me.proxy_config_url")?;
+            if let Some(ref tag_path) = self.me.ad_tag_file {
+                if tag_path.exists() {
+                    let _ = load_ad_tag_file(tag_path)?;
+                }
+            }
         }
         if self.role == Role::Egress {
             ensure!(!self.dc.is_empty(), "egress role requires at least one DC");

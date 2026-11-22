@@ -39,6 +39,9 @@ print_help() {
   mtevilctl user list         Показать список дополнительных пользователей
   mtevilctl user add <имя>    Добавить пользователя и сразу вывести его персональную ссылку (без перезапуска контейнера)
   mtevilctl user del <имя>    Удалить пользователя (без перезапуска контейнера)
+  mtevilctl adtag show        Показать статус рекламного тега ME (маскированно, без вывода полного значения)
+  mtevilctl adtag set         Установить 32-hex ad_tag от @MTProxybot (рекомендуемый скрытый ввод без истории shell; права 0600, без рестарта)
+  mtevilctl adtag clear       Удалить рекламный тег (без перезапуска контейнера)
   mtevilctl setup             Запустить интерактивный мастер перенастройки текущей установки (псевдоним: reconfigure)
   mtevilctl update            Обновить контейнер до свежего стабильного релиза без повторного запуска мастера (с сохранением настроек и секретов)
   mtevilctl update --prerelease
@@ -78,7 +81,7 @@ case "$CMD" in
     print_help
     exit 1
     ;;
-  status|update|rollback|traffic|traf|link|sni|user|setup|reconfigure)
+  status|update|rollback|traffic|traf|link|sni|user|adtag|setup|reconfigure)
     shift
     for arg in "$@"; do
       if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then

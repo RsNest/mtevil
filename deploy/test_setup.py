@@ -2417,6 +2417,219 @@ class SetupValidationTests(unittest.TestCase):
                     self.assertEqual(len(edit_lines), 1, f"{tag_name} ({exists=}, {is_draft=}): {edit_lines}")
                     self.assertEqual(edit_lines[0], f"release edit {tag_name} --draft=false {expected_flags}")
 
+    def test_strip_me_block_for_legacy_version_and_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "config.json"
+            original = {
+                "role": "direct",
+                "sni": "ya.ru",
+                "me": {"enabled": True, "send_client_ip": True, "pool_size": 2},
+            }
+            cfg.write_text(setup.json.dumps(original, indent=2) + "\n", encoding="utf-8")
+
+            # v0.3.0 supports `me`: must not strip or create backup.
+            self.assertTrue(setup.version_supports_me_config("v0.3.0"))
+            self.assertTrue(setup.version_supports_me_config("v0.3.0-rc.1"))
+            stripped, bk = setup.strip_me_block_for_legacy_version(cfg, "v0.3.0")
+            self.assertFalse(stripped)
+            self.assertIsNone(bk)
+            self.assertIn("me", setup.json.loads(cfg.read_text(encoding="utf-8")))
+
+            # v0.2.0 does NOT support `me`: must create backup and strip `me`.
+            self.assertFalse(setup.version_supports_me_config("v0.2.0"))
+            stripped, bk = setup.strip_me_block_for_legacy_version(cfg, "v0.2.0")
+            self.assertTrue(stripped)
+            self.assertIsNotNone(bk)
+            assert bk is not None
+            self.assertTrue(bk.is_file())
+            self.assertEqual(setup.json.loads(bk.read_text(encoding="utf-8"))["me"]["enabled"], True)
+            self.assertNotIn("me", setup.json.loads(cfg.read_text(encoding="utf-8")))
+
+    def test_phase4_adtag_masking_status_wizard_and_v02_migration(self) -> None:
+        # 1. ad_tag validation and masking (raw tag never echoed)
+        raw_tag = "0123456789abcdef0123456789abcdef"
+        self.assertEqual(setup.validate_ad_tag_hex(raw_tag.upper()), raw_tag)
+        masked = setup.mask_ad_tag(raw_tag)
+        self.assertEqual(masked, "0123…cdef")
+        self.assertNotIn(raw_tag, masked)
+        with self.assertRaises(ValueError):
+            setup.validate_ad_tag_hex("too-short")
+        with self.assertRaises(ValueError):
+            setup.validate_ad_tag_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+
+        # 2. format_me_status_lines: disabled, active, degraded, split edge warning
+        off = "\n".join(setup.format_me_status_lines("direct", {"role": "direct"}, None))
+        self.assertIn("выключен", off)
+
+        active = "\n".join(
+            setup.format_me_status_lines(
+                "direct",
+                {"role": "direct", "me": {"enabled": True, "fallback_to_direct": True}},
+                {
+                    "me": {
+                        "enabled": True,
+                        "mode": "me",
+                        "alive_connections": 24,
+                        "total_slots": 24,
+                        "config_age_secs": 125,
+                        "fallback_direct_total": 0,
+                        "refresh_errors": 0,
+                        "backpressure_drops": 1,
+                        "dropped_close_ext": 2,
+                        "ad_tag": "configured",
+                    }
+                },
+            )
+        )
+        self.assertIn("ME активен", active)
+        self.assertIn("24/24", active)
+        self.assertIn("2 мин 5 с", active)
+        self.assertIn("backpressure_drops=1", active)
+        self.assertIn("dropped_close_ext=2", active)
+        self.assertIn("настроен", active)
+        self.assertNotIn(raw_tag, active)
+
+        degraded = "\n".join(
+            setup.format_me_status_lines(
+                "direct",
+                {"role": "direct", "me": {"enabled": True, "fallback_to_direct": True}},
+                {"me": {"enabled": True, "mode": "me_degraded_fallback_direct", "alive_connections": 0, "total_slots": 24, "fallback_direct_total": 3}},
+            )
+        )
+        self.assertIn("ME degraded -> fallback на Direct", degraded)
+        self.assertIn("fallback=3", degraded)
+
+        edge_warn = "\n".join(
+            setup.format_me_status_lines(
+                "edge",
+                {"role": "edge", "me": {"enabled": True, "fallback_to_direct": True, "send_client_ip": True}},
+                {"me": {"enabled": False, "fallback_direct_total": 4}},
+            )
+        )
+        self.assertIn("Предупреждение ME", edge_warn)
+        self.assertIn("v0.3+", edge_warn)
+
+        # 3. prompt_me_config: direct bridge prompts public_ipv4 & prints privacy warning
+        answers = iter(["y", "y", "y", "203.0.113.10"])
+        buf = io.StringIO()
+        with mock.patch("builtins.input", side_effect=lambda _p="": next(answers)), contextlib.redirect_stdout(buf):
+            me_blk = setup.prompt_me_config(
+                "direct",
+                network_host=False,
+                detected_public_ip="203.0.113.10",
+                existing_me=None,
+            )
+        out_txt = buf.getvalue()
+        self.assertIn("приватность", out_txt)
+        self.assertIn("NAT/Docker bridge", out_txt)
+        self.assertIsNotNone(me_blk)
+        assert me_blk is not None
+        self.assertTrue(me_blk["enabled"])
+        self.assertTrue(me_blk["send_client_ip"])
+        self.assertTrue(me_blk["fallback_to_direct"])
+        self.assertEqual(me_blk["public_ipv4"], "203.0.113.10")
+        self.assertEqual(me_blk["pool_size"], 2)
+
+        # 4. mtevilctl adtag set/show/clear uses init service with 0600, UID 10001, stdin (never argv), masks output
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: mtevil:test\n  init:\n    image: mtevil:test\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_PROJECT=mtevil-direct\nMTEVIL_IMAGE=mtevil:test\n", encoding="utf-8")
+            (d / "config.json").write_text(
+                setup.json.dumps({"role": "direct", "sni": "ya.ru", "me": {"enabled": True}}),
+                encoding="utf-8",
+            )
+            recorded_runs: list[tuple[list[str], str | None]] = []
+
+            def fake_subproc_run(cmd, **kwargs):
+                recorded_runs.append((list(cmd), kwargs.get("input")))
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            def fake_run(cmd, check=True):
+                if "ps" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="cid123\n", stderr="")
+                if "stat -c" in " ".join(cmd):
+                    return subprocess.CompletedProcess(cmd, 0, stdout="10001:10001 600\n", stderr="")
+                if "cat" in " ".join(cmd):
+                    return subprocess.CompletedProcess(cmd, 0, stdout=raw_tag + "\n", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            out_set = io.StringIO()
+            with (
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "compose_cmd", return_value=["docker", "compose"]),
+                mock.patch.object(setup, "compose_service", return_value="mtevil"),
+                mock.patch.object(setup, "compose_write_service", return_value="init"),
+                mock.patch.object(setup, "run", side_effect=fake_run),
+                mock.patch.object(setup.subprocess, "run", side_effect=fake_subproc_run),
+                mock.patch.object(setup.sys.stdin, "isatty", return_value=True),
+                mock.patch.object(setup.getpass, "getpass", return_value=raw_tag),
+                contextlib.redirect_stdout(out_set),
+            ):
+                # Hidden interactive prompt (no CLI arg -> getpass, avoids shell history)
+                rc_set = setup.run_adtag_command(d, "set", None)
+                rc_show = setup.run_adtag_command(d, "show")
+                rc_clear = setup.run_adtag_command(d, "clear")
+            self.assertEqual((rc_set, rc_show, rc_clear), (0, 0, 0))
+            self.assertEqual(len(recorded_runs), 1)
+            set_cmd, set_stdin = recorded_runs[0]
+            self.assertIn("init", set_cmd)
+            self.assertNotIn(raw_tag, " ".join(set_cmd))
+            self.assertNotIn("|| true", " ".join(set_cmd))
+            self.assertEqual(set_stdin, raw_tag + "\n")
+            self.assertIn("chmod 0600", " ".join(set_cmd))
+            self.assertIn("10001:10001", " ".join(set_cmd))
+            self.assertIn("0123…cdef", out_set.getvalue())
+            self.assertIn("владелец 10001:10001", out_set.getvalue())
+            self.assertNotIn(raw_tag, out_set.getvalue())
+
+            # Non-TTY stdin pipe works without CLI arg too
+            recorded_runs.clear()
+            with (
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "compose_cmd", return_value=["docker", "compose"]),
+                mock.patch.object(setup, "compose_service", return_value="mtevil"),
+                mock.patch.object(setup, "compose_write_service", return_value="init"),
+                mock.patch.object(setup, "run", side_effect=fake_run),
+                mock.patch.object(setup.subprocess, "run", side_effect=fake_subproc_run),
+                mock.patch("sys.stdin", io.StringIO(raw_tag + "\n")),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(setup.run_adtag_command(d, "set", None), 0)
+            self.assertEqual(recorded_runs[0][1], raw_tag + "\n")
+
+        # 5. Migration v0.2.0 -> v0.3 preserves custom compose and keeps ME disabled
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            custom_compose = (
+                "services:\n"
+                "  mtevil:\n"
+                "    image: ${MTEVIL_IMAGE}\n"
+                "    # custom operator comment\n"
+                "    volumes:\n"
+                "      - ./config.json:/etc/mtevil/config.json:ro\n"
+                "      - state:/var/lib/mtevil:ro\n"
+                "      - replay:/var/lib/mtevil-replay:rw\n"
+                "  init:\n"
+                "    image: ${MTEVIL_IMAGE}\n"
+                "    profiles: [init]\n"
+                "    volumes:\n"
+                "      - state:/var/lib/mtevil:rw\n"
+                "      - replay:/var/lib/mtevil-replay:rw\n"
+                "volumes:\n"
+                "  state:\n"
+                "  replay:\n"
+            )
+            (d / "compose.yaml").write_text(custom_compose, encoding="utf-8")
+            (d / "config.json").write_text(
+                setup.json.dumps({"role": "direct", "sni": "ya.ru", "replay_file": "/var/lib/mtevil-replay/replay.bin"}),
+                encoding="utf-8",
+            )
+            changed = setup.migrate_compose_and_replay_on_update(d, d / "config.json", d / "compose.yaml")
+            self.assertFalse(changed)
+            self.assertIn("# custom operator comment", (d / "compose.yaml").read_text(encoding="utf-8"))
+            self.assertNotIn("me", setup.json.loads((d / "config.json").read_text(encoding="utf-8")))
+
 
 if __name__ == "__main__":
     prog = unittest.main(verbosity=2, exit=False)

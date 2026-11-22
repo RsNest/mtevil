@@ -7,6 +7,7 @@ members = [
     "crates/data-plane",
     "crates/egress",
     "crates/guard",
+    "crates/me-pool",
 ]
 
 # Рабочие крейты: proto (wire-кодеки), guard (replay-кэш), egress (failover backoff/jitter),

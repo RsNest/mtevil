@@ -9,6 +9,7 @@ pub(crate) struct EgressSecurityConfig {
     pub(crate) max_unauth_handshakes: usize,
     pub(crate) nonce_cache_capacity: usize,
     pub(crate) dc_media_overrides: HashMap<i16, Vec<SocketAddr>>,
+    pub(crate) me: Option<Arc<me::MeRuntime>>,
 }
 
 impl EgressSecurityConfig {
@@ -22,6 +23,7 @@ impl EgressSecurityConfig {
             max_unauth_handshakes: (max_connections / 4).clamp(4, 128),
             nonce_cache_capacity: config::default_egress_nonce_cache_capacity(max_connections),
             dc_media_overrides: default_media_override_map(),
+            me: None,
         }
     }
 
@@ -249,7 +251,7 @@ pub(crate) async fn serve_egress_with_security(
                 &egress_token,
                 handshake,
                 idle,
-                &counters,
+                counters.clone(),
                 &runtime_sec,
             )
             .await;
@@ -280,7 +282,7 @@ pub(crate) async fn egress_connection(
     expected_token: &[u8; 16],
     handshake: Duration,
     idle: Duration,
-    counters: &telemetry::Counters,
+    counters: Arc<telemetry::Counters>,
     security: &EgressRuntimeSecurity,
 ) -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
@@ -301,6 +303,93 @@ pub(crate) async fn egress_connection(
     counters
         .downstream_rx_bytes
         .fetch_add(magic.len() as u64, Relaxed);
+
+    if magic == wire::EGRESS_MAGIC_V4 {
+        let mut rest = [0u8; wire::EGRESS_PREFACE_V4_LEN - 4];
+        if let Err(err) = timeout(handshake, edge.read_exact(&mut rest))
+            .await
+            .context("egress_v4_header_timeout")
+            .and_then(|r| r.context("egress_v4_header_eof"))
+        {
+            counters.egress_preface_aborted.fetch_add(1, Relaxed);
+            return Err(err);
+        }
+        counters
+            .downstream_rx_bytes
+            .fetch_add(rest.len() as u64, Relaxed);
+        let mut full = [0u8; wire::EGRESS_PREFACE_V4_LEN];
+        full[..4].copy_from_slice(&magic);
+        full[4..].copy_from_slice(&rest);
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let parsed = match wire::verify_egress_preface_v4(
+            &full,
+            expected_token,
+            now_secs,
+            wire::EGRESS_V3_MAX_SKEW_SECS,
+        ) {
+            Ok(p) => p,
+            Err(err) => {
+                security.record_auth_failure_counted(peer_ip, &counters);
+                return Err(err);
+            }
+        };
+        let mut replay_key = [0u8; 32];
+        replay_key[..8].copy_from_slice(&parsed.timestamp.to_le_bytes());
+        replay_key[8..24].copy_from_slice(&parsed.nonce);
+        replay_key[24..26].copy_from_slice(&parsed.dc.to_le_bytes());
+        replay_key[31] = 4; // domain-separate MTV4 nonces from MTV3
+        let decision = security
+            .nonce_replay
+            .lock()
+            .await
+            .check_and_insert(replay_key, Instant::now());
+        match decision {
+            Decision::Fresh => {}
+            Decision::Duplicate => {
+                security.record_auth_failure_counted(peer_ip, &counters);
+                bail!("egress MTV4 nonce replay detected");
+            }
+            Decision::Full => {
+                let prev = counters.egress_nonce_cache_full.fetch_add(1, Relaxed);
+                if prev == 0 || prev.is_multiple_of(1024) {
+                    telemetry::event(
+                        "egress_nonce_cache_full",
+                        0,
+                        json!({
+                            "capacity": security.cfg.nonce_cache_capacity,
+                            "accepted_while_full": prev + 1
+                        }),
+                    );
+                }
+            }
+        }
+        drop(unauth_permit);
+
+        let Some(me_rt) = &security.cfg.me else {
+            let _ = timeout(handshake, edge.write_all(&[EGRESS_ACK_ERR])).await;
+            bail!("egress MTV4 rejected: ME mode disabled on egress");
+        };
+        // AND-logic for client IP: forward only if both edge set MTV4_FLAG_HAS_CLIENT_IP
+        // AND egress has me.send_client_ip = true. Never log the client IP.
+        let effective_client_addr = if me_rt.send_client_ip() {
+            parsed.client_addr
+        } else {
+            None
+        };
+        let me_session = match me_rt.open_session(parsed.dc, effective_client_addr, parsed.proto) {
+            Ok(sess) => sess,
+            Err(err) => {
+                let _ = timeout(handshake, edge.write_all(&[EGRESS_ACK_ERR])).await;
+                return Err(err.context("egress MTV4 ME pool unavailable"));
+            }
+        };
+        timeout(handshake, edge.write_all(&[EGRESS_ACK_OK]))
+            .await
+            .context("egress_v4_ack_write_timeout")?
+            .context("egress_v4_ack_write_failed")?;
+        counters.downstream_tx_bytes.fetch_add(1, Relaxed);
+        return me::relay_egress_mtv4_me(edge, me_session, idle, counters).await;
+    }
 
     let (raw_dc_id, mtv3_dc_header) = if magic == wire::EGRESS_MAGIC_V3 {
         let mut rest = [0u8; wire::EGRESS_PREFACE_V3_LEN - 4];
@@ -327,7 +416,7 @@ pub(crate) async fn egress_connection(
         ) {
             Ok(p) => p,
             Err(err) => {
-                security.record_auth_failure_counted(peer_ip, counters);
+                security.record_auth_failure_counted(peer_ip, &counters);
                 return Err(err);
             }
         };
@@ -343,7 +432,7 @@ pub(crate) async fn egress_connection(
         match decision {
             Decision::Fresh => {}
             Decision::Duplicate => {
-                security.record_auth_failure_counted(peer_ip, counters);
+                security.record_auth_failure_counted(peer_ip, &counters);
                 bail!("egress MTV3 nonce replay detected");
             }
             Decision::Full => {
@@ -364,7 +453,7 @@ pub(crate) async fn egress_connection(
         (parsed.dc, Some(parsed.dc_header))
     } else if magic == wire::EGRESS_MAGIC_V2 {
         if !security.cfg.accept_legacy {
-            security.record_auth_failure_counted(peer_ip, counters);
+            security.record_auth_failure_counted(peer_ip, &counters);
             bail!("egress legacy MTV2 disabled");
         }
         let mut rest = [0u8; 20];
@@ -381,14 +470,14 @@ pub(crate) async fn egress_connection(
             .fetch_add(rest.len() as u64, Relaxed);
         let token: [u8; 16] = rest[4..20].try_into()?;
         if !ct_eq_16(&token, expected_token) {
-            security.record_auth_failure_counted(peer_ip, counters);
+            security.record_auth_failure_counted(peer_ip, &counters);
             bail!("egress token mismatch");
         }
         let dc_id = i16::from_le_bytes([rest[0], rest[1]]);
         counters.egress_legacy_connections.fetch_add(1, Relaxed);
         (dc_id, None)
     } else {
-        security.record_auth_failure_counted(peer_ip, counters);
+        security.record_auth_failure_counted(peer_ip, &counters);
         bail!("invalid egress magic");
     };
     drop(unauth_permit);

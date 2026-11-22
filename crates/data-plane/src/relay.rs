@@ -112,6 +112,8 @@ pub(crate) struct ClientSession {
     pub(crate) user: String,
     pub(crate) transport: wire::ClientTransport,
     pub(crate) tls: Option<TlsReader>,
+    /// Client peer address from PROXY protocol v2 when enabled; otherwise `None` (falls back to `TcpStream::peer_addr`).
+    pub(crate) client_peer: Option<SocketAddr>,
     pub(crate) hello_read_us: u64,
     pub(crate) flight_written_us: Option<u64>,
     pub(crate) diag: HelloDiag,
@@ -141,15 +143,90 @@ pub(crate) async fn relay_client(
         user,
         transport,
         tls,
+        client_peer,
         hello_read_us,
         flight_written_us,
         diag,
     } = session;
     apply_bulk_mss(client, state.client_mss_bulk);
+    if let Some(me_rt) = &state.me {
+        let effective_peer = client_peer.or_else(|| client.peer_addr().ok());
+        let remote_addr = if me_rt.send_client_ip() {
+            me::extract_client_ipv4(effective_peer)
+        } else {
+            None
+        };
+        match me_rt.open_session(transport.dc, remote_addr, transport.kind) {
+            Ok(me_session) => {
+                let ad_tag_configured = me_rt.current_ad_tag().is_some();
+                return me::relay_me_session(
+                    client,
+                    state,
+                    session_id,
+                    t0,
+                    user,
+                    transport,
+                    tls,
+                    hello_read_us,
+                    flight_written_us,
+                    diag,
+                    me_session,
+                    ad_tag_configured,
+                )
+                .await;
+            }
+            Err(err) => {
+                if me_rt.fallback_to_direct() {
+                    me_rt.record_fallback_to_direct(session_id, transport.dc, &err.to_string());
+                } else {
+                    return Err(err.context("me_strict_no_healthy_connection"));
+                }
+            }
+        }
+    }
+    if let Some(edge_me) = &state.edge_me {
+        let effective_peer = client_peer.or_else(|| client.peer_addr().ok());
+        let remote_addr = if edge_me.send_client_ip {
+            me::extract_client_ipv4(effective_peer)
+        } else {
+            None
+        };
+        match connect_upstream_mtv4(state, transport.dc, transport.kind, remote_addr).await {
+            Ok((upstream, route)) => {
+                return me::relay_edge_mtv4_session(
+                    client,
+                    upstream,
+                    route,
+                    state,
+                    session_id,
+                    t0,
+                    user,
+                    transport,
+                    tls,
+                    hello_read_us,
+                    flight_written_us,
+                    diag,
+                )
+                .await;
+            }
+            Err(err) => {
+                if edge_me.fallback_to_direct {
+                    edge_me.record_fallback_to_direct(
+                        &state.counters,
+                        session_id,
+                        transport.dc,
+                        &err.to_string(),
+                    );
+                } else {
+                    return Err(err.context("edge_me_strict_no_healthy_egress"));
+                }
+            }
+        }
+    }
     let us = || t0.elapsed().as_micros() as u64;
     let framed = tls.is_some();
     let inner_header_us = us();
-    let dc = wire::dc_transport()?;
+    let dc = wire::dc_transport_for(transport.kind)?;
     let (upstream, route) = connect_upstream(state, transport.dc, &dc.header).await?;
     let dc_connected_us = us();
     telemetry::event(
@@ -159,7 +236,7 @@ pub(crate) async fn relay_client(
             "user":user,
             "dc":transport.dc,
             "route":route,
-            "transport":"padded-intermediate",
+            "transport":transport.kind.as_str(),
             "mode": if framed { "ee" } else { "dd" },
             "hello_read_us":hello_read_us,
             "flight_written_us":flight_written_us,

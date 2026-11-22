@@ -604,15 +604,14 @@ pub struct ClientTransport {
     pub decrypt: AesCtr,
     pub encrypt: AesCtr,
     pub dc: i16,
+    pub kind: crate::ClientProtoKind,
 }
 pub fn client_transport(wire: &[u8; 64], secret: &[u8; 16]) -> Result<ClientTransport> {
     let mut decrypt = cipher(&wire[8..40], &wire[40..56], secret)?;
     let mut plain = *wire;
     decrypt.apply_keystream(&mut plain);
-    ensure!(
-        plain[56..60] == [0xdd; 4],
-        "only padded intermediate supported"
-    );
+    let kind = crate::ClientProtoKind::from_tag([plain[56], plain[57], plain[58], plain[59]])
+        .ok_or_else(|| anyhow::anyhow!("unsupported inner transport"))?;
     let dc = i16::from_le_bytes([plain[60], plain[61]]);
     ensure!(
         (1..=5).contains(&dc.checked_abs().unwrap_or(0)),
@@ -624,6 +623,7 @@ pub fn client_transport(wire: &[u8; 64], secret: &[u8; 16]) -> Result<ClientTran
         decrypt,
         encrypt,
         dc,
+        kind,
     })
 }
 
@@ -633,6 +633,9 @@ pub struct DcTransport {
     pub decrypt: AesCtr,
 }
 pub fn dc_transport() -> Result<DcTransport> {
+    dc_transport_for(crate::ClientProtoKind::PaddedIntermediate)
+}
+pub fn dc_transport_for(kind: crate::ClientProtoKind) -> Result<DcTransport> {
     let mut plain = [0u8; 64];
     loop {
         OsRng.fill_bytes(&mut plain);
@@ -650,7 +653,7 @@ pub fn dc_transport() -> Result<DcTransport> {
             break;
         }
     }
-    plain[56..60].fill(0xdd);
+    plain[56..60].copy_from_slice(&kind.tag());
     let mut encrypt = cipher(&plain[8..40], &plain[40..56], &[])?;
     let reversed: Vec<_> = plain[8..56].iter().rev().copied().collect();
     let decrypt = cipher(&reversed[..32], &reversed[32..], &[])?;
@@ -763,6 +766,16 @@ pub fn verify_server_flight(
 /// Build the 64-byte obfuscated2 client init header for padded-intermediate mode (`0xdddddddd`)
 /// targeting `dc` and return `(wire_header, encrypt_cipher, decrypt_cipher)`.
 pub fn build_client_init(secret: &[u8; 16], dc: i16) -> Result<([u8; 64], AesCtr, AesCtr)> {
+    build_client_init_with_kind(secret, dc, crate::ClientProtoKind::PaddedIntermediate)
+}
+
+/// Build the 64-byte obfuscated2 client init header for the specified inner transport `kind`
+/// targeting `dc` and return `(wire_header, encrypt_cipher, decrypt_cipher)`.
+pub fn build_client_init_with_kind(
+    secret: &[u8; 16],
+    dc: i16,
+    kind: crate::ClientProtoKind,
+) -> Result<([u8; 64], AesCtr, AesCtr)> {
     ensure!(
         (1..=5).contains(&dc.checked_abs().unwrap_or(0)),
         "invalid DC"
@@ -784,7 +797,7 @@ pub fn build_client_init(secret: &[u8; 16], dc: i16) -> Result<([u8; 64], AesCtr
             break;
         }
     }
-    plain[56..60].fill(0xdd);
+    plain[56..60].copy_from_slice(&kind.tag());
     plain[60..62].copy_from_slice(&dc.to_le_bytes());
     let mut encrypt = cipher(&plain[8..40], &plain[40..56], secret)?;
     let reversed: Vec<_> = plain[8..56].iter().rev().copied().collect();
@@ -803,9 +816,21 @@ const PROXY_V2_SIG: [u8; 12] = [
 
 pub const EGRESS_MAGIC_V2: [u8; 4] = *b"MTV2";
 pub const EGRESS_MAGIC_V3: [u8; 4] = *b"MTV3";
+pub const EGRESS_MAGIC_V4: [u8; 4] = *b"MTV4";
 pub const EGRESS_PREFACE_V2_LEN: usize = 88;
 pub const EGRESS_PREFACE_V3_LEN: usize = 126;
+pub const EGRESS_PREFACE_V4_LEN: usize = 70;
 pub const EGRESS_V3_MAX_SKEW_SECS: u64 = 30;
+pub const MTV4_FLAG_HAS_CLIENT_IP: u8 = 0x01;
+pub const MTV4_FLAG_PROTO_MASK: u8 = 0x06;
+pub const MTV4_FLAG_PROTO_PADDED_INTERMEDIATE: u8 = 0x00;
+pub const MTV4_FLAG_PROTO_INTERMEDIATE: u8 = 0x02;
+pub const MTV4_FLAG_PROTO_ABRIDGED: u8 = 0x04;
+pub const MTV4_FRAME_HEADER_LEN: usize = 5;
+pub const MTV4_FRAME_PAYLOAD: u8 = 0x01;
+pub const MTV4_FRAME_QUICK_ACK: u8 = 0x02;
+pub const MTV4_FRAME_EOF: u8 = 0x03;
+pub const MTV4_FRAME_PAYLOAD_QUICK_ACK: u8 = 0x04;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EgressPrefaceV3 {
@@ -878,6 +903,232 @@ pub fn verify_egress_preface_v3(
         nonce,
         dc_header,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EgressPrefaceV4 {
+    pub dc: i16,
+    pub timestamp: u64,
+    pub nonce: [u8; 16],
+    pub flags: u8,
+    pub proto: crate::ClientProtoKind,
+    pub client_addr: Option<std::net::SocketAddrV4>,
+}
+
+/// Build an authenticated 70-byte `MTV4` preface for split `edge -> egress` ME mode
+/// (defaulting client transport flags to `PaddedIntermediate`).
+pub fn build_egress_preface_v4(
+    token: &[u8; 16],
+    dc: i16,
+    timestamp: u64,
+    nonce: &[u8; 16],
+    client_addr: Option<std::net::SocketAddrV4>,
+) -> Result<[u8; EGRESS_PREFACE_V4_LEN]> {
+    build_egress_preface_v4_with_proto(
+        token,
+        dc,
+        timestamp,
+        nonce,
+        crate::ClientProtoKind::PaddedIntermediate,
+        client_addr,
+    )
+}
+
+/// Build an authenticated 70-byte `MTV4` preface for split `edge -> egress` ME mode,
+/// encoding both the client transport kind and optional `client_addr` inside the HMAC header.
+pub fn build_egress_preface_v4_with_proto(
+    token: &[u8; 16],
+    dc: i16,
+    timestamp: u64,
+    nonce: &[u8; 16],
+    proto: crate::ClientProtoKind,
+    client_addr: Option<std::net::SocketAddrV4>,
+) -> Result<[u8; EGRESS_PREFACE_V4_LEN]> {
+    ensure!(
+        (1..=5).contains(&dc.checked_abs().unwrap_or(0)),
+        "invalid MTV4 DC id"
+    );
+    let mut signed = [0u8; 38];
+    signed[..4].copy_from_slice(&EGRESS_MAGIC_V4);
+    signed[4..6].copy_from_slice(&dc.to_be_bytes());
+    signed[6..14].copy_from_slice(&timestamp.to_be_bytes());
+    signed[14..30].copy_from_slice(nonce);
+    let mut flags = match proto {
+        crate::ClientProtoKind::PaddedIntermediate => MTV4_FLAG_PROTO_PADDED_INTERMEDIATE,
+        crate::ClientProtoKind::Intermediate => MTV4_FLAG_PROTO_INTERMEDIATE,
+        crate::ClientProtoKind::Abridged => MTV4_FLAG_PROTO_ABRIDGED,
+    };
+    if let Some(addr) = client_addr {
+        flags |= MTV4_FLAG_HAS_CLIENT_IP;
+        signed[32..36].copy_from_slice(&addr.ip().octets());
+        signed[36..38].copy_from_slice(&addr.port().to_be_bytes());
+    }
+    signed[30] = flags;
+    signed[31] = 0;
+    let tag = mac(token, &signed)?;
+    let mut out = [0u8; EGRESS_PREFACE_V4_LEN];
+    out[..38].copy_from_slice(&signed);
+    out[38..70].copy_from_slice(&tag);
+    Ok(out)
+}
+
+/// Verify an authenticated 70-byte `MTV4` preface (magic, HMAC-SHA256, timestamp skew, flags, DC).
+pub fn verify_egress_preface_v4(
+    preface: &[u8; EGRESS_PREFACE_V4_LEN],
+    token: &[u8; 16],
+    now_secs: u64,
+    max_skew_secs: u64,
+) -> Result<EgressPrefaceV4> {
+    ensure!(preface[..4] == EGRESS_MAGIC_V4, "invalid MTV4 magic");
+    let expected_tag = mac(token, &preface[..38])?;
+    ensure!(
+        bool::from(preface[38..70].ct_eq(&expected_tag)),
+        "egress MTV4 HMAC mismatch"
+    );
+    let dc = i16::from_be_bytes([preface[4], preface[5]]);
+    ensure!(
+        (1..=5).contains(&dc.checked_abs().unwrap_or(0)),
+        "invalid MTV4 DC id"
+    );
+    let timestamp = u64::from_be_bytes([
+        preface[6],
+        preface[7],
+        preface[8],
+        preface[9],
+        preface[10],
+        preface[11],
+        preface[12],
+        preface[13],
+    ]);
+    ensure!(
+        now_secs.abs_diff(timestamp) <= max_skew_secs,
+        "egress MTV4 timestamp skew exceeds {max_skew_secs}s"
+    );
+    let mut nonce = [0u8; 16];
+    nonce.copy_from_slice(&preface[14..30]);
+    let flags = preface[30];
+    let reserved = preface[31];
+    ensure!(
+        (flags & !(MTV4_FLAG_HAS_CLIENT_IP | MTV4_FLAG_PROTO_MASK)) == 0 && reserved == 0,
+        "unsupported MTV4 flags or reserved byte"
+    );
+    let proto = match flags & MTV4_FLAG_PROTO_MASK {
+        MTV4_FLAG_PROTO_PADDED_INTERMEDIATE => crate::ClientProtoKind::PaddedIntermediate,
+        MTV4_FLAG_PROTO_INTERMEDIATE => crate::ClientProtoKind::Intermediate,
+        MTV4_FLAG_PROTO_ABRIDGED => crate::ClientProtoKind::Abridged,
+        _ => anyhow::bail!("unsupported MTV4 client protocol bits"),
+    };
+    let client_addr = if (flags & MTV4_FLAG_HAS_CLIENT_IP) != 0 {
+        let ip = std::net::Ipv4Addr::new(preface[32], preface[33], preface[34], preface[35]);
+        let port = u16::from_be_bytes([preface[36], preface[37]]);
+        Some(std::net::SocketAddrV4::new(ip, port))
+    } else {
+        None
+    };
+    Ok(EgressPrefaceV4 {
+        dc,
+        timestamp,
+        nonce,
+        flags,
+        proto,
+        client_addr,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mtv4Frame {
+    Payload(Vec<u8>),
+    PayloadQuickAck(Vec<u8>),
+    QuickAck(u32),
+    Eof,
+}
+
+/// Validate a 5-byte `MTV4` frame header (`[kind: u8][len: u32 BE]`) before allocating the body (INV-08).
+pub fn parse_mtv4_frame_header(header: &[u8; MTV4_FRAME_HEADER_LEN]) -> Result<(u8, usize)> {
+    let kind = header[0];
+    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    match kind {
+        MTV4_FRAME_PAYLOAD | MTV4_FRAME_PAYLOAD_QUICK_ACK => {
+            ensure!(
+                (4..=crate::MAX_MTPROTO_FRAME_LEN).contains(&len) && len.is_multiple_of(4),
+                "MTV4 payload frame length {len} out of bounds or unaligned"
+            );
+        }
+        MTV4_FRAME_QUICK_ACK => {
+            ensure!(len == 4, "MTV4 quick-ack frame length must be 4, got {len}");
+        }
+        MTV4_FRAME_EOF => {
+            ensure!(len == 0, "MTV4 EOF frame length must be 0, got {len}");
+        }
+        _ => anyhow::bail!("unknown MTV4 frame kind {kind}"),
+    }
+    Ok((kind, len))
+}
+
+/// Encode an `MTV4` frame into `[kind: u8][len: u32 BE][body]`.
+pub fn encode_mtv4_frame(frame: &Mtv4Frame) -> Result<Vec<u8>> {
+    match frame {
+        Mtv4Frame::Payload(body) | Mtv4Frame::PayloadQuickAck(body) => {
+            ensure!(
+                (4..=crate::MAX_MTPROTO_FRAME_LEN).contains(&body.len())
+                    && body.len().is_multiple_of(4),
+                "MTV4 payload length {} invalid",
+                body.len()
+            );
+            let kind = if matches!(frame, Mtv4Frame::PayloadQuickAck(_)) {
+                MTV4_FRAME_PAYLOAD_QUICK_ACK
+            } else {
+                MTV4_FRAME_PAYLOAD
+            };
+            let mut out = Vec::with_capacity(MTV4_FRAME_HEADER_LEN + body.len());
+            out.push(kind);
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            out.extend_from_slice(body);
+            Ok(out)
+        }
+        Mtv4Frame::QuickAck(confirm_key) => {
+            let mut out = Vec::with_capacity(MTV4_FRAME_HEADER_LEN + 4);
+            out.push(MTV4_FRAME_QUICK_ACK);
+            out.extend_from_slice(&4u32.to_be_bytes());
+            out.extend_from_slice(&confirm_key.to_be_bytes());
+            Ok(out)
+        }
+        Mtv4Frame::Eof => {
+            let mut out = Vec::with_capacity(MTV4_FRAME_HEADER_LEN);
+            out.push(MTV4_FRAME_EOF);
+            out.extend_from_slice(&0u32.to_be_bytes());
+            Ok(out)
+        }
+    }
+}
+
+/// Decode one `MTV4` frame from `buf` (validating bounds before allocation, INV-08).
+pub fn decode_mtv4_frame_from_slice(buf: &mut Vec<u8>) -> Result<Option<Mtv4Frame>> {
+    if buf.len() < MTV4_FRAME_HEADER_LEN {
+        return Ok(None);
+    }
+    let hdr: [u8; MTV4_FRAME_HEADER_LEN] = [buf[0], buf[1], buf[2], buf[3], buf[4]];
+    let (kind, len) = parse_mtv4_frame_header(&hdr)?;
+    let total = MTV4_FRAME_HEADER_LEN
+        .checked_add(len)
+        .ok_or_else(|| anyhow::anyhow!("MTV4 frame total length overflow"))?;
+    if buf.len() < total {
+        return Ok(None);
+    }
+    let frame = match kind {
+        MTV4_FRAME_PAYLOAD => Mtv4Frame::Payload(buf[MTV4_FRAME_HEADER_LEN..total].to_vec()),
+        MTV4_FRAME_PAYLOAD_QUICK_ACK => {
+            Mtv4Frame::PayloadQuickAck(buf[MTV4_FRAME_HEADER_LEN..total].to_vec())
+        }
+        MTV4_FRAME_QUICK_ACK => {
+            let key = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]);
+            Mtv4Frame::QuickAck(key)
+        }
+        MTV4_FRAME_EOF => Mtv4Frame::Eof,
+        _ => anyhow::bail!("unknown MTV4 frame kind {kind}"),
+    };
+    buf.drain(..total);
+    Ok(Some(frame))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1292,6 +1543,63 @@ mod tests {
             m[pos] ^= 0x77;
             let _ = verify_egress_preface_v3(&m, &token, now, EGRESS_V3_MAX_SKEW_SECS);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn mtv4_preface_and_frame_verification_and_bounds() -> Result<()> {
+        let token = [0x5a; 16];
+        let now = 1_700_000_000u64;
+        let nonce = [0x33; 16];
+        let client = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(198, 51, 100, 9), 41234);
+
+        // With client_addr
+        let p = build_egress_preface_v4(&token, -2, now, &nonce, Some(client))?;
+        let v = verify_egress_preface_v4(&p, &token, now + 5, EGRESS_V3_MAX_SKEW_SECS)?;
+        assert_eq!(v.dc, -2);
+        assert_eq!(v.nonce, nonce);
+        assert_eq!(v.client_addr, Some(client));
+
+        // Without client_addr
+        let p0 = build_egress_preface_v4(&token, 2, now, &nonce, None)?;
+        let v0 = verify_egress_preface_v4(&p0, &token, now, EGRESS_V3_MAX_SKEW_SECS)?;
+        assert_eq!(v0.client_addr, None);
+
+        // Tampered client IP or HMAC rejected
+        let mut bad_ip = p;
+        bad_ip[32] ^= 1;
+        assert!(verify_egress_preface_v4(&bad_ip, &token, now, EGRESS_V3_MAX_SKEW_SECS).is_err());
+
+        // Timestamp skew rejected
+        assert!(verify_egress_preface_v4(&p, &token, now + 31, EGRESS_V3_MAX_SKEW_SECS).is_err());
+
+        // Frame encode/decode roundtrip + INV-08 oversize rejected before alloc
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&encode_mtv4_frame(&Mtv4Frame::Payload(vec![0xab; 64]))?);
+        stream.extend_from_slice(&encode_mtv4_frame(&Mtv4Frame::QuickAck(0xdead_beef))?);
+        stream.extend_from_slice(&encode_mtv4_frame(&Mtv4Frame::Eof)?);
+        assert_eq!(
+            decode_mtv4_frame_from_slice(&mut stream)?,
+            Some(Mtv4Frame::Payload(vec![0xab; 64]))
+        );
+        assert_eq!(
+            decode_mtv4_frame_from_slice(&mut stream)?,
+            Some(Mtv4Frame::QuickAck(0xdead_beef))
+        );
+        assert_eq!(
+            decode_mtv4_frame_from_slice(&mut stream)?,
+            Some(Mtv4Frame::Eof)
+        );
+        assert!(stream.is_empty());
+
+        let oversize_len = (crate::MAX_MTPROTO_FRAME_LEN as u32) + 4;
+        let mut oversize_hdr = [0u8; MTV4_FRAME_HEADER_LEN];
+        oversize_hdr[0] = MTV4_FRAME_PAYLOAD;
+        oversize_hdr[1..5].copy_from_slice(&oversize_len.to_be_bytes());
+        assert!(parse_mtv4_frame_header(&oversize_hdr).is_err());
+        assert!(parse_mtv4_frame_header(&[MTV4_FRAME_QUICK_ACK, 0, 0, 0, 8]).is_err());
+        assert!(parse_mtv4_frame_header(&[MTV4_FRAME_EOF, 0, 0, 0, 4]).is_err());
+        assert!(parse_mtv4_frame_header(&[0x99, 0, 0, 0, 4]).is_err());
         Ok(())
     }
 }

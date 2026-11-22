@@ -17,7 +17,7 @@ LABEL org.opencontainers.image.title="mtevil" \
       org.opencontainers.image.revision="${MTEVIL_REVISION}" \
       org.opencontainers.image.description="Experimental MTProto Direct proxy"
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates openssl \
+    && apt-get install -y --no-install-recommends ca-certificates openssl curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 mtevil \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin mtevil \

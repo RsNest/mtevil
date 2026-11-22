@@ -31,6 +31,7 @@ mod connect;
 mod cover;
 mod egress_health;
 mod egress_server;
+mod me;
 mod relay;
 mod serve;
 
@@ -296,6 +297,7 @@ impl Args {
                 .unwrap_or_else(config::default_cover_dns_ttl_secs),
             diagnostics: self.diagnostics,
             metrics_listen: self.metrics_listen,
+            me: config::MeConfig::default(),
         };
         config.validate()?;
         Ok(config)
@@ -317,6 +319,9 @@ struct State {
     egress_token: [u8; 16],
     egress_rr: std::sync::atomic::AtomicUsize,
     egress_health: std::sync::Mutex<EgressHealth>,
+    /// Per-egress cooldown strictly for `MTV4` (when an egress rejects `MTV4` or is `v0.2.0`),
+    /// kept separate from `EgressHealth` so `MTV3` Direct fallback is never penalized.
+    mtv4_cooldown: std::sync::Mutex<Vec<Option<Instant>>>,
     egress_probe_notify: Arc<tokio::sync::Notify>,
     egress_cooldown: Duration,
     egress_cooldown_max: Duration,
@@ -336,6 +341,8 @@ struct State {
     alert_webhook_url: Option<String>,
     alerts_file: Option<PathBuf>,
     diagnostics: bool,
+    me: Option<Arc<me::MeRuntime>>,
+    edge_me: Option<Arc<me::EdgeMeSettings>>,
 }
 
 impl State {
@@ -430,6 +437,7 @@ fn write_runtime_stats_atomic(
     path: &std::path::Path,
     counters: &telemetry::Counters,
     role: &str,
+    me: Option<&me::MeRuntime>,
 ) -> Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
@@ -437,7 +445,8 @@ fn write_runtime_stats_atomic(
             return Ok(());
         }
     }
-    let val = counters.snapshot_json(role);
+    let me_snap = me.map(me::MeRuntime::telemetry_snapshot);
+    let val = counters.snapshot_json_with_me(role, me_snap.as_ref());
     let encoded = serde_json::to_string(&val)?;
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     let mut f = std::fs::OpenOptions::new()
@@ -456,10 +465,11 @@ fn spawn_stats_writer(
     role: &'static str,
     path: PathBuf,
     period: Duration,
+    me: Option<Arc<me::MeRuntime>>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     counters.ensure_started();
-    let _ = write_runtime_stats_atomic(&path, &counters, role);
+    let _ = write_runtime_stats_atomic(&path, &counters, role, me.as_deref());
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(period);
         interval.tick().await;
@@ -468,9 +478,9 @@ fn spawn_stats_writer(
                 _ = interval.tick() => {}
                 _ = &mut stop_rx => break,
             }
-            let _ = write_runtime_stats_atomic(&path, &counters, role);
+            let _ = write_runtime_stats_atomic(&path, &counters, role, me.as_deref());
         }
-        let _ = write_runtime_stats_atomic(&path, &counters, role);
+        let _ = write_runtime_stats_atomic(&path, &counters, role, me.as_deref());
     })
 }
 
@@ -887,12 +897,22 @@ async fn main() -> Result<()> {
         );
         let counters = Arc::new(telemetry::Counters::default());
         counters.ensure_started();
+        let me_cache_dir = stats_path
+            .parent()
+            .map(|d| d.join("me-cache"))
+            .unwrap_or_else(|| PathBuf::from("/var/lib/mtevil-replay/me-cache"));
+        let egress_me_rt = if config.me.enabled {
+            Some(me::MeRuntime::start(config.me.clone(), me_cache_dir, counters.clone()).await)
+        } else {
+            None
+        };
         let (stats_stop_tx, stats_stop_rx) = tokio::sync::oneshot::channel::<()>();
         let stats_task = spawn_stats_writer(
             counters.clone(),
             "egress",
             stats_path,
             Duration::from_millis(500),
+            egress_me_rt.clone(),
             stats_stop_rx,
         );
         let (metrics_stop_tx, metrics_stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -921,6 +941,7 @@ async fn main() -> Result<()> {
                 .egress_nonce_cache_capacity
                 .unwrap_or_else(|| config::default_egress_nonce_cache_capacity(effective_max)),
             dc_media_overrides: dc_media_overrides.clone(),
+            me: egress_me_rt.clone(),
         };
         let dcs_arc = Arc::new(dcs);
         let dc_monitor = (config.dc_probe_interval_secs > 0).then(|| {
@@ -958,6 +979,9 @@ async fn main() -> Result<()> {
         if let Some(task) = dc_monitor {
             task.abort();
             let _ = task.await;
+        }
+        if let Some(me_rt) = &egress_me_rt {
+            me_rt.shutdown();
         }
         let _ = metrics_stop_tx.send(());
         if let Some(task) = metrics_task {
@@ -1007,6 +1031,26 @@ async fn main() -> Result<()> {
     ));
     let handshake_dur = Duration::from_secs(config.handshake_timeout_secs);
     let _ = cover_resolver.refresh_once(handshake_dur, &counters).await;
+    let me_cache_dir = config
+        .replay_file
+        .as_ref()
+        .and_then(|p| p.parent().map(|d| d.join("me-cache")))
+        .or_else(|| stats_path.parent().map(|d| d.join("me-cache")))
+        .unwrap_or_else(|| PathBuf::from("/var/lib/mtevil-replay/me-cache"));
+    let is_edge_role = config.role == Role::Edge || !config.egress_upstreams.is_empty();
+    let me_runtime = if config.me.enabled && !is_edge_role {
+        Some(me::MeRuntime::start(config.me.clone(), me_cache_dir, counters.clone()).await)
+    } else {
+        None
+    };
+    let edge_me_settings = if config.me.enabled && is_edge_role {
+        Some(Arc::new(me::EdgeMeSettings::new(
+            config.me.fallback_to_direct,
+            config.me.send_client_ip,
+        )))
+    } else {
+        None
+    };
     let state = Arc::new(State {
         secrets: std::sync::RwLock::new(Arc::new(secrets)),
         sni: config.sni,
@@ -1022,6 +1066,7 @@ async fn main() -> Result<()> {
         egress_token,
         egress_rr: std::sync::atomic::AtomicUsize::new(0),
         egress_health: std::sync::Mutex::new(EgressHealth::new(egress_count)),
+        mtv4_cooldown: std::sync::Mutex::new(vec![None; egress_count]),
         egress_probe_notify: Arc::new(tokio::sync::Notify::new()),
         egress_cooldown: Duration::from_millis(config.egress_cooldown_base_ms),
         egress_cooldown_max: Duration::from_millis(config.egress_cooldown_max_ms),
@@ -1046,6 +1091,8 @@ async fn main() -> Result<()> {
         alert_webhook_url: config.alert_webhook_url,
         alerts_file,
         diagnostics: config.diagnostics,
+        me: me_runtime.clone(),
+        edge_me: edge_me_settings,
     });
     let role_str: &'static str = if state.egress_upstreams.is_empty() {
         "direct"
@@ -1058,6 +1105,7 @@ async fn main() -> Result<()> {
         role_str,
         stats_path,
         Duration::from_millis(500),
+        me_runtime.clone(),
         stats_stop_rx,
     );
     let (metrics_stop_tx, metrics_stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1190,6 +1238,9 @@ async fn main() -> Result<()> {
     .await;
     let _ = stats_stop_tx.send(());
     let _ = stats_task.await;
+    if let Some(me_rt) = &state.me {
+        me_rt.shutdown();
+    }
     let _ = metrics_stop_tx.send(());
     if let Some(task) = metrics_task {
         let _ = task.await;

@@ -74,6 +74,7 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         egress_token: [0u8; 16],
         egress_rr: std::sync::atomic::AtomicUsize::new(0),
         egress_health: std::sync::Mutex::new(EgressHealth::new(0)),
+        mtv4_cooldown: std::sync::Mutex::new(Vec::new()),
         egress_probe_notify: Arc::new(tokio::sync::Notify::new()),
         egress_cooldown: Duration::from_millis(config::default_egress_cooldown_base_ms()),
         egress_cooldown_max: Duration::from_millis(config::default_egress_cooldown_max_ms()),
@@ -95,6 +96,8 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         alert_webhook_url: None,
         alerts_file: None,
         diagnostics: false,
+        me: None,
+        edge_me: None,
     })
 }
 
@@ -1274,6 +1277,7 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
         diagnostics: false,
         metrics_listen: None,
+        me: config::MeConfig::default(),
     };
 
     let mut proxy_state = state(cover.addr, dc_addr);
@@ -1604,7 +1608,7 @@ async fn runtime_stats_file_tracks_edge_and_egress_byte_counters() -> Result<()>
     let dir = std::env::temp_dir().join(format!("mtevil-stats-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let stats_file = dir.join("runtime-stats.json");
-    write_runtime_stats_atomic(&stats_file, &edge_state.counters, "edge")?;
+    write_runtime_stats_atomic(&stats_file, &edge_state.counters, "edge", None)?;
     let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&stats_file)?)?;
     assert_eq!(parsed["role"].as_str(), Some("edge"));
     assert_eq!(
@@ -1715,6 +1719,7 @@ async fn probe_telegram_e2e_verifies_handshake_and_res_pq_reply() -> Result<()> 
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
         diagnostics: false,
         metrics_listen: None,
+        me: config::MeConfig::default(),
     };
 
     let rtt_ms = probe_telegram_e2e(&cfg, proxy_addr, 2, Duration::from_secs(3)).await?;
@@ -2125,6 +2130,7 @@ async fn allowed_sni_file_accepts_previous_and_current_sni_without_breaking_link
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
         diagnostics: false,
         metrics_listen: None,
+        me: config::MeConfig::default(),
     };
     assert_eq!(cfg.allowed_snis(), "ya.ru,example.com,vk.com");
 
@@ -2897,6 +2903,7 @@ async fn egress_mtv3_verifies_hmac_rejects_replay_skew_legacy_toggle_and_securit
         max_unauth_handshakes: 2,
         dc_media_overrides: default_media_override_map(),
         nonce_cache_capacity: 16_384,
+        me: None,
     };
     let egress_task = tokio::spawn(serve_egress_with_security(
         egress_listener,
@@ -3021,6 +3028,7 @@ async fn egress_mtv3_verifies_hmac_rejects_replay_skew_legacy_toggle_and_securit
         max_unauth_handshakes: 1,
         dc_media_overrides: default_media_override_map(),
         nonce_cache_capacity: 16_384,
+        me: None,
     };
     let egress2_task = tokio::spawn(serve_egress_with_security(
         egress2_listener,
@@ -4451,8 +4459,15 @@ async fn inv10_f23_signaled_down_does_not_cascade_failures_or_inflate_cooldown()
             else {
                 return Err(anyhow::anyhow!("node 0 must be claimable"));
             };
-            let res =
-                dial_egress_candidate(&st_c, 0, 2, 2, &[0x11; 64], Duration::from_secs(5)).await;
+            let res = dial_egress_candidate(
+                &st_c,
+                0,
+                2,
+                2,
+                connect::EgressDialMode::DirectStream(&[0x11; 64]),
+                Duration::from_secs(5),
+            )
+            .await;
             let Err(err) = res else {
                 return Err(anyhow::anyhow!("all 30 attempts must fail"));
             };
@@ -4553,7 +4568,16 @@ async fn inv10_f23_ack_timeout_after_preface_is_dc_level_while_connect_timeout_i
 
     let claim_a =
         EgressHealth::try_claim(&st.egress_health, 0, 2, Instant::now()).context("claim DC-A")?;
-    let Err(err_a) = dial_egress_candidate(&st, 0, 2, 2, &[0x11; 64], actual_per_try).await else {
+    let Err(err_a) = dial_egress_candidate(
+        &st,
+        0,
+        2,
+        2,
+        connect::EgressDialMode::DirectStream(&[0x11; 64]),
+        actual_per_try,
+    )
+    .await
+    else {
         anyhow::bail!("DC-A must time out waiting for ACK");
     };
     assert!(
@@ -4613,8 +4637,15 @@ async fn inv10_f23_ack_timeout_after_preface_is_dc_level_while_connect_timeout_i
 
     let claim_dead = EgressHealth::try_claim(&st2.egress_health, 0, 2, Instant::now())
         .context("claim dead node")?;
-    let Err(err_dead) =
-        dial_egress_candidate(&st2, 0, 2, 2, &[0x33; 64], Duration::from_secs(1)).await
+    let Err(err_dead) = dial_egress_candidate(
+        &st2,
+        0,
+        2,
+        2,
+        connect::EgressDialMode::DirectStream(&[0x33; 64]),
+        Duration::from_secs(1),
+    )
+    .await
     else {
         anyhow::bail!("closed port must fail");
     };
@@ -4892,7 +4923,7 @@ async fn inv10_f23_hung_egress_30_parallel_single_escalation_and_base_cooldown()
                 0,
                 dc,
                 dc.abs(),
-                &[0x11; 64],
+                connect::EgressDialMode::DirectStream(&[0x11; 64]),
                 Duration::from_millis(300),
             )
             .await;

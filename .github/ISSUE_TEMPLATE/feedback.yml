@@ -6,14 +6,14 @@ body:
   - type: markdown
     attributes:
       value: |
-        Пожалуйста, **не прикладывайте** секреты (`proxy-secret`, `egress-token`, `users.json`), приватные ссылки `t.me/proxy` и реальные IP-адреса серверов.
+        Пожалуйста, **не прикладывайте** секреты (`proxy-secret`, `egress-token`, `users.json`, `ad_tag`), приватные ссылки `t.me/proxy` и реальные IP-адреса серверов.
 
   - type: input
     id: version
     attributes:
       label: Версия mtevil
-      description: Например, v0.2.0 (можно посмотреть в выводе `mtevilctl status`).
-      placeholder: v0.2.0
+      description: Например, v0.3.0 (можно посмотреть в выводе `mtevilctl status`).
+      placeholder: v0.3.0
     validations:
       required: true
 
@@ -24,6 +24,17 @@ body:
       options:
         - direct
         - edge + egress
+    validations:
+      required: true
+
+  - type: dropdown
+    id: me_mode
+    attributes:
+      label: Режим Middle-End (ME / ad_tag)
+      options:
+        - Выключен (Direct, по умолчанию)
+        - Включён без ad_tag
+        - Включён с ad_tag
     validations:
       required: true
 

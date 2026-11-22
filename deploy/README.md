@@ -154,7 +154,15 @@ python3 deploy/setup.py --mode advanced --network-host
   - **SharX:** IP mesh-интерфейса (например, `10.203.0.x`), слушающего на данной ноде.
   - **WireGuard / AmneziaWG:** локальный IP `wg*`/`awg*`-интерфейса (например, `10.250.x.y`).
 - Для отказоустойчивости маршруты от `edge` к основному и резервному `egress` должны идти по **независимым** туннелям/путям.
-- **Важно:** между `edge` и `egress` по умолчанию используется протокол `MTV3` (`magic | dc | timestamp | nonce | HMAC-SHA256(token, magic||dc||timestamp||nonce||dc_header)` с constant-time проверкой, окном `±30 с` и replay-кэшем `nonce`), при этом `egress` по умолчанию принимает и `MTV2` (`egress_accept_legacy = true`) для плавного обновления (сначала обновляется `egress`, затем `edge`). На `egress` дополнительно поддерживаются список разрешённых CIDR источников (`egress_allow_from`, по умолчанию пусто), лимит неудачных попыток на IP в 60-секундном скользящем окне (`egress_max_failed_per_ip`, по умолчанию `16`), отдельный лимит одновременных незавершённых handshake и предупреждение `egress_public_listen_warning` при привязке не к loopback/приватному адресу. Шифрование канала между `edge` и `egress` обеспечивает сам туннель (SharX / WG / AWG).
+- **Важно:** между `edge` и `egress` по умолчанию используется протокол `MTV3` (`magic | dc | timestamp | nonce | HMAC-SHA256(token, magic||dc||timestamp||nonce||dc_header)` с constant-time проверкой, окном `±30 с` и replay-кэшем `nonce`), при этом `egress` по умолчанию принимает и `MTV2` (`egress_accept_legacy = true`) для плавного обновления. При включённом режиме Middle-End (`me.enabled = true`) между `edge` и `egress` используется протокол `MTV4` с поддержкой `ad_tag`, фреймингом и отдельным cooldown `MTV4` (`30 с`) на случай, если часть узлов `egress` ещё на `v0.2.0` (трафик прозрачно переходит на `MTV3` Direct при `fallback_to_direct = true`, без блокировки узла для Direct). При обновлении схемы `edge → egress` **всегда обновляйте сначала все узлы `egress` (резервный → основной), затем `edge`**. На `egress` дополнительно поддерживаются список разрешённых CIDR источников (`egress_allow_from`, по умолчанию пусто), лимит неудачных попыток на IP в 60-секундном скользящем окне (`egress_max_failed_per_ip`, по умолчанию `16`), отдельный лимит одновременных незавершённых handshake и предупреждение `egress_public_listen_warning` при привязке не к loopback/приватному адресу. Шифрование канала между `edge` и `egress` обеспечивает сам туннель (SharX / WG / AWG).
+
+### Режим Middle-End (ME), `ad_tag`, приватность и NAT/bridge
+
+- По умолчанию `me.enabled = false`; существующие конфиги работают в режиме Direct без изменений.
+- В расширенном режиме мастера (`mtevilctl setup` / `deploy/setup.py --mode advanced`) можно включить ME (`direct`, `egress`, `edge`), задать `me.public_ipv4` (обязателен за 1:1 NAT и в Docker `bridge`), `me.pool_size` (по умолчанию `2`), `me.fallback_to_direct` (`true`) и `me.send_client_ip` (`true`).
+- **Рекламный тег (`ad_tag`, 32 hex из `@MTProxybot`):** управляйте им через `mtevilctl adtag set`, `show`, `clear`. **Рекомендуется запускать `mtevilctl adtag set` без аргумента** (скрытый ввод в терминале или через `stdin`), чтобы не оставлять тег в истории shell. Файл записывается в том `state` с правами `0600`, владельцем `10001:10001` и проверкой чтения от UID `10001`; демон перечитывает его автоматически каждые `2 с` без перезапуска контейнера.
+- **Приватность:** при `me.send_client_ip = true` (по умолчанию) Telegram получает реальный IPv4 клиента в `RPC_PROXY_REQ` (при включённом `proxy_protocol` — из PROXY protocol v2; для IPv6-клиентов передаётся `0.0.0.0:0`). В split-схеме передача IP клиента активна только при `send_client_ip = true` на обоих узлах (AND-логика); на `egress` клиентский IP не логируется. Значение `me.send_client_ip = false` (`0.0.0.0:0`) помечено как экспериментальное до проверки полной сессии реальным клиентом Telegram.
+- **Статус и откат:** `mtevilctl status` показывает состояние ME-пула, статус `ad_tag` (значение маскируется) и предупреждение, если ME включён на `edge` (напоминание включить ME и обновить все `egress`). При `mtevilctl rollback` или `mtevilctl update --version v0.2.0` несовместимый блок `me` автоматически вырезается из `config.json` с сохранением резервной копии `config.json.pre-me-downgrade` (`0600`). Подробная инструкция ручной проверки ME — [docs/me-manual-test.md](../docs/me-manual-test.md).
 
 ### Что происходит при сбое egress и оповещения (`edge-alerts.jsonl`)
 
@@ -174,10 +182,13 @@ mtevilctl status                 # Версия, роль, SNI, статус к�
 mtevilctl link                   # Показать текущую ссылку для подключения (--sni <домен>, --user <имя>, --all)
 mtevilctl sni [домен]            # Сменить основной SNI с сохранением работы прежних ссылок (/var/lib/mtevil/allowed-sni.txt)
 mtevilctl user add <имя>         # Добавить пользователя и вывести его ссылку (user list / user del <имя>)
+mtevilctl adtag set              # Задать рекламный тег ME (@MTProxybot) скрытым вводом (без истории shell)
+mtevilctl adtag show             # Показать статус рекламного тега ME (значение маскируется)
+mtevilctl adtag clear            # Удалить рекламный тег ME
 mtevilctl setup                  # Запустить интерактивный мастер перенастройки текущей установки (reconfigure)
 mtevilctl update                 # Обновить до свежего стабильного релиза (с re-exec, проверкой Telegram и автооткатом)
 mtevilctl update --prerelease    # Обновить с учётом предварительных релизов (alpha/beta/rc)
-mtevilctl update --version v0.1.0-rc.1  # Установить конкретный тег (переопределяет канал)
+mtevilctl update --version v0.2.0  # Установить конкретный тег (при понижении до v0.2.0 блок me вырезается с бэкапом)
 mtevilctl rollback               # Откатить к предыдущему рабочему образу и конфигу локально (без интернета)
 mtevilctl traffic                # Активные сессии, байты по направлениям/участкам и период счётчиков
 mtevilctl traffic --live         # Обновление раз в секунду: скорость приёма/отдачи, отключения, ретрансмиссии TCP

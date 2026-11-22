@@ -47,6 +47,10 @@ Phase 0 (F1–F10 в phase-0.md §9) — подмножество; столбе�
 | F-33 | TCP zero window клиента | PostCommit | backpressure по outbound, deadline → graceful close | budget_stall_timeout | INV-03 | netem |
 | F-34 | Reordering/dup на пути | обе | корректность FIFO per-client сохраняется | fifo_violations (должно быть 0) | INV-05 | netem |
 | F-35 | Lie-пакеты/пробинг под нагрузкой | PreAuth | те же ответы P01–P11, что и без нагрузки | probe_pass_rate_under_load | INV-04, §10 | P11 |
+| F-36 | ME-сокет перестал читать/отвечать под нагрузкой (`write_timeout` / `ping_timeout`) | PostCommit | writer/pinger срабатывает по таймауту (`10 с` по умолчанию) → `shutdown_shared` через `watch::channel(false)`, активные сессии получают EOF, пул переподключается без утечки задач/FD | mtevil_me_pool_connected, mtevil_me_pool_degraded | ADR-002 | chaos (`tokio::time::pause`) |
+| F-37 | Все ME-сокеты упали одновременно / `core.telegram.org` недоступен | PostCommit | экспоненциальный backoff без tight-loop и crash-loop; при `fallback_to_direct=true` новые сессии прозрачно уходят в Direct; LKG-кэш `proxy-secret`/`proxy-multi.conf` в томе `replay` не затирается повреждённым ответом | mtevil_me_fallback_direct_total, mtevil_me_refresh_errors_total | ADR-002 | unit + live |
+| F-38 | Медленный клиент при переполнении очереди ME-сессии | PostCommit | ограниченный канал на сессию с drop + закрытие сессии, `RPC_CLOSE_EXT` через `try_send` с учётом потерь | mtevil_me_backpressure_drops_total, mtevil_me_dropped_close_ext_total | ADR-002 | unit + load (30/100) |
+| F-39 | Смешанные версии split: `edge v0.3` (ME) + `egress v0.2.0` (без `MTV4`) | PostCommit | быстрый отказ `MTV4` → отдельный `mtv4_cooldown` (`30 с`) без перевода узла в cooldown для `MTV3`; при `fallback_to_direct=true` немедленный fallback на Direct по `MTV3` | mtevil_me_fallback_direct_total | ADR-002 | live compat (`3a`/`3b`) |
 
 ## 2. Правила применения
 

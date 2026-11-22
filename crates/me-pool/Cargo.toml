@@ -1,0 +1,24 @@
+[package]
+name = "mtevil-me-pool"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Clean-room Telegram Middle-End (ME) RPC client and connection pool"
+
+[dependencies]
+anyhow.workspace = true
+aes = "0.8"
+cbc = "0.1"
+crc32fast = "1"
+md-5 = "0.10"
+sha1 = "0.10"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+mtevil-egress = { path = "../egress" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
+[lints]
+workspace = true

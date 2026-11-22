@@ -343,6 +343,7 @@ pub(crate) fn default_media_override_map() -> HashMap<i16, Vec<SocketAddr>> {
         cover_dns_ttl_secs: config::default_cover_dns_ttl_secs(),
         diagnostics: false,
         metrics_listen: None,
+        me: config::MeConfig::default(),
     }
     .dc_media_overrides()
     .unwrap_or_default()
@@ -577,6 +578,81 @@ pub(crate) enum EgressAttemptErr {
     /// Attempt was cancelled because another concurrent attempt already signaled this node down.
     /// Must NOT record an extra failure or inflate cooldown backoff.
     SignaledDown(anyhow::Error),
+    /// Egress rejected `MTV4` (e.g. `egress v0.2.0` closed on unknown magic, or `egress v0.3`
+    /// returned `EGRESS_ACK_ERR` because ME is disabled/degraded). Must NOT penalize `MTV3`
+    /// health in `EgressHealth`; sets only the separate `mtv4_cooldown` slot.
+    Mtv4Unsupported(anyhow::Error),
+}
+
+const MTV4_UNSUPPORTED_COOLDOWN: Duration = Duration::from_secs(30);
+
+fn is_mtv4_in_cooldown(state: &State, idx: usize, now: Instant) -> bool {
+    let guard = state
+        .mtv4_cooldown
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard
+        .get(idx)
+        .and_then(|v| *v)
+        .is_some_and(|until| now < until)
+}
+
+fn mark_mtv4_cooldown(state: &State, idx: usize, now: Instant) {
+    let mut guard = state
+        .mtv4_cooldown
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if guard.len() <= idx {
+        guard.resize(idx + 1, None);
+    }
+    guard[idx] = Some(now + MTV4_UNSUPPORTED_COOLDOWN);
+}
+
+fn clear_mtv4_cooldown(state: &State, idx: usize) {
+    let mut guard = state
+        .mtv4_cooldown
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = guard.get_mut(idx) {
+        *slot = None;
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum EgressDialMode<'a> {
+    DirectStream(&'a [u8; 64]),
+    FramedMe {
+        proto: wire::ClientProtoKind,
+        client_addr: Option<std::net::SocketAddrV4>,
+    },
+}
+
+fn build_egress_wire_preface_for_mode(
+    token: &[u8; 16],
+    dc_id: i16,
+    mode: EgressDialMode<'_>,
+    use_mtv3: bool,
+) -> Result<Vec<u8>> {
+    match mode {
+        EgressDialMode::DirectStream(dc_header) => {
+            build_egress_wire_preface(token, dc_id, dc_header, use_mtv3)
+        }
+        EgressDialMode::FramedMe { proto, client_addr } => {
+            use rand::RngCore;
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            let mut nonce = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut nonce);
+            Ok(wire::build_egress_preface_v4_with_proto(
+                token,
+                dc_id,
+                now,
+                &nonce,
+                proto,
+                client_addr,
+            )?
+            .to_vec())
+        }
+    }
 }
 
 pub(crate) async fn dial_egress_candidate(
@@ -584,7 +660,7 @@ pub(crate) async fn dial_egress_candidate(
     idx: usize,
     dc_id: i16,
     dc_abs: i16,
-    dc_header: &[u8; 64],
+    mode: EgressDialMode<'_>,
     per_try: Duration,
 ) -> std::result::Result<TcpStream, EgressAttemptErr> {
     use std::sync::atomic::Ordering::Relaxed;
@@ -601,9 +677,13 @@ pub(crate) async fn dial_egress_candidate(
             .await
             .map_err(|e| EgressAttemptErr::Node(e.into()))?;
         configure_tcp_socket(&upstream).map_err(EgressAttemptErr::Node)?;
-        let preface =
-            build_egress_wire_preface(&state.egress_token, dc_id, dc_header, state.egress_use_mtv3)
-                .map_err(EgressAttemptErr::Node)?;
+        let preface = build_egress_wire_preface_for_mode(
+            &state.egress_token,
+            dc_id,
+            mode,
+            state.egress_use_mtv3,
+        )
+        .map_err(EgressAttemptErr::Node)?;
         upstream
             .write_all(&preface)
             .await
@@ -614,21 +694,36 @@ pub(crate) async fn dial_egress_candidate(
             .upstream_tx_bytes
             .fetch_add(preface.len() as u64, Relaxed);
         let mut ack = [0u8; 1];
-        upstream
-            .read_exact(&mut ack)
-            .await
-            .map_err(|e| EgressAttemptErr::Node(e.into()))?;
+        let is_mtv4 = matches!(mode, EgressDialMode::FramedMe { .. });
+        upstream.read_exact(&mut ack).await.map_err(|e| {
+            if is_mtv4 {
+                EgressAttemptErr::Mtv4Unsupported(anyhow::anyhow!(
+                    "egress closed after MTV4 preface (v0.2.0 or ME unsupported): {e}"
+                ))
+            } else {
+                EgressAttemptErr::Node(e.into())
+            }
+        })?;
         state
             .counters
             .upstream_rx_bytes
             .fetch_add(ack.len() as u64, Relaxed);
         if ack[0] == EGRESS_ACK_OK {
             EgressHealth::record_ack_latency(&state.egress_health, idx, t0.elapsed());
+            if is_mtv4 {
+                clear_mtv4_cooldown(state, idx);
+            }
             Ok(upstream)
         } else if ack[0] == EGRESS_ACK_ERR {
-            Err(EgressAttemptErr::Dc(anyhow::anyhow!(
-                "egress DC {dc_abs} unreachable (negative ACK)"
-            )))
+            if is_mtv4 {
+                Err(EgressAttemptErr::Mtv4Unsupported(anyhow::anyhow!(
+                    "egress rejected MTV4 for DC {dc_abs} (ME disabled or pool empty)"
+                )))
+            } else {
+                Err(EgressAttemptErr::Dc(anyhow::anyhow!(
+                    "egress DC {dc_abs} unreachable (negative ACK)"
+                )))
+            }
         } else {
             Err(EgressAttemptErr::Node(anyhow::anyhow!(
                 "egress upstream invalid ACK byte"
@@ -759,6 +854,12 @@ pub(crate) fn finalize_egress_error(
             drop(claim);
             e
         }
+        EgressAttemptErr::Mtv4Unsupported(e) => {
+            // Separate protocol cooldown: do NOT penalize EgressHealth so MTV3 Direct remains healthy.
+            drop(claim);
+            mark_mtv4_cooldown(state, idx, Instant::now());
+            e
+        }
     }
 }
 
@@ -780,6 +881,37 @@ pub(crate) async fn connect_upstream(
             .fetch_add(dc_header.len() as u64, Relaxed);
         return Ok((upstream, "direct"));
     }
+    connect_egress_with_mode(state, dc_id, EgressDialMode::DirectStream(dc_header)).await
+}
+
+pub(crate) async fn connect_upstream_mtv4(
+    state: &State,
+    dc_id: i16,
+    proto: wire::ClientProtoKind,
+    client_addr: Option<std::net::SocketAddrV4>,
+) -> Result<(TcpStream, &'static str)> {
+    ensure!(
+        !state.egress_upstreams.is_empty(),
+        "MTV4 requires at least one egress upstream"
+    );
+    connect_egress_with_mode(
+        state,
+        dc_id,
+        EgressDialMode::FramedMe { proto, client_addr },
+    )
+    .await
+}
+
+async fn connect_egress_with_mode(
+    state: &State,
+    dc_id: i16,
+    mode: EgressDialMode<'_>,
+) -> Result<(TcpStream, &'static str)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let route_label: &'static str = match mode {
+        EgressDialMode::DirectStream(_) => "egress",
+        EgressDialMode::FramedMe { .. } => "egress_me",
+    };
     let count = state.egress_upstreams.len();
     let start = match state.egress_strategy {
         EgressStrategy::Ordered => 0,
@@ -795,10 +927,14 @@ pub(crate) async fn connect_upstream(
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempted_any = false;
         let mut hedged_this_conn = false;
+        let is_mtv4 = matches!(mode, EgressDialMode::FramedMe { .. });
         let mut offset = 0;
         while offset < count {
             let idx = (start + offset) % count;
             offset += 1;
+            if is_mtv4 && is_mtv4_in_cooldown(state, idx, Instant::now()) {
+                continue;
+            }
             let Some(claim) =
                 EgressHealth::try_claim(&state.egress_health, idx, dc_key, Instant::now())
             else {
@@ -810,7 +946,7 @@ pub(crate) async fn connect_upstream(
                 .then(|| Duration::from_millis(state.egress_hedge_ms))
                 .filter(|d| *d < per_try);
             if let Some(h_delay) = hedge_delay.filter(|_| !hedged_this_conn && offset < count) {
-                let fut1 = dial_egress_candidate(state, idx, dc_id, dc_abs, dc_header, per_try);
+                let fut1 = dial_egress_candidate(state, idx, dc_id, dc_abs, mode, per_try);
                 tokio::pin!(fut1);
                 let early = tokio::select! {
                     biased;
@@ -828,7 +964,7 @@ pub(crate) async fn connect_upstream(
                                 &last_err,
                                 "primary_in_cooldown",
                             );
-                            return Ok((upstream, "egress"));
+                            return Ok((upstream, route_label));
                         }
                         Err(err1) => {
                             last_err = Some(finalize_egress_error(state, idx, claim, err1));
@@ -841,6 +977,9 @@ pub(crate) async fn connect_upstream(
                 while offset < count {
                     let cand_idx = (start + offset) % count;
                     offset += 1;
+                    if is_mtv4 && is_mtv4_in_cooldown(state, cand_idx, Instant::now()) {
+                        continue;
+                    }
                     if let Some(c2) = EgressHealth::try_claim(
                         &state.egress_health,
                         cand_idx,
@@ -862,7 +1001,7 @@ pub(crate) async fn connect_upstream(
                                 &last_err,
                                 "primary_in_cooldown",
                             );
-                            return Ok((upstream, "egress"));
+                            return Ok((upstream, route_label));
                         }
                         Err(err1) => {
                             last_err = Some(finalize_egress_error(state, idx, claim, err1));
@@ -874,7 +1013,7 @@ pub(crate) async fn connect_upstream(
                 state.counters.hedge_started.fetch_add(1, Relaxed);
                 let per_try2 =
                     EgressHealth::adaptive_per_try(&state.egress_health, idx2, max_per_try);
-                let fut2 = dial_egress_candidate(state, idx2, dc_id, dc_abs, dc_header, per_try2);
+                let fut2 = dial_egress_candidate(state, idx2, dc_id, dc_abs, mode, per_try2);
                 tokio::pin!(fut2);
                 enum HedgeRace {
                     First(std::result::Result<TcpStream, EgressAttemptErr>),
@@ -895,7 +1034,7 @@ pub(crate) async fn connect_upstream(
                             &last_err,
                             "primary_in_cooldown",
                         );
-                        return Ok((stream1, "egress"));
+                        return Ok((stream1, route_label));
                     }
                     HedgeRace::First(Err(err1)) => {
                         last_err = Some(finalize_egress_error(state, idx, claim, err1));
@@ -910,7 +1049,7 @@ pub(crate) async fn connect_upstream(
                                     &last_err,
                                     "hedged_connect_backup_won",
                                 );
-                                return Ok((stream2, "egress"));
+                                return Ok((stream2, route_label));
                             }
                             Err(err2) => {
                                 last_err = Some(finalize_egress_error(state, idx2, claim2, err2));
@@ -934,7 +1073,7 @@ pub(crate) async fn connect_upstream(
                             &last_err,
                             "hedged_connect_backup_won",
                         );
-                        return Ok((stream2, "egress"));
+                        return Ok((stream2, route_label));
                     }
                     HedgeRace::Second(Err(err2)) => {
                         last_err = Some(finalize_egress_error(state, idx2, claim2, err2));
@@ -948,7 +1087,7 @@ pub(crate) async fn connect_upstream(
                                     &last_err,
                                     "primary_in_cooldown",
                                 );
-                                return Ok((stream1, "egress"));
+                                return Ok((stream1, route_label));
                             }
                             Err(err1) => {
                                 last_err = Some(finalize_egress_error(state, idx, claim, err1));
@@ -959,7 +1098,7 @@ pub(crate) async fn connect_upstream(
                 }
             }
 
-            match dial_egress_candidate(state, idx, dc_id, dc_abs, dc_header, per_try).await {
+            match dial_egress_candidate(state, idx, dc_id, dc_abs, mode, per_try).await {
                 Ok(upstream) => {
                     finalize_egress_success(
                         state,
@@ -969,7 +1108,7 @@ pub(crate) async fn connect_upstream(
                         &last_err,
                         "primary_in_cooldown",
                     );
-                    return Ok((upstream, "egress"));
+                    return Ok((upstream, route_label));
                 }
                 Err(err) => {
                     last_err = Some(finalize_egress_error(state, idx, claim, err));
@@ -981,6 +1120,11 @@ pub(crate) async fn connect_upstream(
         // Other concurrent callers wait in single-flight on `egress_probe_notify` within
         // the remaining handshake budget instead of failing immediately.
         if !attempted_any {
+            if is_mtv4 {
+                return Err(last_err.unwrap_or_else(|| {
+                    anyhow::anyhow!("all egress upstreams are in MTV4 unsupported cooldown")
+                }));
+            }
             struct NotifyOnDrop<'a>(&'a tokio::sync::Notify);
             impl Drop for NotifyOnDrop<'_> {
                 fn drop(&mut self) {
@@ -998,9 +1142,7 @@ pub(crate) async fn connect_upstream(
                 let _notify_guard = NotifyOnDrop(&state.egress_probe_notify);
                 let forced_per_try =
                     EgressHealth::adaptive_per_try(&state.egress_health, idx, max_per_try);
-                match dial_egress_candidate(state, idx, dc_id, dc_abs, dc_header, forced_per_try)
-                    .await
-                {
+                match dial_egress_candidate(state, idx, dc_id, dc_abs, mode, forced_per_try).await {
                     Ok(upstream) => {
                         finalize_egress_success(
                             state,
@@ -1010,7 +1152,7 @@ pub(crate) async fn connect_upstream(
                             &last_err,
                             "forced_probe_recovered",
                         );
-                        return Ok((upstream, "egress"));
+                        return Ok((upstream, route_label));
                     }
                     Err(err) => {
                         last_err = Some(finalize_egress_error(state, idx, claim, err));
@@ -1041,10 +1183,8 @@ pub(crate) async fn connect_upstream(
                         };
                         let sf_per_try =
                             EgressHealth::adaptive_per_try(&state.egress_health, idx, max_per_try);
-                        match dial_egress_candidate(
-                            state, idx, dc_id, dc_abs, dc_header, sf_per_try,
-                        )
-                        .await
+                        match dial_egress_candidate(state, idx, dc_id, dc_abs, mode, sf_per_try)
+                            .await
                         {
                             Ok(upstream) => {
                                 finalize_egress_success(
@@ -1055,7 +1195,7 @@ pub(crate) async fn connect_upstream(
                                     &last_err,
                                     "single_flight_recovered",
                                 );
-                                return Ok((upstream, "egress"));
+                                return Ok((upstream, route_label));
                             }
                             Err(err) => {
                                 last_err = Some(finalize_egress_error(state, idx, claim, err));
