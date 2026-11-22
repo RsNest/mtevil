@@ -36,7 +36,7 @@ pub(crate) struct EgressHealth {
     pub(crate) node_failed: Vec<bool>,
     pub(crate) dc_slots: HashMap<(usize, i16), CooldownSlot>,
     pub(crate) route_state: EdgeRouteState,
-    pub(crate) ack_samples_ms: std::collections::VecDeque<u64>,
+    pub(crate) node_ack_samples_ms: Vec<std::collections::VecDeque<u64>>,
     pub(crate) node_down_notifiers: Vec<Arc<tokio::sync::Notify>>,
 }
 
@@ -63,32 +63,50 @@ impl EgressHealth {
             node_failed: vec![false; node_count],
             dc_slots: HashMap::new(),
             route_state: EdgeRouteState::PrimaryOk,
-            ack_samples_ms: std::collections::VecDeque::with_capacity(32),
+            node_ack_samples_ms: (0..node_count)
+                .map(|_| std::collections::VecDeque::with_capacity(32))
+                .collect(),
             node_down_notifiers: (0..node_count)
                 .map(|_| Arc::new(tokio::sync::Notify::new()))
                 .collect(),
         }
     }
 
-    pub(crate) fn record_ack_latency(health: &std::sync::Mutex<Self>, elapsed: Duration) {
+    pub(crate) fn record_ack_latency(
+        health: &std::sync::Mutex<Self>,
+        idx: usize,
+        elapsed: Duration,
+    ) {
         let ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
         let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
-        if h.ack_samples_ms.len() >= 32 {
-            h.ack_samples_ms.pop_front();
+        while h.node_ack_samples_ms.len() <= idx {
+            h.node_ack_samples_ms
+                .push(std::collections::VecDeque::with_capacity(32));
         }
-        h.ack_samples_ms.push_back(ms.max(1));
+        let samples = &mut h.node_ack_samples_ms[idx];
+        if samples.len() >= 32 {
+            samples.pop_front();
+        }
+        samples.push_back(ms.max(1));
     }
 
-    /// Adaptive per-try connect/ACK timeout: `3 × median(recent_ack_ms)` clamped to `[300 ms, max_per_try]`.
+    /// Adaptive per-try connect/ACK timeout for node `idx`: `3 × median(node_ack_samples_ms[idx])`
+    /// clamped to `[300 ms, max_per_try]`, or `max_per_try` until the node has at least 3 samples.
     pub(crate) fn adaptive_per_try(
         health: &std::sync::Mutex<Self>,
+        idx: usize,
         max_per_try: Duration,
     ) -> Duration {
+        const MIN_SAMPLES: usize = 3;
         let h = health.lock().unwrap_or_else(|e| e.into_inner());
-        if h.ack_samples_ms.is_empty() {
+        let Some(samples) = h
+            .node_ack_samples_ms
+            .get(idx)
+            .filter(|s| s.len() >= MIN_SAMPLES)
+        else {
             return max_per_try;
-        }
-        let mut sorted: Vec<u64> = h.ack_samples_ms.iter().copied().collect();
+        };
+        let mut sorted: Vec<u64> = samples.iter().copied().collect();
         sorted.sort_unstable();
         let median_ms = sorted[sorted.len() / 2];
         let max_ms = max_per_try.as_millis().min(u128::from(u64::MAX)) as u64;

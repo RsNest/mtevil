@@ -615,7 +615,7 @@ pub(crate) async fn dial_egress_candidate(
             .upstream_rx_bytes
             .fetch_add(ack.len() as u64, Relaxed);
         if ack[0] == EGRESS_ACK_OK {
-            EgressHealth::record_ack_latency(&state.egress_health, t0.elapsed());
+            EgressHealth::record_ack_latency(&state.egress_health, idx, t0.elapsed());
             Ok(upstream)
         } else if ack[0] == EGRESS_ACK_ERR {
             Err(EgressAttemptErr::Dc(anyhow::anyhow!(
@@ -744,13 +744,9 @@ pub(crate) async fn connect_upstream(
     let max_per_try = (state.handshake / (count as u32).max(1))
         .max(Duration::from_millis(150))
         .min(Duration::from_secs(2));
-    let per_try = EgressHealth::adaptive_per_try(&state.egress_health, max_per_try);
     let dc_abs = dc_id.abs();
     let dc_key = dc_id;
     let ordered = state.egress_strategy == EgressStrategy::Ordered;
-    let hedge_delay = (state.egress_hedge_ms > 0)
-        .then(|| Duration::from_millis(state.egress_hedge_ms))
-        .filter(|d| *d < per_try);
     timeout(state.handshake, async {
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempted_any = false;
@@ -765,6 +761,10 @@ pub(crate) async fn connect_upstream(
                 continue;
             };
             attempted_any = true;
+            let per_try = EgressHealth::adaptive_per_try(&state.egress_health, idx, max_per_try);
+            let hedge_delay = (state.egress_hedge_ms > 0)
+                .then(|| Duration::from_millis(state.egress_hedge_ms))
+                .filter(|d| *d < per_try);
             if let Some(h_delay) = hedge_delay.filter(|_| !hedged_this_conn && offset < count) {
                 let fut1 = dial_egress_candidate(state, idx, dc_id, dc_abs, dc_header, per_try);
                 tokio::pin!(fut1);
@@ -828,7 +828,9 @@ pub(crate) async fn connect_upstream(
                 };
                 hedged_this_conn = true;
                 state.counters.hedge_started.fetch_add(1, Relaxed);
-                let fut2 = dial_egress_candidate(state, idx2, dc_id, dc_abs, dc_header, per_try);
+                let per_try2 =
+                    EgressHealth::adaptive_per_try(&state.egress_health, idx2, max_per_try);
+                let fut2 = dial_egress_candidate(state, idx2, dc_id, dc_abs, dc_header, per_try2);
                 tokio::pin!(fut2);
                 enum HedgeRace {
                     First(std::result::Result<TcpStream, EgressAttemptErr>),
@@ -950,7 +952,11 @@ pub(crate) async fn connect_upstream(
                 EgressHealth::try_claim_forced_soonest(&state.egress_health, count, dc_key)
             {
                 let _notify_guard = NotifyOnDrop(&state.egress_probe_notify);
-                match dial_egress_candidate(state, idx, dc_id, dc_abs, dc_header, per_try).await {
+                let forced_per_try =
+                    EgressHealth::adaptive_per_try(&state.egress_health, idx, max_per_try);
+                match dial_egress_candidate(state, idx, dc_id, dc_abs, dc_header, forced_per_try)
+                    .await
+                {
                     Ok(upstream) => {
                         finalize_egress_success(
                             state,
@@ -989,8 +995,12 @@ pub(crate) async fn connect_upstream(
                         ) else {
                             continue;
                         };
-                        match dial_egress_candidate(state, idx, dc_id, dc_abs, dc_header, per_try)
-                            .await
+                        let sf_per_try =
+                            EgressHealth::adaptive_per_try(&state.egress_health, idx, max_per_try);
+                        match dial_egress_candidate(
+                            state, idx, dc_id, dc_abs, dc_header, sf_per_try,
+                        )
+                        .await
                         {
                             Ok(upstream) => {
                                 finalize_egress_success(

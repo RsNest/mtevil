@@ -3992,25 +3992,30 @@ async fn inv10_f23_round_robin_hedge_adaptive_per_try_and_parallel_node_down_sig
     use std::sync::atomic::Ordering::Relaxed;
     let cover = cover_mock().await?;
 
-    // 1. Adaptive per_try calculation: empty -> max; median 10ms -> 300ms min; median 400ms -> 1200ms; median 900ms -> 2000ms max.
+    // 1. Adaptive per_try calculation is per-node: empty -> max; median 10ms -> 300ms min;
+    //    unsampled sibling stays at max; median 400ms -> 1200ms.
     let h = std::sync::Mutex::new(EgressHealth::new(2));
     assert_eq!(
-        EgressHealth::adaptive_per_try(&h, Duration::from_secs(2)),
+        EgressHealth::adaptive_per_try(&h, 0, Duration::from_secs(2)),
         Duration::from_secs(2)
     );
     for _ in 0..5 {
-        EgressHealth::record_ack_latency(&h, Duration::from_millis(10));
+        EgressHealth::record_ack_latency(&h, 0, Duration::from_millis(10));
     }
     assert_eq!(
-        EgressHealth::adaptive_per_try(&h, Duration::from_secs(2)),
+        EgressHealth::adaptive_per_try(&h, 0, Duration::from_secs(2)),
         Duration::from_millis(300)
+    );
+    assert_eq!(
+        EgressHealth::adaptive_per_try(&h, 1, Duration::from_secs(2)),
+        Duration::from_secs(2)
     );
     let h2 = std::sync::Mutex::new(EgressHealth::new(2));
     for _ in 0..5 {
-        EgressHealth::record_ack_latency(&h2, Duration::from_millis(400));
+        EgressHealth::record_ack_latency(&h2, 1, Duration::from_millis(400));
     }
     assert_eq!(
-        EgressHealth::adaptive_per_try(&h2, Duration::from_secs(2)),
+        EgressHealth::adaptive_per_try(&h2, 1, Duration::from_secs(2)),
         Duration::from_millis(1200)
     );
 
@@ -4050,8 +4055,8 @@ async fn inv10_f23_round_robin_hedge_adaptive_per_try_and_parallel_node_down_sig
         sm.egress_use_mtv3 = false;
         sm.handshake = Duration::from_secs(5);
     }
-    // Seed adaptive ACK latency from healthy baseline (~5ms -> adaptive per_try = 300ms).
-    EgressHealth::record_ack_latency(&st.egress_health, Duration::from_millis(5));
+    // Seed adaptive ACK latency on node 0 from healthy baseline (~5ms -> adaptive per_try = 300ms).
+    EgressHealth::record_ack_latency(&st.egress_health, 0, Duration::from_millis(5));
 
     let mut joins = Vec::with_capacity(30);
     for _ in 0..30 {
@@ -4221,5 +4226,150 @@ async fn inv10_f32_egress_long_download_exceeding_idle_survives_while_true_idle_
     let _ = timeout(Duration::from_secs(2), srv).await;
     dc_task.abort();
     silent_dc_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn inv10_f23_fast_primary_samples_do_not_timeout_healthy_slower_backup() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+    let cover = cover_mock().await?;
+
+    async fn spawn_controllable_egress(
+        ack_delay_ms: u64,
+        blackhole: Arc<AtomicBool>,
+    ) -> Result<(SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>)> {
+        let l = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = l.local_addr()?;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h_cl = hits.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else {
+                    break;
+                };
+                h_cl.fetch_add(1, Relaxed);
+                let bh = blackhole.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 88];
+                    if s.read_exact(&mut buf).await.is_ok() {
+                        if bh.load(Relaxed) {
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            return;
+                        }
+                        if ack_delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(ack_delay_ms)).await;
+                        }
+                        let _ = s.write_all(&[EGRESS_ACK_OK]).await;
+                        let mut drain = [0u8; 16];
+                        let _ = timeout(Duration::from_secs(2), s.read(&mut drain)).await;
+                    }
+                });
+            }
+        });
+        Ok((addr, hits, task))
+    }
+
+    // 1. Ordered strategy: fast primary trains estimator (< 5ms), then becomes unavailable;
+    //    healthy slower backup (450ms ACK > 300ms floor, < 2000ms max_per_try) must succeed
+    //    both on direct failover and on hedged failover.
+    let p_bh = Arc::new(AtomicBool::new(false));
+    let b_bh = Arc::new(AtomicBool::new(false));
+    let (p_addr, _p_hits, p_task) = spawn_controllable_egress(0, p_bh.clone()).await?;
+    let (b_addr, b_hits, b_task) = spawn_controllable_egress(450, b_bh.clone()).await?;
+
+    let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut st).context("unique state")?;
+        sm.egress_upstreams = vec![p_addr, b_addr];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+        sm.egress_hedge_ms = 80;
+        sm.egress_use_mtv3 = false;
+        sm.handshake = Duration::from_secs(4);
+    }
+
+    // Train fast primary with 8 successful connections.
+    for _ in 0..8 {
+        let (s, route) = connect_upstream(&st, 2, &[0x11; 64]).await?;
+        assert_eq!(route, "egress");
+        drop(s);
+    }
+    assert_eq!(
+        b_hits.load(Relaxed),
+        0,
+        "backup must remain unsampled during training"
+    );
+
+    // 1a. Primary blackholed -> hedge fires at 80ms -> backup (450ms ACK) must NOT time out at 300ms.
+    p_bh.store(true, Relaxed);
+    let t0 = Instant::now();
+    let (s, route) = connect_upstream(&st, 2, &[0x22; 64])
+        .await
+        .context("ordered hedged failover to 450ms healthy backup must succeed")?;
+    assert_eq!(route, "egress");
+    assert!(t0.elapsed() < Duration::from_secs(4));
+    assert_eq!(st.counters.hedge_started.load(Relaxed), 1);
+    assert_eq!(st.counters.hedge_won_by_backup.load(Relaxed), 1);
+    drop(s);
+
+    // 1b. Next connection while primary is in cooldown goes directly to backup (450ms ACK) and succeeds.
+    let (s2, route2) = connect_upstream(&st, 2, &[0x33; 64])
+        .await
+        .context("ordered direct failover to 450ms healthy backup must succeed")?;
+    assert_eq!(route2, "egress");
+    drop(s2);
+
+    // 2. Round-robin strategy: fast node 0 trained while node 1 is in cooldown; then node 0
+    //    blackholes and node 1 (unsampled, 450ms ACK) must succeed via hedge from node 0.
+    let rr_bh0 = Arc::new(AtomicBool::new(false));
+    let rr_bh1 = Arc::new(AtomicBool::new(false));
+    let (rr0, _rr0_hits, rr0_task) = spawn_controllable_egress(0, rr_bh0.clone()).await?;
+    let (rr1, rr1_hits, rr1_task) = spawn_controllable_egress(450, rr_bh1.clone()).await?;
+
+    let mut st_rr = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut st_rr).context("unique state")?;
+        sm.egress_upstreams = vec![rr0, rr1];
+        sm.egress_strategy = EgressStrategy::RoundRobin;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+        sm.egress_hedge_ms = 80;
+        sm.egress_use_mtv3 = false;
+        sm.handshake = Duration::from_secs(4);
+    }
+    // Temporarily put node 1 in cooldown so only node 0 is sampled during training.
+    {
+        let mut h = st_rr
+            .egress_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        h.nodes[1].until = Some(Instant::now() + Duration::from_secs(60));
+    }
+    for _ in 0..6 {
+        let (s, _) = connect_upstream(&st_rr, 2, &[0x44; 64]).await?;
+        drop(s);
+    }
+    assert_eq!(rr1_hits.load(Relaxed), 0);
+
+    // Restore node 1, blackhole node 0, and force RR start = 0 so node 0 is attempted first and hedges to node 1.
+    {
+        let mut h = st_rr
+            .egress_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        h.nodes[1].until = None;
+    }
+    st_rr.egress_rr.store(0, Relaxed);
+    rr_bh0.store(true, Relaxed);
+    let (s_rr, route_rr) = connect_upstream(&st_rr, 2, &[0x55; 64])
+        .await
+        .context("round-robin hedged failover to 450ms healthy backup must succeed")?;
+    assert_eq!(route_rr, "egress");
+    assert_eq!(st_rr.counters.hedge_started.load(Relaxed), 1);
+    assert_eq!(st_rr.counters.hedge_won_by_backup.load(Relaxed), 1);
+    drop(s_rr);
+
+    for t in [p_task, b_task, rr0_task, rr1_task] {
+        t.abort();
+    }
     Ok(())
 }
