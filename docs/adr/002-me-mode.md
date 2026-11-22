@@ -58,10 +58,35 @@
 - В протоколе ME пакет `RPC_PROXY_REQ` содержит поля `remote_ip` и `remote_port` — в отличие от Direct-режима, где Telegram видит только IP прокси, в ME-режиме по умолчанию Telegram (ME-сервер) получает реальный IP-адрес клиента (как в официальном MTProxy).
 - **Эмпирическая проверка спайком (`scripts/me_spike.py --dc 2 --remote-ip 0.0.0.0 --remote-port 0`):** Telegram ME **принимает** нулевой адрес `0.0.0.0:0` на уровне `req_pq_multi → resPQ#05162463` (`100 B`, `RTT = 22.1 ms`), однако полная пользовательская сессия реального клиента Telegram (авторизация, чаты, медиа, `ad_tag`) с `0.0.0.0:0` ещё не проверялась.
 - **Решение:** вводится явная настройка `me.send_client_ip: bool`:
-  - **По умолчанию `true`** — отправляется реальный адрес клиента (`remote_ip:port`), как в официальном MTProxy.
+  - **По умолчанию `true`** — отправляется реальный адрес клиента (`remote_ip:port`), как в официальном MTProxy (при включённом `proxy_protocol` адрес берётся из PROXY protocol v2; для чистых IPv6-клиентов детерминированно передаётся `0.0.0.0:0`).
   - **Значение `false` (`0.0.0.0:0`) — помечено «экспериментально»** до проверки реальной сессии реальным клиентом Telegram.
-- **Split-правило:** на `egress` клиентский IP используется только в памяти для заполнения `RPC_PROXY_REQ` и **никогда не записывается в логи, метрики или файлы**.
+- **Split-правило (логика «И»):** в `edge → egress` (`MTV4`) адрес клиента передаётся внутри аутентифицированной части префейса `MTV4` **только если** на `edge` включён `me.send_client_ip: true` (иначе в `MTV4` идут флаг `0` и `0.0.0.0:0`). На `egress` адрес передаётся в Telegram ME **только если** одновременно установлен флаг в `MTV4` **и** на `egress` включён `me.send_client_ip: true`. **На `egress` клиентский IP никогда не записывается в логи, метрики или файлы.**
 - **Предупреждение для README и мастера установки:** при включении ME мастер и `README.md` обязаны явно предупреждать оператора о том, что при `me.send_client_ip: true` (по умолчанию) Telegram видит реальный IP клиента, а режим `me.send_client_ip: false` (`0.0.0.0:0`) является экспериментальным.
+
+### 3.5. Спецификация протокола `MTV4` (Split `edge → egress` ME)
+- **Префейс `MTV4` (ровно 70 байт, `edge → egress`):**
+  - `0..4`: магия `MTV4` (`0x4d 0x54 0x56 0x34`);
+  - `4..6`: `dc_id: i16` (BE, включая медиа-DC `-2`, `-4`, `1..=5`);
+  - `6..14`: `timestamp: u64` (BE Unix seconds, окно `±30 с`);
+  - `14..30`: `nonce: [u8; 16]` (проверка в `egress_nonce_cache`, защита от replay);
+  - `30..31`: `flags: u8` (`0x01` = `MTV4_FLAG_HAS_CLIENT_IP`, биты `1..7` должны быть `0`);
+  - `31..32`: `reserved: u8` (`0x00`);
+  - `32..36`: `client_ipv4: [u8; 4]` (`0.0.0.0`, если флаг `0x01` не выставлен);
+  - `36..38`: `client_port: u16` (BE; `0`, если флаг `0x01` не выставлен);
+  - `38..70`: `hmac: [u8; 32]` = `HMAC-SHA256(egress_token, preface[0..38])` (аутентифицирует весь заголовок, включая `client_ipv4:port`).
+- **Согласование режима и ACK (1 байт, `egress → edge`):**
+  - `egress` проверяет `egress_allow_from`, rate-limit по IP, `HMAC-SHA256`, `timestamp ±30 с` и `nonce`-replay.
+  - Если на `egress` `me.enabled == true` и пул открыл `MeSession` для `dc_id` → `egress` отвечает `EGRESS_ACK_OK` (`0x00`).
+  - Если на `egress` `me.enabled == false` или нет живого ME-соединения для `dc_id` → `egress` отвечает `EGRESS_ACK_ERR` (`0x01`) и закрывает соединение.
+  - На `edge` при `EGRESS_ACK_ERR` срабатывает штатный failover (`EgressHealth`, `breaker`, `egress_hedge_ms`, F3b-эскалация) на резервный `egress`. Если все `egress` не смогли открыть ME-сессию, `edge` при `me.fallback_to_direct = true` переходит на Direct по **`MTV3`** (метрика `mtevil_me_fallback_direct_total` + rate-limited событие `me_fallback_direct`); при `fallback_to_direct = false` сессия клиента закрывается без перехода в Direct и без cover (INV-01).
+- **Кадрирование после `EGRESS_ACK_OK` (двунаправленно `edge ↔ egress`):**
+  - Заголовок кадра 5 байт: `[kind: u8][len: u32 BE]`, затем `len` байт тела.
+  - `kind = 0x01` (`PAYLOAD`): MTProto-кадр (`4 <= len <= 1 MiB`, кратно 4, проверка длины **до аллокации**, INV-08).
+  - `kind = 0x02` (`QUICK_ACK`): `len == 4`, `confirm_key: u32 BE` (`egress → edge` при получении `RPC_SIMPLE_ACK`).
+  - `kind = 0x03` (`EOF`): `len == 0`, штатное закрытие сессии.
+- **Обратная совместимость и порядок обновления:**
+  - `egress v0.3` принимает `MTV2` (если `egress_accept_legacy = true`), `MTV3` (Direct stream) и `MTV4` (framed ME).
+  - Порядок обновления split-инсталляции: **сначала `egress`, затем `edge`**. Старый `edge v0.2` продолжает работать с `egress v0.3` по `MTV3` без разрыва совместимости.
 
 ### 3.2. NAT и Docker (`me.public_ipv4`)
 - В формуле KDF ME-протокола участвуют локальный IPv4 (`clt_ip`) и локальный порт (`clt_port`) TCP-сокета. Telegram ME подставляет в KDF тот публичный IPv4 и порт, с которого пришло соединение.
