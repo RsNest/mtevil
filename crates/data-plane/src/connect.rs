@@ -571,6 +571,9 @@ pub(crate) async fn connect_dc_candidates(
 pub(crate) enum EgressAttemptErr {
     Node(anyhow::Error),
     Dc(anyhow::Error),
+    /// Attempt was cancelled because another concurrent attempt already signaled this node down.
+    /// Must NOT record an extra failure or inflate cooldown backoff.
+    SignaledDown(anyhow::Error),
 }
 
 pub(crate) async fn dial_egress_candidate(
@@ -588,6 +591,7 @@ pub(crate) async fn dial_egress_candidate(
     tokio::pin!(node_down);
     node_down.as_mut().enable();
     let t0 = Instant::now();
+    let preface_written = std::sync::atomic::AtomicBool::new(false);
 
     let attempt = timeout(per_try, async {
         let mut upstream = TcpStream::connect(addr)
@@ -601,6 +605,7 @@ pub(crate) async fn dial_egress_candidate(
             .write_all(&preface)
             .await
             .map_err(|e| EgressAttemptErr::Node(e.into()))?;
+        preface_written.store(true, Relaxed);
         state
             .counters
             .upstream_tx_bytes
@@ -632,9 +637,19 @@ pub(crate) async fn dial_egress_candidate(
         biased;
         res = attempt => match res {
             Ok(inner) => inner,
-            Err(_) => Err(EgressAttemptErr::Node(anyhow::anyhow!("egress_connect_timeout"))),
+            Err(_) => {
+                if preface_written.load(Relaxed) {
+                    // TCP established and full preface was written; missing ACK within per_try
+                    // is a soft/DC-level timeout so only (node, dc) cools down without node_down.
+                    Err(EgressAttemptErr::Dc(anyhow::anyhow!(
+                        "egress_ack_timeout (dc {dc_abs})"
+                    )))
+                } else {
+                    Err(EgressAttemptErr::Node(anyhow::anyhow!("egress_connect_timeout")))
+                }
+            }
         },
-        () = &mut node_down => Err(EgressAttemptErr::Node(anyhow::anyhow!("egress_node_signaled_down"))),
+        () = &mut node_down => Err(EgressAttemptErr::SignaledDown(anyhow::anyhow!("egress_node_signaled_down"))),
     }
 }
 
@@ -704,15 +719,19 @@ pub(crate) fn finalize_egress_error(
     claim: EgressAttemptClaim<'_>,
     err: EgressAttemptErr,
 ) -> anyhow::Error {
-    EgressHealth::set_node_availability(&state.egress_health, idx, false);
     match err {
         EgressAttemptErr::Dc(e) => {
             claim.record_dc_failure(state.egress_cooldown, state.egress_cooldown_max);
             e
         }
         EgressAttemptErr::Node(e) => {
+            EgressHealth::set_node_availability(&state.egress_health, idx, false);
             claim.record_node_failure(state.egress_cooldown, state.egress_cooldown_max);
             EgressHealth::notify_node_down(&state.egress_health, idx);
+            e
+        }
+        EgressAttemptErr::SignaledDown(e) => {
+            drop(claim);
             e
         }
     }

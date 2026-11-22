@@ -90,8 +90,8 @@ impl EgressHealth {
         samples.push_back(ms.max(1));
     }
 
-    /// Adaptive per-try connect/ACK timeout for node `idx`: `3 × median(node_ack_samples_ms[idx])`
-    /// clamped to `[300 ms, max_per_try]`, or `max_per_try` until the node has at least 3 samples.
+    /// Adaptive per-try connect/ACK timeout for node `idx`: `max(300 ms, 2 × p95(node_ack_samples_ms[idx]))`
+    /// clamped to `max_per_try`, or `max_per_try` until the node has at least 3 samples.
     pub(crate) fn adaptive_per_try(
         health: &std::sync::Mutex<Self>,
         idx: usize,
@@ -108,10 +108,13 @@ impl EgressHealth {
         };
         let mut sorted: Vec<u64> = samples.iter().copied().collect();
         sorted.sort_unstable();
-        let median_ms = sorted[sorted.len() / 2];
+        let p95_idx = ((sorted.len() * 95).div_ceil(100))
+            .saturating_sub(1)
+            .min(sorted.len() - 1);
+        let p95_ms = sorted[p95_idx];
         let max_ms = max_per_try.as_millis().min(u128::from(u64::MAX)) as u64;
         let min_ms = 300u64.min(max_ms);
-        Duration::from_millis(median_ms.saturating_mul(3).clamp(min_ms, max_ms))
+        Duration::from_millis(p95_ms.saturating_mul(2).clamp(min_ms, max_ms))
     }
 
     pub(crate) fn node_down_notifier(

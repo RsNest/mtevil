@@ -4016,7 +4016,7 @@ async fn inv10_f23_round_robin_hedge_adaptive_per_try_and_parallel_node_down_sig
     }
     assert_eq!(
         EgressHealth::adaptive_per_try(&h2, 1, Duration::from_secs(2)),
-        Duration::from_millis(1200)
+        Duration::from_millis(800)
     );
 
     // 2. Round-robin with 1 blackhole node and 1 healthy node: 30 parallel connections finish well under 700ms p95!
@@ -4372,4 +4372,304 @@ async fn inv10_f23_fast_primary_samples_do_not_timeout_healthy_slower_backup() -
         t.abort();
     }
     Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn inv10_f23_signaled_down_does_not_cascade_failures_or_inflate_cooldown() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let cover = cover_mock().await?;
+
+    // Mock egress accepts 30 connections, waits until ALL 30 have written their preface and are
+    // waiting for ACK, then closes ONLY the 1st connection (real transport EOF) while holding
+    // the other 29 open so they cancel via `node_down` (`EgressAttemptErr::SignaledDown`).
+    let l = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = l.local_addr()?;
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let all_ready = Arc::new(tokio::sync::Notify::new());
+    let release_fail = Arc::new(tokio::sync::Notify::new());
+    let hold_rest = Arc::new(tokio::sync::Notify::new());
+
+    let in_flight_srv = in_flight.clone();
+    let all_ready_srv = all_ready.clone();
+    let release_fail_srv = release_fail.clone();
+    let hold_rest_srv = hold_rest.clone();
+    let srv = tokio::spawn(async move {
+        for idx in 0..30usize {
+            let Ok((mut s, _)) = l.accept().await else {
+                break;
+            };
+            let inf = in_flight_srv.clone();
+            let ar = all_ready_srv.clone();
+            let rf = release_fail_srv.clone();
+            let hr = hold_rest_srv.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 88];
+                if s.read_exact(&mut buf).await.is_ok() {
+                    if inf.fetch_add(1, Relaxed) + 1 == 30 {
+                        ar.notify_one();
+                    }
+                    if idx == 0 {
+                        rf.notified().await;
+                        // Drop socket -> real EOF transport failure on attempt #0
+                        drop(s);
+                    } else {
+                        // Hold open until test finishes so attempts 1..30 cancel via node_down
+                        hr.notified().await;
+                        drop(s);
+                    }
+                }
+            });
+        }
+    });
+
+    let base_cd = Duration::from_secs(3);
+    let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut st).context("unique state")?;
+        sm.egress_upstreams = vec![addr];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(1));
+        sm.egress_cooldown = base_cd;
+        sm.egress_cooldown_max = Duration::from_secs(60);
+        sm.egress_use_mtv3 = false;
+        sm.handshake = Duration::from_secs(10);
+    }
+    assert_eq!(
+        st.egress_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .nodes[0]
+            .failures,
+        0
+    );
+
+    let mut joins = Vec::with_capacity(30);
+    for _ in 0..30 {
+        let st_c = st.clone();
+        joins.push(tokio::spawn(async move {
+            let Some(claim) = EgressHealth::try_claim(&st_c.egress_health, 0, 2, Instant::now())
+            else {
+                return Err(anyhow::anyhow!("node 0 must be claimable"));
+            };
+            let res =
+                dial_egress_candidate(&st_c, 0, 2, 2, &[0x11; 64], Duration::from_secs(5)).await;
+            let Err(err) = res else {
+                return Err(anyhow::anyhow!("all 30 attempts must fail"));
+            };
+            let is_signaled = matches!(err, EgressAttemptErr::SignaledDown(_));
+            let _ = finalize_egress_error(&st_c, 0, claim, err);
+            Ok(is_signaled)
+        }));
+    }
+
+    // Confirm all 30 attempts are in-flight before injecting the single transport failure.
+    all_ready.notified().await;
+    assert_eq!(in_flight.load(Relaxed), 30);
+
+    let before_fail = Instant::now();
+    release_fail.notify_one();
+
+    let mut signaled_count = 0usize;
+    for j in joins {
+        if j.await?? {
+            signaled_count += 1;
+        }
+    }
+    hold_rest.notify_waiters();
+    srv.abort();
+
+    assert_eq!(
+        signaled_count, 29,
+        "exactly 29 peer attempts must cancel via SignaledDown"
+    );
+    let h = st.egress_health.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(
+        h.nodes[0].failures, 1,
+        "SignaledDown cancellations must not increment slot.failures"
+    );
+    let until = h.nodes[0].until.context("node 0 must be in cooldown")?;
+    let assigned = until.saturating_duration_since(before_fail);
+    // Base cooldown is 3s with ±20% jitter -> [2400ms, 3600ms], never inflated to 2*base (6s) or max (60s).
+    assert!(
+        assigned >= Duration::from_millis(2400) && assigned <= Duration::from_millis(3650),
+        "assigned cooldown must equal base ±20% jitter (got {assigned:?})"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn inv10_f23_ack_timeout_after_preface_is_dc_level_while_connect_timeout_is_node_level(
+) -> Result<()> {
+    let cover = cover_mock().await?;
+
+    // Mock egress: for DC 2 (DC-A) accepts TCP, reads full 88-byte MTV2 preface, then stalls ACK
+    // longer than actual per_try; for DC 4 (DC-B) responds immediately with EGRESS_ACK_OK.
+    let l = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = l.local_addr()?;
+    let srv = tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 88];
+                if s.read_exact(&mut buf).await.is_ok() {
+                    let dc = i16::from_le_bytes([buf[4], buf[5]]);
+                    if dc == 2 {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    } else {
+                        let _ = s.write_all(&[EGRESS_ACK_OK]).await;
+                        let mut drain = [0u8; 16];
+                        let _ = timeout(Duration::from_secs(2), s.read(&mut drain)).await;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut st).context("unique state")?;
+        sm.egress_upstreams = vec![addr];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(1));
+        sm.egress_cooldown = Duration::from_secs(10);
+        sm.egress_cooldown_max = Duration::from_secs(60);
+        sm.egress_use_mtv3 = false;
+        sm.handshake = Duration::from_secs(4);
+    }
+    // Seed 4 fast samples on node 0 so adaptive_per_try is active (300ms).
+    for _ in 0..4 {
+        EgressHealth::record_ack_latency(&st.egress_health, 0, Duration::from_millis(10));
+    }
+    let max_per_try = Duration::from_secs(2);
+    let actual_per_try = EgressHealth::adaptive_per_try(&st.egress_health, 0, max_per_try);
+
+    // Scenario 1: TCP established + full preface written + ACK exceeds actual_per_try (5s > actual_per_try).
+    let notifier = EgressHealth::node_down_notifier(&st.egress_health, 0);
+    let node_down_fut = notifier.notified();
+    tokio::pin!(node_down_fut);
+    node_down_fut.as_mut().enable();
+
+    let claim_a =
+        EgressHealth::try_claim(&st.egress_health, 0, 2, Instant::now()).context("claim DC-A")?;
+    let Err(err_a) = dial_egress_candidate(&st, 0, 2, 2, &[0x11; 64], actual_per_try).await else {
+        anyhow::bail!("DC-A must time out waiting for ACK");
+    };
+    assert!(
+        matches!(err_a, EgressAttemptErr::Dc(_)),
+        "ACK timeout after full preface write must be classified as Dc-level"
+    );
+    let _ = finalize_egress_error(&st, 0, claim_a, err_a);
+
+    // Verify: (node 0, DC 2) is in cooldown, node 0 itself is NOT in cooldown, node_down NOT sent.
+    {
+        let h = st.egress_health.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            h.nodes[0].until.is_none(),
+            "whole node must NOT be cooled down on ACK timeout after preface"
+        );
+        assert!(
+            h.dc_slots.get(&(0, 2)).and_then(|s| s.until).is_some(),
+            "(node 0, DC-A) must be in cooldown"
+        );
+    }
+    assert!(
+        timeout(Duration::from_millis(20), &mut node_down_fut)
+            .await
+            .is_err(),
+        "node_down must NOT be signaled on DC-level ACK timeout"
+    );
+
+    // While DC-A (2) is still in cooldown, DC-B (4) connects cleanly through the SAME node 0!
+    let (stream_b, route_b) = connect_upstream(&st, 4, &[0x22; 64])
+        .await
+        .context("DC-B must succeed through same node while DC-A is in cooldown")?;
+    assert_eq!(route_b, "egress");
+    drop(stream_b);
+    srv.abort();
+
+    // Scenario 2: Real transport failure before preface write (closed port -> connection refused)
+    // cools down the whole node AND signals node_down.
+    let dead_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let dead_addr = dead_listener.local_addr()?;
+    drop(dead_listener);
+
+    let mut st2 = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut st2).context("unique state")?;
+        sm.egress_upstreams = vec![dead_addr];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(1));
+        sm.egress_cooldown = Duration::from_secs(10);
+        sm.egress_cooldown_max = Duration::from_secs(60);
+        sm.egress_use_mtv3 = false;
+        sm.handshake = Duration::from_secs(4);
+    }
+    let notifier2 = EgressHealth::node_down_notifier(&st2.egress_health, 0);
+    let node_down_fut2 = notifier2.notified();
+    tokio::pin!(node_down_fut2);
+    node_down_fut2.as_mut().enable();
+
+    let claim_dead = EgressHealth::try_claim(&st2.egress_health, 0, 2, Instant::now())
+        .context("claim dead node")?;
+    let Err(err_dead) =
+        dial_egress_candidate(&st2, 0, 2, 2, &[0x33; 64], Duration::from_secs(1)).await
+    else {
+        anyhow::bail!("closed port must fail");
+    };
+    assert!(
+        matches!(err_dead, EgressAttemptErr::Node(_)),
+        "pre-preface transport error must be Node-level"
+    );
+    let _ = finalize_egress_error(&st2, 0, claim_dead, err_dead);
+
+    {
+        let h2 = st2.egress_health.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            h2.nodes[0].until.is_some(),
+            "whole node must be in cooldown after pre-preface transport failure"
+        );
+    }
+    timeout(Duration::from_millis(50), &mut node_down_fut2)
+        .await
+        .context("node_down must be signaled on pre-preface transport failure")?;
+    Ok(())
+}
+
+#[test]
+fn inv10_f23_compare_per_try_floor_policies_slow_route_vs_blackhole() {
+    // Compare Policy A: fixed 800ms floor vs Policy B: max(300ms, 2*p95) clamped to max_per_try=2000ms.
+    let max_ms = 2000u64;
+    let policy_a = |samples: &[u64]| -> u64 {
+        let mut s = samples.to_vec();
+        s.sort_unstable();
+        let med = s[s.len() / 2];
+        med.saturating_mul(3).clamp(800, max_ms)
+    };
+    let policy_b = |samples: &[u64]| -> u64 {
+        let h = std::sync::Mutex::new(EgressHealth::new(1));
+        for &ms in samples {
+            EgressHealth::record_ack_latency(&h, 0, Duration::from_millis(ms));
+        }
+        EgressHealth::adaptive_per_try(&h, 0, Duration::from_millis(max_ms)).as_millis() as u64
+    };
+
+    // (a) Healthy slow/jittery route: 18 samples at 120ms, 2 tail samples at 420ms -> p95=420ms.
+    let mut slow_samples = vec![120u64; 18];
+    slow_samples.extend_from_slice(&[420, 420]);
+    let per_try_a_slow = policy_a(&slow_samples);
+    let per_try_b_slow = policy_b(&slow_samples);
+    // Both avoid false timeouts on 500ms tail spikes (A=800ms, B=840ms); Policy B even scales above 800ms for slower tails!
+    assert_eq!(per_try_a_slow, 800);
+    assert_eq!(per_try_b_slow, 840);
+
+    // (b) Fast route hitting blackhole (no hedge / 2nd attempt): 19 samples at 15ms, 1 at 40ms -> p95=40ms.
+    let mut fast_samples = vec![15u64; 19];
+    fast_samples.push(40);
+    let per_try_a_bh = policy_a(&fast_samples);
+    let per_try_b_bh = policy_b(&fast_samples);
+    // Policy B cuts unhedged blackhole detection from 800ms down to 300ms (2.67x faster).
+    assert_eq!(per_try_a_bh, 800);
+    assert_eq!(per_try_b_bh, 300);
 }
