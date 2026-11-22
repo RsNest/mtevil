@@ -779,6 +779,7 @@ services:
     profiles: [tools]
     volumes:
       - state:/var/lib/mtevil
+      - replay:/var/lib/mtevil-replay
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -1356,64 +1357,270 @@ def download_url_atomic(
                 pass
 
 
-def migrate_compose_and_replay_on_update(deploy_dir: Path, cfg_file: Path, compose_file: Path) -> bool:
-    """Migrate pre-v0.2 compose.yaml (rw state volume) and config.json replay_file to isolated state:ro + replay."""
+class MigrationError(ValueError):
+    """Raised when an existing compose.yaml/config.json cannot be safely migrated to v0.2 layout."""
+
+
+def _plan_compose_v02_migration(compose_text: str, svc_name: str) -> tuple[bool, str]:
+    """Surgically patch compose.yaml for v0.2 (state:ro, replay volume, init service).
+
+    Preserves all user customizations (ports, environment, extra volumes, ulimits,
+    labels, cpus/mem_limit, extra services). Raises MigrationError if the compose
+    file is malformed or cannot be patched safely.
+    """
+    if "\t" in compose_text:
+        raise MigrationError("compose.yaml содержит символы табуляции (некорректный YAML)")
+    if not compose_text.strip():
+        raise MigrationError("compose.yaml пуст")
+
+    lines = compose_text.splitlines()
+    services_idx = None
+    volumes_idx = None
+    for i, line in enumerate(lines):
+        if re.match(r"^services\s*:\s*(#.*)?$", line):
+            services_idx = i
+        elif re.match(r"^volumes\s*:\s*(#.*)?$", line):
+            volumes_idx = i
+
+    if services_idx is None:
+        raise MigrationError("в compose.yaml отсутствует секция services:")
+
+    services_end = len(lines)
+    for i in range(services_idx + 1, len(lines)):
+        if lines[i] and not lines[i].startswith(" ") and not lines[i].startswith("#"):
+            services_end = i
+            break
+
+    svc_start = None
+    svc_indent = None
+    has_init_svc = False
+    for i in range(services_idx + 1, services_end):
+        m = re.match(r"^( +)([A-Za-z0-9_.-]+)\s*:\s*(#.*)?$", lines[i])
+        if m:
+            ind = len(m.group(1))
+            name = m.group(2)
+            if svc_indent is None or ind == svc_indent:
+                if name == svc_name and svc_start is None:
+                    svc_start = i
+                    svc_indent = ind
+                elif name == "init":
+                    has_init_svc = True
+
+    if svc_start is None or svc_indent is None:
+        raise MigrationError(f"в compose.yaml не найден сервис '{svc_name}:' в секции services:")
+
+    svc_end = services_end
+    for i in range(svc_start + 1, services_end):
+        if lines[i].strip() and not lines[i].lstrip().startswith("#"):
+            cur_ind = len(lines[i]) - len(lines[i].lstrip(" "))
+            if cur_ind <= svc_indent:
+                svc_end = i
+                break
+
+    svc_vol_hdr = None
+    svc_vol_indent = None
+    for i in range(svc_start + 1, svc_end):
+        m = re.match(r"^( +)volumes\s*:\s*(#.*)?$", lines[i])
+        if m and len(m.group(1)) > svc_indent:
+            svc_vol_hdr = i
+            svc_vol_indent = len(m.group(1))
+            break
+
+    if svc_vol_hdr is None or svc_vol_indent is None:
+        if "state:/var/lib/mtevil" not in compose_text:
+            return False, compose_text
+        raise MigrationError(f"в сервисе '{svc_name}' не найдена секция volumes:")
+
+    svc_vol_end = svc_end
+    for i in range(svc_vol_hdr + 1, svc_end):
+        if lines[i].strip() and not lines[i].lstrip().startswith("#"):
+            cur_ind = len(lines[i]) - len(lines[i].lstrip(" "))
+            if cur_ind <= svc_vol_indent and not lines[i].lstrip().startswith("-"):
+                svc_vol_end = i
+                break
+
+    state_line_idx = None
+    has_state_ro = False
+    has_replay_mount = False
+    for i in range(svc_vol_hdr + 1, svc_vol_end):
+        stripped = lines[i].strip()
+        if re.match(r'^-\s*["\']?state:/var/lib/mtevil:ro["\']?\s*(#.*)?$', stripped):
+            state_line_idx = i
+            has_state_ro = True
+        elif re.match(r'^-\s*["\']?state:/var/lib/mtevil(?::rw)?["\']?\s*(#.*)?$', stripped):
+            state_line_idx = i
+        elif "replay:/var/lib/mtevil-replay" in stripped:
+            has_replay_mount = True
+
+    if state_line_idx is None:
+        if "state:/var/lib/mtevil" not in compose_text:
+            return False, compose_text
+        raise MigrationError(f"не удалось безопасно распознать монтирование state:/var/lib/mtevil в сервисе '{svc_name}'")
+
+    has_top_replay = False
+    if volumes_idx is not None:
+        for i in range(volumes_idx + 1, len(lines)):
+            if lines[i] and not lines[i].startswith(" ") and not lines[i].startswith("#"):
+                break
+            if re.match(r"^ +replay\s*:", lines[i]):
+                has_top_replay = True
+                break
+    else:
+        raise MigrationError("в compose.yaml отсутствует корневая секция volumes: для тома state")
+
+    if has_state_ro and has_replay_mount and has_init_svc and has_top_replay:
+        return False, compose_text
+
+    out = list(lines)
+
+    # 1. Switch state mount to :ro and add replay mount right below it.
+    state_ind = " " * (len(out[state_line_idx]) - len(out[state_line_idx].lstrip(" ")))
+    if not has_state_ro:
+        out[state_line_idx] = f"{state_ind}- state:/var/lib/mtevil:ro"
+    inserted_offset = 0
+    if not has_replay_mount:
+        out.insert(state_line_idx + 1, f"{state_ind}- replay:/var/lib/mtevil-replay")
+        inserted_offset += 1
+
+    # 2. Insert `init` service if absent (reusing `<<: *image` if anchor exists, else matching image line).
+    if not has_init_svc:
+        has_image_anchor = any("&image" in l for l in out[:services_idx])
+        img_spec = "<<: *image"
+        if not has_image_anchor:
+            found_img = f"image: ${{MTEVIL_IMAGE:-{DEFAULT_IMAGE}}}"
+            for i in range(svc_start + 1, svc_end + inserted_offset):
+                m_img = re.match(r"^ +(image\s*:\s*.+)$", out[i])
+                if m_img:
+                    found_img = m_img.group(1).strip()
+                    break
+            img_spec = found_img
+        pad = " " * svc_indent
+        init_block = [
+            "",
+            f"{pad}init:",
+            f"{pad}  {img_spec}",
+            f"{pad}  profiles: [tools]",
+            f"{pad}  volumes:",
+            f"{pad}    - state:/var/lib/mtevil",
+            f"{pad}    - replay:/var/lib/mtevil-replay",
+            f"{pad}  read_only: true",
+            f"{pad}  cap_drop: [ALL]",
+            f"{pad}  security_opt: [no-new-privileges:true]",
+            f"{pad}  mem_limit: 64m",
+            f"{pad}  pids_limit: 32",
+        ]
+        insert_at = services_end + inserted_offset
+        while insert_at > services_idx + 1 and out[insert_at - 1].strip() == "":
+            insert_at -= 1
+        for offset_i, bl in enumerate(init_block):
+            out.insert(insert_at + offset_i, bl)
+        inserted_offset += len(init_block)
+
+    # 3. Declare `replay:` under top-level `volumes:` if absent.
+    if not has_top_replay:
+        vol_pos = None
+        state_vol_pos = None
+        state_vol_ind = "  "
+        for i, l in enumerate(out):
+            if re.match(r"^volumes\s*:\s*(#.*)?$", l):
+                vol_pos = i
+                break
+        if vol_pos is None:
+            raise MigrationError("в compose.yaml отсутствует корневая секция volumes:")
+        for i in range(vol_pos + 1, len(out)):
+            if out[i] and not out[i].startswith(" ") and not out[i].startswith("#"):
+                break
+            m_sv = re.match(r"^( +)state\s*:", out[i])
+            if m_sv:
+                state_vol_pos = i
+                state_vol_ind = m_sv.group(1)
+                break
+        if state_vol_pos is not None:
+            out.insert(state_vol_pos + 1, f"{state_vol_ind}replay:")
+        else:
+            out.insert(vol_pos + 1, f"{state_vol_ind}replay:")
+
+    return True, "\n".join(out) + "\n"
+
+
+def migrate_compose_and_replay_on_update(
+    deploy_dir: Path,
+    cfg_file: Path,
+    compose_file: Path,
+    *,
+    dry_run: bool = False,
+) -> bool:
+    """Safely migrate pre-v0.2 compose.yaml and config.json to isolated state:ro + replay.
+
+    - Preserves compose.yaml.pre-v0.2 and config.json.pre-v0.2 before the first edit (never overwrites existing).
+    - Surgically patches compose.yaml to keep all user customizations (ports, env, volumes, ulimits, labels, cpus/mem, extra services).
+    - Raises MigrationError without modifying any file if compose.yaml or config.json cannot be safely migrated.
+    """
     try:
-        compose_text = compose_file.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return False
-    has_legacy_rw_state = (
-        "state:/var/lib/mtevil" in compose_text and "state:/var/lib/mtevil:ro" not in compose_text
-    )
-    needs_compose = has_legacy_rw_state or (
-        "state:/var/lib/mtevil" in compose_text
-        and ("replay:/var/lib/mtevil-replay" not in compose_text or "\n  init:\n" not in compose_text)
-    )
-    if not needs_compose:
-        return False
+        compose_text = compose_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise MigrationError(f"не удалось прочитать compose.yaml: {exc}") from exc
     try:
-        cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
+        cfg_text = cfg_file.read_text(encoding="utf-8")
+        cfg = json.loads(cfg_text)
+    except (OSError, ValueError) as exc:
+        raise MigrationError(f"некорректный config.json: {exc}") from exc
     if not isinstance(cfg, dict):
-        return False
+        raise MigrationError("config.json должен содержать JSON-объект")
+
+    svc_name = deployment_service(deploy_dir)
+    compose_changed, new_compose = _plan_compose_v02_migration(compose_text, svc_name)
 
     role = str(cfg.get("role") or "direct")
-    network_host = "network_mode: host" in compose_text
-    include_build = "\n  build:\n" in compose_text
-    health_host = "127.0.0.1"
-    health_port: int | None = None
-    listen = str(cfg.get("listen") or "").strip()
-    if network_host and ":" in listen:
-        h_part, p_part = listen.rsplit(":", 1)
-        h_part = h_part.strip("[]")
-        if h_part and h_part not in ("0.0.0.0", "::"):
-            health_host = h_part
-        try:
-            health_port = int(p_part)
-        except ValueError:
-            health_port = None
-    raw_max_conn = cfg.get("max_connections")
-    max_conn = raw_max_conn if isinstance(raw_max_conn, int) else None
+    cfg_changed = False
+    new_cfg = dict(cfg)
+    if compose_changed or "replay:/var/lib/mtevil-replay" in new_compose:
+        if new_cfg.get("replay_file") == "/var/lib/mtevil/replay.bin" or (
+            role in ("direct", "edge") and "replay_file" not in new_cfg
+        ):
+            new_cfg["replay_file"] = "/var/lib/mtevil-replay/replay.bin"
+            cfg_changed = True
 
-    new_compose = render_compose(
-        Path(__file__).resolve().parent.parent,
-        deploy_dir,
-        role,
-        network_host=network_host,
-        health_host=health_host,
-        health_port=health_port,
-        include_build=include_build,
-        max_connections=max_conn,
-    )
-    compose_file.write_text(new_compose, encoding="utf-8")
+    if not compose_changed and not cfg_changed:
+        return False
+    if dry_run:
+        return True
 
-    if cfg.get("replay_file") == "/var/lib/mtevil/replay.bin" or (
-        role in ("direct", "edge") and "replay_file" not in cfg
-    ):
-        cfg["replay_file"] = "/var/lib/mtevil-replay/replay.bin"
-        cfg_file.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    pre_compose = deploy_dir / "compose.yaml.pre-v0.2"
+    if not pre_compose.exists():
+        pre_compose.write_text(compose_text, encoding="utf-8")
+    pre_cfg = deploy_dir / "config.json.pre-v0.2"
+    if not pre_cfg.exists():
+        pre_cfg.write_text(cfg_text, encoding="utf-8")
+
+    if compose_changed:
+        compose_file.write_text(new_compose, encoding="utf-8")
+    if cfg_changed:
+        cfg_file.write_text(json.dumps(new_cfg, indent=2) + "\n", encoding="utf-8")
     return True
+
+
+def copy_legacy_replay_bin_to_replay_volume(base: list[str]) -> bool:
+    """Copy existing /var/lib/mtevil/replay.bin bytes into /var/lib/mtevil-replay/replay.bin via init service."""
+    if compose_write_service(base) != "init":
+        return False
+    proc = run(
+        base
+        + [
+            "run",
+            "--rm",
+            "-T",
+            "--no-deps",
+            "--entrypoint",
+            "/bin/sh",
+            "init",
+            "-c",
+            "if [ -f /var/lib/mtevil/replay.bin ] && [ ! -f /var/lib/mtevil-replay/replay.bin ]; then "
+            "cp -p /var/lib/mtevil/replay.bin /var/lib/mtevil-replay/replay.bin && echo COPIED; fi",
+        ],
+        check=False,
+    )
+    return proc.returncode == 0 and "COPIED" in (proc.stdout or "")
 
 
 def strip_legacy_default_mss(cfg_file: Path) -> bool:
@@ -1863,6 +2070,16 @@ def run_update_command(
             print(detail, file=sys.stderr)
         return 1
 
+    # Validate migration plan BEFORE saving rollback or touching live files / stopping the running container.
+    try:
+        migrate_compose_and_replay_on_update(deploy_dir, cfg_file, compose_file, dry_run=True)
+    except MigrationError as exc:
+        print(
+            err_text(f"Не удалось безопасно мигрировать compose.yaml/config.json: {exc}. Обновление отменено, текущий сервис не затронут."),
+            file=sys.stderr,
+        )
+        return 1
+
     # Save rollback snapshot of the currently working version, image tag, and config before modifying anything.
     try:
         save_rollback_snapshot(
@@ -1878,11 +2095,13 @@ def run_update_command(
         return 1
 
     strip_legacy_default_mss(cfg_file)
-    migrate_compose_and_replay_on_update(deploy_dir, cfg_file, compose_file)
+    migrated_v02 = migrate_compose_and_replay_on_update(deploy_dir, cfg_file, compose_file)
     orig_env_text = env_file.read_text(encoding="utf-8", errors="ignore")
     env_file.write_text(set_env_image(orig_env_text, target_image), encoding="utf-8")
 
     base = compose_cmd(deploy_dir, project)
+    if migrated_v02:
+        copy_legacy_replay_bin_to_replay_volume(base)
     up_proc = run(base + ["up", "-d", "--no-build", "--force-recreate", compose_service(base)], check=False)
     if up_proc.returncode != 0:
         detail = (up_proc.stderr or up_proc.stdout or "").strip()

@@ -2125,35 +2125,136 @@ class SetupValidationTests(unittest.TestCase):
             self.assertEqual(len(del_cmds), 1)
             self.assertIn(" run --rm -T --no-deps --entrypoint /usr/local/bin/mtevil init user-del ", del_cmds[0])
 
-            # Verify v0.1.5 -> v0.2.0 migration of legacy rw state compose.yaml + replay_file.
-            d_mig = d / "mig_v015"
-            d_mig.mkdir()
-            (d_mig / "compose.yaml").write_text(
-                "services:\n  mtevil:\n    image: ${MTEVIL_IMAGE}\n    network_mode: host\n"
-                "    volumes:\n      - ./config.json:/etc/mtevil/config.json:ro\n      - state:/var/lib/mtevil\n"
-                "volumes:\n  state:\n",
+            # Verify v0.1.5 -> v0.2.0 migration across:
+            # 1) standard compose, 2) customized compose (+ .pre-v0.2 backup preservation on retry),
+            # 3) host-network edge compose, 4) corrupted compose (fails before touching files or stopping container).
+            d_std = d / "mig_std"
+            d_std.mkdir()
+            std_compose = (
+                "name: ${MTEVIL_PROJECT:-mtevil-direct}\n\n"
+                "services:\n"
+                "  mtevil:\n"
+                "    image: ${MTEVIL_IMAGE:-ghcr.io/rsnest/mtevil:v0.1.5}\n"
+                "    ports:\n"
+                '      - "0.0.0.0:443:24443/tcp"\n'
+                "    volumes:\n"
+                "      - ./config.json:/etc/mtevil/config.json:ro\n"
+                "      - state:/var/lib/mtevil\n\n"
+                "volumes:\n"
+                "  state:\n"
+            )
+            std_cfg = setup.json.dumps({"role": "direct", "listen": "0.0.0.0:24443", "replay_file": "/var/lib/mtevil/replay.bin"}) + "\n"
+            (d_std / "compose.yaml").write_text(std_compose, encoding="utf-8")
+            (d_std / "config.json").write_text(std_cfg, encoding="utf-8")
+            self.assertTrue(setup.migrate_compose_and_replay_on_update(d_std, d_std / "config.json", d_std / "compose.yaml"))
+            self.assertEqual((d_std / "compose.yaml.pre-v0.2").read_text(encoding="utf-8"), std_compose)
+            self.assertEqual((d_std / "config.json.pre-v0.2").read_text(encoding="utf-8"), std_cfg)
+            std_after = (d_std / "compose.yaml").read_text(encoding="utf-8")
+            self.assertIn("state:/var/lib/mtevil:ro", std_after)
+            self.assertIn("replay:/var/lib/mtevil-replay", std_after)
+            self.assertIn("\n  init:\n", std_after)
+            self.assertIn("\n  replay:\n", std_after)
+            self.assertEqual(setup.json.loads((d_std / "config.json").read_text(encoding="utf-8"))["replay_file"], "/var/lib/mtevil-replay/replay.bin")
+            self.assertFalse(setup.migrate_compose_and_replay_on_update(d_std, d_std / "config.json", d_std / "compose.yaml"))
+
+            # 2) Custom compose: ports, environment, extra volumes, ulimits, labels, cpus/mem, extra service preserved!
+            d_cust = d / "mig_custom"
+            d_cust.mkdir()
+            cust_compose = (
+                "name: ${MTEVIL_PROJECT:-mtevil-custom}\n\n"
+                "services:\n"
+                "  mtevil:\n"
+                "    image: ${MTEVIL_IMAGE:-ghcr.io/rsnest/mtevil:v0.1.5}\n"
+                "    ports:\n"
+                '      - "127.0.0.1:8443:24443/tcp"\n'
+                "    environment:\n"
+                "      - CUSTOM_ENV=keep_me\n"
+                "    labels:\n"
+                '      com.example.role: "custom-proxy"\n'
+                "    cpus: \"1.50\"\n"
+                "    mem_limit: 512m\n"
+                "    ulimits:\n"
+                "      nofile:\n"
+                "        soft: 16384\n"
+                "        hard: 16384\n"
+                "    volumes:\n"
+                "      - ./config.json:/etc/mtevil/config.json:ro\n"
+                "      - state:/var/lib/mtevil\n"
+                "      - ./extra-certs:/etc/extra:ro\n"
+                "  sidecar:\n"
+                "    image: alpine:3.20\n"
+                '    command: ["sleep", "infinity"]\n\n'
+                "volumes:\n"
+                "  state:\n"
+                "  custom_vol:\n"
+            )
+            (d_cust / "compose.yaml").write_text(cust_compose, encoding="utf-8")
+            (d_cust / "config.json").write_text(std_cfg, encoding="utf-8")
+            self.assertTrue(setup.migrate_compose_and_replay_on_update(d_cust, d_cust / "config.json", d_cust / "compose.yaml"))
+            cust_after = (d_cust / "compose.yaml").read_text(encoding="utf-8")
+            for must_keep in (
+                '127.0.0.1:8443:24443/tcp',
+                'CUSTOM_ENV=keep_me',
+                'com.example.role: "custom-proxy"',
+                'cpus: "1.50"',
+                'mem_limit: 512m',
+                'soft: 16384',
+                './extra-certs:/etc/extra:ro',
+                '  sidecar:',
+                '  custom_vol:',
+                'state:/var/lib/mtevil:ro',
+                'replay:/var/lib/mtevil-replay',
+                '  init:',
+                '  replay:',
+            ):
+                self.assertIn(must_keep, cust_after)
+            # Retry after modifying compose.yaml must NOT overwrite existing .pre-v0.2 backup!
+            (d_cust / "compose.yaml").write_text(cust_compose.replace("CUSTOM_ENV=keep_me", "CUSTOM_ENV=retry"), encoding="utf-8")
+            self.assertTrue(setup.migrate_compose_and_replay_on_update(d_cust, d_cust / "config.json", d_cust / "compose.yaml"))
+            self.assertIn("CUSTOM_ENV=keep_me", (d_cust / "compose.yaml.pre-v0.2").read_text(encoding="utf-8"))
+
+            # 3) Host-network edge compose
+            d_edge = d / "mig_edge"
+            d_edge.mkdir()
+            edge_compose = (
+                "services:\n"
+                "  mtevil:\n"
+                "    image: ${MTEVIL_IMAGE}\n"
+                "    network_mode: host\n"
+                "    volumes:\n"
+                "      - ./config.json:/etc/mtevil/config.json:ro\n"
+                "      - state:/var/lib/mtevil\n"
+                "    healthcheck:\n"
+                '      test: [CMD, /usr/local/bin/mtevil, health, --address, "127.0.0.1:443"]\n'
+                "volumes:\n"
+                "  state:\n"
+            )
+            (d_edge / "compose.yaml").write_text(edge_compose, encoding="utf-8")
+            (d_edge / "config.json").write_text(
+                setup.json.dumps({"role": "edge", "listen": "0.0.0.0:443", "replay_file": "/var/lib/mtevil/replay.bin"}) + "\n",
                 encoding="utf-8",
             )
-            (d_mig / "config.json").write_text(
-                setup.json.dumps({
-                    "role": "direct",
-                    "listen": "0.0.0.0:24443",
-                    "replay_file": "/var/lib/mtevil/replay.bin",
-                    "max_connections": 256,
-                }) + "\n",
-                encoding="utf-8",
-            )
-            self.assertTrue(setup.migrate_compose_and_replay_on_update(d_mig, d_mig / "config.json", d_mig / "compose.yaml"))
-            mig_compose = (d_mig / "compose.yaml").read_text(encoding="utf-8")
-            self.assertIn("state:/var/lib/mtevil:ro", mig_compose)
-            self.assertIn("replay:/var/lib/mtevil-replay", mig_compose)
-            self.assertIn("\n  init:\n", mig_compose)
-            self.assertIn("network_mode: host", mig_compose)
-            self.assertIn('"127.0.0.1:24443"', mig_compose)
-            mig_cfg = setup.json.loads((d_mig / "config.json").read_text(encoding="utf-8"))
-            self.assertEqual(mig_cfg["replay_file"], "/var/lib/mtevil-replay/replay.bin")
-            # Idempotent on second call.
-            self.assertFalse(setup.migrate_compose_and_replay_on_update(d_mig, d_mig / "config.json", d_mig / "compose.yaml"))
+            self.assertTrue(setup.migrate_compose_and_replay_on_update(d_edge, d_edge / "config.json", d_edge / "compose.yaml"))
+            edge_after = (d_edge / "compose.yaml").read_text(encoding="utf-8")
+            self.assertIn("network_mode: host", edge_after)
+            self.assertIn('"127.0.0.1:443"', edge_after)
+            self.assertIn("state:/var/lib/mtevil:ro", edge_after)
+            self.assertIn("replay:/var/lib/mtevil-replay", edge_after)
+
+            # 4) Corrupted compose (tab indentation / missing volumes section) -> MigrationError without touching files!
+            for bad_name, bad_yaml in (
+                ("bad_tab", "services:\n\tmtevil:\n\t\tvolumes:\n\t\t\t- state:/var/lib/mtevil\nvolumes:\n  state:\n"),
+                ("bad_no_vols", "services:\n  mtevil:\n    volumes:\n      - state:/var/lib/mtevil\n"),
+            ):
+                d_bad = d / bad_name
+                d_bad.mkdir()
+                (d_bad / "compose.yaml").write_text(bad_yaml, encoding="utf-8")
+                (d_bad / "config.json").write_text(std_cfg, encoding="utf-8")
+                with self.assertRaises(setup.MigrationError):
+                    setup.migrate_compose_and_replay_on_update(d_bad, d_bad / "config.json", d_bad / "compose.yaml")
+                self.assertEqual((d_bad / "compose.yaml").read_text(encoding="utf-8"), bad_yaml)
+                self.assertEqual((d_bad / "config.json").read_text(encoding="utf-8"), std_cfg)
+                self.assertFalse((d_bad / "compose.yaml.pre-v0.2").exists())
 
     def test_release_publish_flags_and_updater_channel_selection(self):
         # 1. Verify compute_release_publish_flags across prereleases, newer stable, older stable, and draft handling.
