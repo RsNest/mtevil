@@ -67,7 +67,7 @@ def select_latest_release(
         }
         if not {"install.sh", "setup.py"}.issubset(ready_names):
             continue
-        if key[3] < STAGE_RANKS[None]:
+        if rel.get("prerelease") or key[3] < STAGE_RANKS[None]:
             prerelease_candidates.append((key, tag))
             if allow_prerelease:
                 candidates.append((key, tag))
@@ -85,6 +85,36 @@ def select_latest_release(
         raise ValueError("no eligible published release with install.sh and setup.py assets")
     candidates.sort(key=lambda item: item[0])
     return candidates[-1][1]
+
+
+def compute_release_publish_flags(
+    tag: str,
+    published_releases: list[dict[str, object]],
+) -> tuple[str, str]:
+    """Return (prerelease_flag, latest_flag) for `gh release edit`.
+
+    Supported alpha/beta/rc tags are always published as prereleases and explicitly
+    excluded from GitHub Latest (`--prerelease=true`, `--latest=false`).
+    Stable tags are compared only against other non-draft stable releases so an older
+    stable tag gets `--latest=false` while a newer stable tag gets `--latest`.
+    """
+    if is_prerelease_tag(tag):
+        return ("--prerelease=true", "--latest=false")
+
+    target_key = parse_semver_tag(tag)
+    is_newest = True
+    if target_key is not None:
+        for rel in published_releases:
+            if not isinstance(rel, dict) or rel.get("isDraft") or rel.get("draft"):
+                continue
+            other_tag = str(rel.get("tagName") or rel.get("tag_name") or "").strip()
+            if rel.get("isPrerelease") or rel.get("prerelease") or is_prerelease_tag(other_tag):
+                continue
+            other_key = parse_semver_tag(other_tag)
+            if other_key is not None and other_key > target_key:
+                is_newest = False
+                break
+    return ("--prerelease=false", "--latest" if is_newest else "--latest=false")
 
 
 def resolve_commit_release_tag(
