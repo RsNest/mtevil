@@ -38,8 +38,8 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --locked
 
-      - name: Run deploy setup tests
-        run: MTEVIL_REQUIRE_ALL_TESTS=0 python3 -m unittest discover -s deploy -p "test_*.py" -v
+      - name: Run deploy setup unit tests
+        run: MTEVIL_REQUIRE_ALL_TESTS=0 python3 deploy/run_tests.py
 
   security:
     name: Cargo Deny & Audit
@@ -84,7 +84,7 @@ jobs:
           done
 
   docker:
-    name: Docker Build (no push)
+    name: Docker Build & Deploy Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -93,11 +93,18 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image
+      - name: Build and load Docker image from checkout
         uses: docker/build-push-action@v6
         with:
           context: .
+          tags: mtevil:ci
           push: false
-          load: false
+          load: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Run complete deploy test suite (no skips allowed)
+        env:
+          MTEVIL_TEST_IMAGE: mtevil:ci
+          MTEVIL_REQUIRE_ALL_TESTS: "1"
+        run: python3 deploy/run_tests.py
