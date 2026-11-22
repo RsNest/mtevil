@@ -184,6 +184,45 @@ pub(crate) async fn relay_client(
             }
         }
     }
+    if let Some(edge_me) = &state.edge_me {
+        let effective_peer = client_peer.or_else(|| client.peer_addr().ok());
+        let remote_addr = if edge_me.send_client_ip {
+            me::extract_client_ipv4(effective_peer)
+        } else {
+            None
+        };
+        match connect_upstream_mtv4(state, transport.dc, remote_addr).await {
+            Ok((upstream, route)) => {
+                return me::relay_edge_mtv4_session(
+                    client,
+                    upstream,
+                    route,
+                    state,
+                    session_id,
+                    t0,
+                    user,
+                    transport,
+                    tls,
+                    hello_read_us,
+                    flight_written_us,
+                    diag,
+                )
+                .await;
+            }
+            Err(err) => {
+                if edge_me.fallback_to_direct {
+                    edge_me.record_fallback_to_direct(
+                        &state.counters,
+                        session_id,
+                        transport.dc,
+                        &err.to_string(),
+                    );
+                } else {
+                    return Err(err.context("edge_me_strict_no_healthy_egress"));
+                }
+            }
+        }
+    }
     let us = || t0.elapsed().as_micros() as u64;
     let framed = tls.is_some();
     let inner_header_us = us();

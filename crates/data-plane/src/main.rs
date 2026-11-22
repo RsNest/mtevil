@@ -339,6 +339,7 @@ struct State {
     alerts_file: Option<PathBuf>,
     diagnostics: bool,
     me: Option<Arc<me::MeRuntime>>,
+    edge_me: Option<Arc<me::EdgeMeSettings>>,
 }
 
 impl State {
@@ -893,13 +894,22 @@ async fn main() -> Result<()> {
         );
         let counters = Arc::new(telemetry::Counters::default());
         counters.ensure_started();
+        let me_cache_dir = stats_path
+            .parent()
+            .map(|d| d.join("me-cache"))
+            .unwrap_or_else(|| PathBuf::from("/var/lib/mtevil-replay/me-cache"));
+        let egress_me_rt = if config.me.enabled {
+            Some(me::MeRuntime::start(config.me.clone(), me_cache_dir, counters.clone()).await)
+        } else {
+            None
+        };
         let (stats_stop_tx, stats_stop_rx) = tokio::sync::oneshot::channel::<()>();
         let stats_task = spawn_stats_writer(
             counters.clone(),
             "egress",
             stats_path,
             Duration::from_millis(500),
-            None,
+            egress_me_rt.clone(),
             stats_stop_rx,
         );
         let (metrics_stop_tx, metrics_stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -928,6 +938,7 @@ async fn main() -> Result<()> {
                 .egress_nonce_cache_capacity
                 .unwrap_or_else(|| config::default_egress_nonce_cache_capacity(effective_max)),
             dc_media_overrides: dc_media_overrides.clone(),
+            me: egress_me_rt.clone(),
         };
         let dcs_arc = Arc::new(dcs);
         let dc_monitor = (config.dc_probe_interval_secs > 0).then(|| {
@@ -965,6 +976,9 @@ async fn main() -> Result<()> {
         if let Some(task) = dc_monitor {
             task.abort();
             let _ = task.await;
+        }
+        if let Some(me_rt) = &egress_me_rt {
+            me_rt.shutdown();
         }
         let _ = metrics_stop_tx.send(());
         if let Some(task) = metrics_task {
@@ -1020,8 +1034,17 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parent().map(|d| d.join("me-cache")))
         .or_else(|| stats_path.parent().map(|d| d.join("me-cache")))
         .unwrap_or_else(|| PathBuf::from("/var/lib/mtevil-replay/me-cache"));
-    let me_runtime = if config.me.enabled {
+    let is_edge_role = config.role == Role::Edge || !config.egress_upstreams.is_empty();
+    let me_runtime = if config.me.enabled && !is_edge_role {
         Some(me::MeRuntime::start(config.me.clone(), me_cache_dir, counters.clone()).await)
+    } else {
+        None
+    };
+    let edge_me_settings = if config.me.enabled && is_edge_role {
+        Some(Arc::new(me::EdgeMeSettings::new(
+            config.me.fallback_to_direct,
+            config.me.send_client_ip,
+        )))
     } else {
         None
     };
@@ -1065,6 +1088,7 @@ async fn main() -> Result<()> {
         alerts_file,
         diagnostics: config.diagnostics,
         me: me_runtime.clone(),
+        edge_me: edge_me_settings,
     });
     let role_str: &'static str = if state.egress_upstreams.is_empty() {
         "direct"

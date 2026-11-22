@@ -534,6 +534,363 @@ async fn fetch_https_via_curl_bounded(url: &str) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+pub(crate) struct EdgeMeSettings {
+    pub(crate) fallback_to_direct: bool,
+    pub(crate) send_client_ip: bool,
+    fallback_event_state: Mutex<(Option<Instant>, u64)>,
+}
+
+impl EdgeMeSettings {
+    pub(crate) fn new(fallback_to_direct: bool, send_client_ip: bool) -> Self {
+        Self {
+            fallback_to_direct,
+            send_client_ip,
+            fallback_event_state: Mutex::new((None, 0)),
+        }
+    }
+
+    pub(crate) fn record_fallback_to_direct(
+        &self,
+        counters: &telemetry::Counters,
+        session_id: u64,
+        dc_id: i16,
+        reason: &str,
+    ) {
+        counters
+            .me_fallback_direct_total
+            .fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        let emit = {
+            let mut st = self
+                .fallback_event_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match st.0 {
+                Some(last) if now.duration_since(last) < ME_FALLBACK_EVENT_PERIOD => {
+                    st.1 = st.1.saturating_add(1);
+                    None
+                }
+                _ => {
+                    let suppressed = st.1;
+                    st.0 = Some(now);
+                    st.1 = 0;
+                    Some(suppressed)
+                }
+            }
+        };
+        if let Some(suppressed) = emit {
+            telemetry::event(
+                "me_fallback_direct",
+                session_id,
+                json!({
+                    "dc": dc_id,
+                    "reason": reason,
+                    "suppressed": suppressed,
+                }),
+            );
+        }
+    }
+}
+
+/// Read one `MTV4` frame from an async reader, checking length bounds before allocating (INV-08).
+pub(crate) async fn read_mtv4_frame<R: tokio::io::AsyncRead + Unpin>(
+    r: &mut R,
+) -> Result<Option<wire::Mtv4Frame>> {
+    let mut hdr = [0u8; wire::MTV4_FRAME_HEADER_LEN];
+    let first = r.read(&mut hdr[..1]).await?;
+    if first == 0 {
+        return Ok(None);
+    }
+    r.read_exact(&mut hdr[1..]).await?;
+    let (kind, len) = wire::parse_mtv4_frame_header(&hdr)?;
+    match kind {
+        wire::MTV4_FRAME_PAYLOAD => {
+            let mut body = vec![0u8; len];
+            r.read_exact(&mut body).await?;
+            Ok(Some(wire::Mtv4Frame::Payload(body)))
+        }
+        wire::MTV4_FRAME_QUICK_ACK => {
+            let mut key_bytes = [0u8; 4];
+            r.read_exact(&mut key_bytes).await?;
+            Ok(Some(wire::Mtv4Frame::QuickAck(u32::from_be_bytes(
+                key_bytes,
+            ))))
+        }
+        wire::MTV4_FRAME_EOF => Ok(Some(wire::Mtv4Frame::Eof)),
+        _ => anyhow::bail!("unknown MTV4 frame kind {kind}"),
+    }
+}
+
+/// Edge-side `MTV4` relay: decodes client transport (abridged/intermediate/padded-intermediate)
+/// and forwards bounded MTProto frames over an authenticated `MTV4` stream to `egress`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn relay_edge_mtv4_session(
+    client: &mut TcpStream,
+    mut upstream: TcpStream,
+    route: &'static str,
+    state: &State,
+    session_id: u64,
+    t0: Instant,
+    user: String,
+    transport: wire::ClientTransport,
+    tls: Option<TlsReader>,
+    hello_read_us: u64,
+    flight_written_us: Option<u64>,
+    diag: HelloDiag,
+) -> Result<()> {
+    struct MeActiveGuard(Arc<telemetry::Counters>);
+    impl Drop for MeActiveGuard {
+        fn drop(&mut self) {
+            self.0.me_active_sessions.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    state
+        .counters
+        .me_active_sessions
+        .fetch_add(1, Ordering::Relaxed);
+    let _me_guard = MeActiveGuard(state.counters.clone());
+
+    let us = || t0.elapsed().as_micros() as u64;
+    let framed = tls.is_some();
+    let kind = transport.kind;
+    let mut client_decrypt = transport.decrypt;
+    let mut client_encrypt = transport.encrypt;
+
+    telemetry::event(
+        "authenticated",
+        session_id,
+        json!({
+            "user": user,
+            "dc": transport.dc,
+            "route": route,
+            "protocol": "mtv4",
+            "transport": kind.as_str(),
+            "mode": if framed { "ee" } else { "dd" },
+            "hello_read_us": hello_read_us,
+            "flight_written_us": flight_written_us,
+            "inner_header_us": us(),
+            "client_hello_bytes": diag.client_hello_bytes,
+            "client_hello_records": diag.client_hello_records,
+            "record_version": diag.record_version,
+            "client_template": diag.client_template,
+            "cipher_suite": diag.cipher_suite,
+            "flight_bytes": diag.flight_bytes,
+            "fake_tls_cert_bytes": diag.fake_tls_cert_bytes,
+        }),
+    );
+
+    let client_fd = stream_raw_fd(client);
+    let upstream_fd = stream_raw_fd(&upstream);
+    let (mut cr, mut cw) = client.split();
+    let (mut ur, mut uw) = upstream.split();
+    let relay = RelayStats {
+        counters: Some(state.counters.clone()),
+        client_fd,
+        upstream_fd,
+        diagnostics: state.diagnostics,
+        ..RelayStats::default()
+    };
+    let relay_start_us = us();
+    let max_dec_buf = wire::MAX_MTPROTO_FRAME_LEN + 64;
+
+    let result = relay_until_end(
+        &relay,
+        state.idle,
+        async {
+            let mut tls = tls;
+            let mut raw = [0u8; 16 * 1024];
+            let mut dec_buf = Vec::with_capacity(16 * 1024);
+            loop {
+                let n = match tls.as_mut() {
+                    Some(reader) => reader.read_into(&mut cr, &mut raw).await?,
+                    None => cr.read(&mut raw).await?,
+                };
+                if n == 0 {
+                    break;
+                }
+                relay.uploaded.fetch_add(n as u64, Ordering::Relaxed);
+                relay.client_reads.fetch_add(1, Ordering::Relaxed);
+                relay.stamp(&relay.first_up_us, &relay.last_up_us);
+                if let Some(c) = &relay.counters {
+                    c.downstream_rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                let chunk = &mut raw[..n];
+                wire::crypt(&mut client_decrypt, chunk);
+                ensure!(
+                    dec_buf.len().saturating_add(n) <= max_dec_buf,
+                    "edge MTV4 decode buffer exceeded bound"
+                );
+                dec_buf.extend_from_slice(chunk);
+                while let Some(frame) = wire::decode_client_frame(kind, &mut dec_buf)? {
+                    let wire_frame =
+                        wire::encode_mtv4_frame(&wire::Mtv4Frame::Payload(frame.payload))?;
+                    timeout(RELAY_WRITE_TIMEOUT, uw.write_all(&wire_frame))
+                        .await
+                        .context("edge_mtv4_upload_timeout")?
+                        .context("edge_mtv4_upload_failed")?;
+                    relay.dc_writes.fetch_add(1, Ordering::Relaxed);
+                    relay.stamp(&relay.first_up_us, &relay.last_up_us);
+                    if let Some(c) = &relay.counters {
+                        c.upstream_tx_bytes
+                            .fetch_add(wire_frame.len() as u64, Ordering::Relaxed);
+                    }
+                }
+            }
+            if let Ok(eof_frame) = wire::encode_mtv4_frame(&wire::Mtv4Frame::Eof) {
+                let _ = timeout(RELAY_WRITE_TIMEOUT, uw.write_all(&eof_frame)).await;
+            }
+            let _ = timeout(RELAY_WRITE_TIMEOUT, uw.shutdown()).await;
+            Ok::<_, anyhow::Error>(())
+        },
+        async {
+            while let Some(frame) = read_mtv4_frame(&mut ur).await? {
+                match frame {
+                    wire::Mtv4Frame::Payload(payload) => {
+                        if let Some(c) = &relay.counters {
+                            c.upstream_rx_bytes.fetch_add(
+                                (wire::MTV4_FRAME_HEADER_LEN + payload.len()) as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
+                        let mut pad = [0u8; 15];
+                        let pad_len = if kind == wire::ClientProtoKind::PaddedIntermediate {
+                            let n = rand::rngs::OsRng.gen_range(0..=15);
+                            rand::rngs::OsRng.fill_bytes(&mut pad[..n]);
+                            n
+                        } else {
+                            0
+                        };
+                        let mut encoded =
+                            wire::encode_client_frame(kind, &payload, &pad[..pad_len])?;
+                        wire::crypt(&mut client_encrypt, &mut encoded);
+                        write_client_encrypted(
+                            &mut cw,
+                            &encoded,
+                            framed,
+                            RELAY_WRITE_TIMEOUT,
+                            &relay,
+                        )
+                        .await?;
+                    }
+                    wire::Mtv4Frame::QuickAck(confirm_key) => {
+                        let mut ack = wire::encode_quick_ack(kind, confirm_key);
+                        wire::crypt(&mut client_encrypt, &mut ack);
+                        write_client_encrypted(&mut cw, &ack, framed, RELAY_WRITE_TIMEOUT, &relay)
+                            .await?;
+                    }
+                    wire::Mtv4Frame::Eof => break,
+                }
+            }
+            let _ = timeout(RELAY_WRITE_TIMEOUT, cw.shutdown()).await;
+            Ok::<_, anyhow::Error>(())
+        },
+    )
+    .await;
+
+    let mut summary = relay.summary();
+    summary["relay_start_us"] = json!(relay_start_us);
+    summary["elapsed_us"] = json!(us());
+    summary["route"] = json!(route);
+    summary["protocol"] = json!("mtv4");
+    summary["transport"] = json!(kind.as_str());
+    match result {
+        Ok(()) => {
+            telemetry::event("relay_closed", session_id, summary);
+            Ok(())
+        }
+        Err(err) => {
+            summary["error"] = json!(format!("{err:#}"));
+            telemetry::event("relay_failed", session_id, summary);
+            Err(err)
+        }
+    }
+}
+
+/// Egress-side `MTV4` relay: bridges bounded `MTV4` frames from `edge` to a multiplexed `MeSession`.
+pub(crate) async fn relay_egress_mtv4_me(
+    edge: &mut TcpStream,
+    me_session: MeSession,
+    idle: Duration,
+    counters: Arc<telemetry::Counters>,
+) -> Result<()> {
+    struct MeActiveGuard(Arc<telemetry::Counters>);
+    impl Drop for MeActiveGuard {
+        fn drop(&mut self) {
+            self.0.me_active_sessions.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    counters.me_active_sessions.fetch_add(1, Ordering::Relaxed);
+    let _me_guard = MeActiveGuard(counters.clone());
+
+    let (mut er, mut ew) = edge.split();
+    let (mut me_rx, me_tx) = split_me_session_handles(me_session);
+    let relay = RelayStats {
+        counters: Some(counters.clone()),
+        ..RelayStats::default()
+    };
+
+    relay_until_end(
+        &relay,
+        idle,
+        async {
+            while let Some(frame) = read_mtv4_frame(&mut er).await? {
+                match frame {
+                    wire::Mtv4Frame::Payload(payload) => {
+                        let wire_len = wire::MTV4_FRAME_HEADER_LEN + payload.len();
+                        relay.uploaded.fetch_add(wire_len as u64, Ordering::Relaxed);
+                        relay.stamp(&relay.first_up_us, &relay.last_up_us);
+                        counters
+                            .downstream_rx_bytes
+                            .fetch_add(wire_len as u64, Ordering::Relaxed);
+                        timeout(RELAY_WRITE_TIMEOUT, me_tx.send_frame(&payload))
+                            .await
+                            .context("egress_mtv4_me_send_timeout")??;
+                        counters
+                            .upstream_tx_bytes
+                            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    }
+                    wire::Mtv4Frame::QuickAck(_) => {}
+                    wire::Mtv4Frame::Eof => break,
+                }
+            }
+            me_tx.close();
+            Ok::<_, anyhow::Error>(())
+        },
+        async {
+            while let Some(ev) = me_rx.recv_event().await {
+                let wire_frame = match ev {
+                    MeInboundEvent::Payload(payload) => {
+                        counters
+                            .upstream_rx_bytes
+                            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                        wire::encode_mtv4_frame(&wire::Mtv4Frame::Payload(payload))?
+                    }
+                    MeInboundEvent::QuickAck(confirm_key) => {
+                        wire::encode_mtv4_frame(&wire::Mtv4Frame::QuickAck(confirm_key))?
+                    }
+                };
+                timeout(RELAY_WRITE_TIMEOUT, ew.write_all(&wire_frame))
+                    .await
+                    .context("egress_mtv4_edge_write_timeout")?
+                    .context("egress_mtv4_edge_write_failed")?;
+                relay
+                    .downloaded
+                    .fetch_add(wire_frame.len() as u64, Ordering::Relaxed);
+                relay.stamp(&relay.first_dn_us, &relay.last_dn_us);
+                counters
+                    .downstream_tx_bytes
+                    .fetch_add(wire_frame.len() as u64, Ordering::Relaxed);
+            }
+            if let Ok(eof_frame) = wire::encode_mtv4_frame(&wire::Mtv4Frame::Eof) {
+                let _ = timeout(RELAY_WRITE_TIMEOUT, ew.write_all(&eof_frame)).await;
+            }
+            let _ = timeout(RELAY_WRITE_TIMEOUT, ew.shutdown()).await;
+            Ok::<_, anyhow::Error>(())
+        },
+    )
+    .await
+}
+
 /// Relay one authenticated client session over a multiplexed `MeSession`.
 /// Strictly post-ServerHello (INV-01: no cover fallback; INV-03: bounded queues & timeouts;
 /// INV-08: bounded frame lengths before allocation).
@@ -1090,7 +1447,7 @@ mod tests {
         assert!(loaded.me.fallback_to_direct);
         assert!(loaded.me.send_client_ip);
 
-        // 2. Role edge or egress with me.enabled = true must be rejected until Phase 3 (MTV4).
+        // 2. Role edge and egress with me.enabled = true are accepted (Phase 3 MTV4).
         let edge_cfg_path = dir.join("edge.json");
         std::fs::write(
             &edge_cfg_path,
@@ -1103,7 +1460,7 @@ mod tests {
                 "me": { "enabled": true }
             }))?,
         )?;
-        assert!(Config::load(&edge_cfg_path).is_err());
+        assert!(Config::load(&edge_cfg_path)?.me.enabled);
 
         let egress_cfg_path = dir.join("egress.json");
         std::fs::write(
@@ -1114,7 +1471,7 @@ mod tests {
                 "me": { "enabled": true }
             }))?,
         )?;
-        assert!(Config::load(&egress_cfg_path).is_err());
+        assert!(Config::load(&egress_cfg_path)?.me.enabled);
 
         // 3. Invalid ad_tag rejected; valid 32-hex ad_tag (0600) accepted.
         let tag_path = dir.join("ad-tag");
@@ -1264,6 +1621,7 @@ mod tests {
             alerts_file: None,
             diagnostics: false,
             me: Some(me_rt.clone()),
+            edge_me: None,
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1553,6 +1911,7 @@ mod tests {
             alerts_file: None,
             diagnostics: false,
             me: Some(me_rt.clone()),
+            edge_me: None,
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1788,6 +2147,7 @@ mod tests {
             alerts_file: None,
             diagnostics: false,
             me: Some(me_rt.clone()),
+            edge_me: None,
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1848,6 +2208,508 @@ mod tests {
         let _ = srv_task.await;
         me_rt.shutdown();
         me_lkg.shutdown();
+        dc_task.abort();
+        http_task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    fn make_edge_state(
+        client_secret: [u8; 16],
+        egress_token: [u8; 16],
+        upstreams: Vec<SocketAddr>,
+        edge_me: Option<Arc<EdgeMeSettings>>,
+        counters: Arc<telemetry::Counters>,
+    ) -> Arc<State> {
+        let count = upstreams.len();
+        Arc::new(State {
+            secrets: std::sync::RwLock::new(Arc::new(vec![NamedSecret {
+                name: "default".into(),
+                key: Zeroizing::new(client_secret),
+            }])),
+            sni: "example.com".into(),
+            allowed_snis: std::sync::RwLock::new(Arc::new("example.com".into())),
+            cover_resolver: Arc::new(CoverResolver::new(
+                "127.0.0.1:1".into(),
+                Duration::from_secs(60),
+            )),
+            enable_dd: false,
+            proxy_protocol: false,
+            cover_permits: Semaphore::new(4),
+            dcs: HashMap::new(),
+            dc_media_overrides: HashMap::new(),
+            egress_upstreams: upstreams,
+            egress_strategy: EgressStrategy::Ordered,
+            egress_token,
+            egress_rr: std::sync::atomic::AtomicUsize::new(0),
+            egress_health: std::sync::Mutex::new(EgressHealth::new(count)),
+            egress_probe_notify: Arc::new(tokio::sync::Notify::new()),
+            egress_cooldown: Duration::from_millis(200),
+            egress_cooldown_max: Duration::from_secs(2),
+            egress_probe_interval: Duration::from_secs(30),
+            egress_probe_degraded_interval: Duration::from_secs(5),
+            egress_hedge_ms: 150,
+            egress_use_mtv3: true,
+            client_hello: Duration::from_secs(2),
+            handshake: Duration::from_secs(3),
+            idle: Duration::from_secs(5),
+            drain: Duration::from_secs(1),
+            flight: wire::ServerFlightProfile::default(),
+            flight_shaping: false,
+            client_mss_bulk: None,
+            replay: tokio::sync::Mutex::new(ReplayCache::new(1024, Duration::from_secs(300))),
+            counters,
+            alert_webhook_url: None,
+            alerts_file: None,
+            diagnostics: false,
+            me: None,
+            edge_me,
+        })
+    }
+
+    #[tokio::test]
+    async fn mtv4_split_e2e_and_client_ip_and_logic_and_quick_ack() -> Result<()> {
+        let dir = make_temp_dir("mtv4-e2e");
+        let me_secret = vec![0x71; 128];
+        let mock_me = spawn_test_mock_me(me_secret.clone()).await?;
+        let conf_text = format!(
+            "default 2;\nproxy_for 2 {};\nproxy_for -2 {};\n",
+            mock_me.addr, mock_me.addr
+        );
+        let (http_addr, http_task) = spawn_test_http_cfg(
+            Arc::new(Mutex::new(me_secret.clone())),
+            Arc::new(Mutex::new(conf_text.into_bytes())),
+        )
+        .await?;
+
+        let egress_token = [0x44; 16];
+        let client_secret = [0x55; 16];
+
+        // Test AND-logic combinations: (edge_send_ip, egress_send_ip, expect_real_ip)
+        for (idx, (edge_send, egress_send, expect_real)) in [
+            (true, true, true),
+            (false, true, false),
+            (true, false, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            mock_me
+                .observed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            let eg_counters = Arc::new(telemetry::Counters::default());
+            let me_cfg = config::MeConfig {
+                enabled: true,
+                fallback_to_direct: false,
+                send_client_ip: egress_send,
+                public_ipv4: None,
+                pool_size: 1,
+                refresh_interval_secs: 3600,
+                drain_timeout_secs: 5,
+                ad_tag_file: None,
+                cache_dir: Some(dir.join(format!("cache-{idx}"))),
+                proxy_secret_url: format!("http://{http_addr}/secret"),
+                proxy_config_url: format!("http://{http_addr}/conf"),
+            };
+            let me_rt = MeRuntime::start(
+                me_cfg,
+                dir.join(format!("cache-{idx}")),
+                eg_counters.clone(),
+            )
+            .await;
+            for _ in 0..50 {
+                if !me_rt.telemetry_snapshot().degraded {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!me_rt.telemetry_snapshot().degraded);
+
+            let eg_listener = TcpListener::bind("127.0.0.1:0").await?;
+            let eg_addr = eg_listener.local_addr()?;
+            let mut eg_sec = EgressSecurityConfig::default_for(16);
+            eg_sec.me = Some(me_rt.clone());
+            let (eg_stop_tx, eg_stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let eg_task = tokio::spawn(serve_egress_with_security(
+                eg_listener,
+                Arc::new(HashMap::new()),
+                egress_token,
+                16,
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+                Duration::from_secs(1),
+                eg_counters.clone(),
+                eg_sec,
+                async {
+                    let _ = eg_stop_rx.await;
+                },
+            ));
+
+            let edge_counters = Arc::new(telemetry::Counters::default());
+            let edge_state = make_edge_state(
+                client_secret,
+                egress_token,
+                vec![eg_addr],
+                Some(Arc::new(EdgeMeSettings::new(false, edge_send))),
+                edge_counters.clone(),
+            );
+            let edge_listener = TcpListener::bind("127.0.0.1:0").await?;
+            let edge_addr = edge_listener.local_addr()?;
+            let (ed_stop_tx, ed_stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let ed_task = tokio::spawn(serve(edge_listener, edge_state, 16, async {
+                let _ = ed_stop_rx.await;
+            }));
+
+            mock_me.send_quick_ack.store(idx == 0, Ordering::Relaxed);
+            let payload = vec![0xab; 64];
+            let (reply, qa) = run_faketls_client_exchange(
+                edge_addr,
+                &client_secret,
+                "example.com",
+                if idx == 0 { -2 } else { 2 },
+                wire::ClientProtoKind::Intermediate,
+                &payload,
+                false,
+                idx == 0,
+            )
+            .await?;
+            assert_eq!(reply, payload);
+            if idx == 0 {
+                assert_eq!(
+                    qa,
+                    Some(wire::encode_quick_ack(
+                        wire::ClientProtoKind::Intermediate,
+                        0x1234_5678
+                    ))
+                );
+            }
+
+            {
+                let obs = mock_me.observed.lock().unwrap_or_else(|e| e.into_inner());
+                assert_eq!(obs.len(), 1);
+                if expect_real {
+                    assert_eq!(
+                        obs[0].remote_ip,
+                        mtevil_me_pool::ipv4_mapped_16(std::net::Ipv4Addr::LOCALHOST)
+                    );
+                    assert!(obs[0].remote_port > 0);
+                } else {
+                    assert_eq!(
+                        obs[0].remote_ip,
+                        mtevil_me_pool::ipv4_mapped_16(std::net::Ipv4Addr::UNSPECIFIED)
+                    );
+                    assert_eq!(obs[0].remote_port, 0);
+                }
+            }
+
+            let _ = ed_stop_tx.send(());
+            let _ = ed_task.await;
+            let _ = eg_stop_tx.send(());
+            let _ = eg_task.await;
+            me_rt.shutdown();
+        }
+
+        http_task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mtv4_security_tampered_hmac_replay_skew_and_oversize_frame() -> Result<()> {
+        let dir = make_temp_dir("mtv4-sec");
+        let me_secret = vec![0x72; 128];
+        let mock_me = spawn_test_mock_me(me_secret.clone()).await?;
+        let conf_text = format!("default 2;\nproxy_for 2 {};\n", mock_me.addr);
+        let (http_addr, http_task) = spawn_test_http_cfg(
+            Arc::new(Mutex::new(me_secret.clone())),
+            Arc::new(Mutex::new(conf_text.into_bytes())),
+        )
+        .await?;
+
+        let eg_counters = Arc::new(telemetry::Counters::default());
+        let me_cfg = config::MeConfig {
+            enabled: true,
+            fallback_to_direct: false,
+            send_client_ip: false,
+            public_ipv4: None,
+            pool_size: 1,
+            refresh_interval_secs: 3600,
+            drain_timeout_secs: 5,
+            ad_tag_file: None,
+            cache_dir: Some(dir.join("cache")),
+            proxy_secret_url: format!("http://{http_addr}/secret"),
+            proxy_config_url: format!("http://{http_addr}/conf"),
+        };
+        let me_rt = MeRuntime::start(me_cfg, dir.join("cache"), eg_counters.clone()).await;
+        for _ in 0..50 {
+            if !me_rt.telemetry_snapshot().degraded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let token = [0x66; 16];
+        let eg_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let eg_addr = eg_listener.local_addr()?;
+        let mut eg_sec = EgressSecurityConfig::default_for(32);
+        eg_sec.me = Some(me_rt.clone());
+        let (eg_stop_tx, eg_stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let eg_task = tokio::spawn(serve_egress_with_security(
+            eg_listener,
+            Arc::new(HashMap::new()),
+            token,
+            32,
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            eg_counters.clone(),
+            eg_sec,
+            async {
+                let _ = eg_stop_rx.await;
+            },
+        ));
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
+        // 1. Tampered HMAC -> rejected (EOF without ACK_OK)
+        let mut bad_hmac = wire::build_egress_preface_v4(&token, 2, now, &[1; 16], None)?;
+        bad_hmac[69] ^= 0xff;
+        let mut s = TcpStream::connect(eg_addr).await?;
+        s.write_all(&bad_hmac).await?;
+        let mut ack = [0u8; 1];
+        assert!(s.read_exact(&mut ack).await.is_err());
+
+        // 2. Timestamp skew > 30s -> rejected
+        let skewed = wire::build_egress_preface_v4(&token, 2, now - 45, &[2; 16], None)?;
+        let mut s = TcpStream::connect(eg_addr).await?;
+        s.write_all(&skewed).await?;
+        assert!(s.read_exact(&mut ack).await.is_err());
+
+        // 3. Valid preface accepted, replay with same nonce rejected
+        let valid = wire::build_egress_preface_v4(&token, 2, now, &[3; 16], None)?;
+        let mut s1 = TcpStream::connect(eg_addr).await?;
+        s1.write_all(&valid).await?;
+        s1.read_exact(&mut ack).await?;
+        assert_eq!(ack[0], EGRESS_ACK_OK);
+
+        // 4. Oversize MTV4 frame header (> 1 MiB) closes connection before allocation (INV-08)
+        let over_len = (wire::MAX_MTPROTO_FRAME_LEN as u32) + 4;
+        let mut over_hdr = [0u8; wire::MTV4_FRAME_HEADER_LEN];
+        over_hdr[0] = wire::MTV4_FRAME_PAYLOAD;
+        over_hdr[1..5].copy_from_slice(&over_len.to_be_bytes());
+        s1.write_all(&over_hdr).await?;
+        let mut eof_buf = [0u8; 1];
+        let n = timeout(Duration::from_secs(2), s1.read(&mut eof_buf)).await??;
+        assert_eq!(n, 0, "egress must close immediately on oversize MTV4 frame");
+
+        // Replay of the exact same valid preface must be rejected
+        let mut s2 = TcpStream::connect(eg_addr).await?;
+        s2.write_all(&valid).await?;
+        assert!(s2.read_exact(&mut ack).await.is_err());
+
+        let _ = eg_stop_tx.send(());
+        let _ = eg_task.await;
+        me_rt.shutdown();
+        http_task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mtv4_mixed_versions_failover_two_egresses_and_direct_fallback() -> Result<()> {
+        let dir = make_temp_dir("mtv4-mix");
+        let me_secret = vec![0x73; 128];
+        let mock_me = spawn_test_mock_me(me_secret.clone()).await?;
+        let conf_text = format!("default 2;\nproxy_for 2 {};\n", mock_me.addr);
+        let (http_addr, http_task) = spawn_test_http_cfg(
+            Arc::new(Mutex::new(me_secret.clone())),
+            Arc::new(Mutex::new(conf_text.into_bytes())),
+        )
+        .await?;
+
+        // Mock Direct DC listener (accepts DC obfuscated2 header and echoes encrypted stream)
+        let dc_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let dc_addr = dc_listener.local_addr()?;
+        let dc_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = dc_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut hdr = [0u8; 64];
+                    if s.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    // Keep connection open and drain/echo raw bytes to confirm MTV3 Direct path reached DC
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                });
+            }
+        });
+
+        let token = [0x88; 16];
+        let client_secret = [0x99; 16];
+        let mut eg_dcs = HashMap::new();
+        eg_dcs.insert(2, dc_addr);
+        let eg_dcs = Arc::new(eg_dcs);
+
+        // Egress 1: v0.2-style (me.enabled = false -> rejects MTV4 with EGRESS_ACK_ERR, accepts MTV3)
+        let eg1_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let eg1_addr = eg1_listener.local_addr()?;
+        let eg1_counters = Arc::new(telemetry::Counters::default());
+        let (eg1_stop_tx, eg1_stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let eg1_task = tokio::spawn(serve_egress_with_security(
+            eg1_listener,
+            eg_dcs.clone(),
+            token,
+            16,
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            eg1_counters.clone(),
+            EgressSecurityConfig::default_for(16),
+            async {
+                let _ = eg1_stop_rx.await;
+            },
+        ));
+
+        // Egress 2: v0.3 with ME enabled (accepts both MTV4 and MTV3)
+        let eg2_counters = Arc::new(telemetry::Counters::default());
+        let me_cfg = config::MeConfig {
+            enabled: true,
+            fallback_to_direct: false,
+            send_client_ip: false,
+            public_ipv4: None,
+            pool_size: 1,
+            refresh_interval_secs: 3600,
+            drain_timeout_secs: 5,
+            ad_tag_file: None,
+            cache_dir: Some(dir.join("cache-eg2")),
+            proxy_secret_url: format!("http://{http_addr}/secret"),
+            proxy_config_url: format!("http://{http_addr}/conf"),
+        };
+        let me_rt = MeRuntime::start(me_cfg, dir.join("cache-eg2"), eg2_counters.clone()).await;
+        for _ in 0..50 {
+            if !me_rt.telemetry_snapshot().degraded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let eg2_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let eg2_addr = eg2_listener.local_addr()?;
+        let mut eg2_sec = EgressSecurityConfig::default_for(16);
+        eg2_sec.me = Some(me_rt.clone());
+        let (eg2_stop_tx, eg2_stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let eg2_task = tokio::spawn(serve_egress_with_security(
+            eg2_listener,
+            eg_dcs.clone(),
+            token,
+            16,
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            eg2_counters.clone(),
+            eg2_sec,
+            async {
+                let _ = eg2_stop_rx.await;
+            },
+        ));
+
+        // (a) Mixed versions: v0.2 edge (edge_me = None) connects to v0.3 egress2 via MTV3
+        let v02_edge_counters = Arc::new(telemetry::Counters::default());
+        let v02_edge_state = make_edge_state(
+            client_secret,
+            token,
+            vec![eg2_addr],
+            None,
+            v02_edge_counters.clone(),
+        );
+        let dc_t = wire::dc_transport()?;
+        let (_s, route) = connect_upstream(&v02_edge_state, 2, &dc_t.header).await?;
+        assert_eq!(route, "egress");
+        assert!(eg2_counters.egress_mtv3_connections.load(Ordering::Relaxed) >= 1);
+
+        // (b) Failover with 2 egresses: primary eg1 returns EGRESS_ACK_ERR on MTV4 -> edge fails over to backup eg2!
+        let edge_counters = Arc::new(telemetry::Counters::default());
+        let edge_state = make_edge_state(
+            client_secret,
+            token,
+            vec![eg1_addr, eg2_addr],
+            Some(Arc::new(EdgeMeSettings::new(true, false))),
+            edge_counters.clone(),
+        );
+        let edge_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let edge_addr = edge_listener.local_addr()?;
+        let (ed_stop_tx, ed_stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let ed_task = tokio::spawn(serve(edge_listener, edge_state, 16, async {
+            let _ = ed_stop_rx.await;
+        }));
+
+        let payload = vec![0xcd; 48];
+        let (rep, _) = run_faketls_client_exchange(
+            edge_addr,
+            &client_secret,
+            "example.com",
+            2,
+            wire::ClientProtoKind::Intermediate,
+            &payload,
+            false,
+            false,
+        )
+        .await?;
+        assert_eq!(rep, payload);
+        assert_eq!(
+            edge_counters
+                .me_fallback_direct_total
+                .load(Ordering::Relaxed),
+            0,
+            "backup egress2 served ME via MTV4 without falling back to Direct"
+        );
+
+        // (c) Fallback to Direct by MTV3 when only ME-disabled egress1 is configured
+        let fb_counters = Arc::new(telemetry::Counters::default());
+        let fb_state = make_edge_state(
+            client_secret,
+            token,
+            vec![eg1_addr],
+            Some(Arc::new(EdgeMeSettings::new(true, false))),
+            fb_counters.clone(),
+        );
+        let fb_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let fb_addr = fb_listener.local_addr()?;
+        let (fb_stop_tx, fb_stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let fb_task = tokio::spawn(serve(fb_listener, fb_state, 16, async {
+            let _ = fb_stop_rx.await;
+        }));
+        let _ = run_faketls_client_exchange(
+            fb_addr,
+            &client_secret,
+            "example.com",
+            2,
+            wire::ClientProtoKind::Intermediate,
+            &payload,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(
+            fb_counters.me_fallback_direct_total.load(Ordering::Relaxed),
+            1,
+            "edge must fall back to Direct via MTV3 when all egresses reject MTV4"
+        );
+        assert!(eg1_counters.egress_mtv3_connections.load(Ordering::Relaxed) >= 1);
+
+        let _ = ed_stop_tx.send(());
+        let _ = ed_task.await;
+        let _ = fb_stop_tx.send(());
+        let _ = fb_task.await;
+        let _ = eg1_stop_tx.send(());
+        let _ = eg1_task.await;
+        let _ = eg2_stop_tx.send(());
+        let _ = eg2_task.await;
+        me_rt.shutdown();
         dc_task.abort();
         http_task.abort();
         let _ = std::fs::remove_dir_all(&dir);

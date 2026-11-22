@@ -96,6 +96,7 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         alerts_file: None,
         diagnostics: false,
         me: None,
+        edge_me: None,
     })
 }
 
@@ -2901,6 +2902,7 @@ async fn egress_mtv3_verifies_hmac_rejects_replay_skew_legacy_toggle_and_securit
         max_unauth_handshakes: 2,
         dc_media_overrides: default_media_override_map(),
         nonce_cache_capacity: 16_384,
+        me: None,
     };
     let egress_task = tokio::spawn(serve_egress_with_security(
         egress_listener,
@@ -3025,6 +3027,7 @@ async fn egress_mtv3_verifies_hmac_rejects_replay_skew_legacy_toggle_and_securit
         max_unauth_handshakes: 1,
         dc_media_overrides: default_media_override_map(),
         nonce_cache_capacity: 16_384,
+        me: None,
     };
     let egress2_task = tokio::spawn(serve_egress_with_security(
         egress2_listener,
@@ -4455,8 +4458,15 @@ async fn inv10_f23_signaled_down_does_not_cascade_failures_or_inflate_cooldown()
             else {
                 return Err(anyhow::anyhow!("node 0 must be claimable"));
             };
-            let res =
-                dial_egress_candidate(&st_c, 0, 2, 2, &[0x11; 64], Duration::from_secs(5)).await;
+            let res = dial_egress_candidate(
+                &st_c,
+                0,
+                2,
+                2,
+                connect::EgressDialMode::DirectStream(&[0x11; 64]),
+                Duration::from_secs(5),
+            )
+            .await;
             let Err(err) = res else {
                 return Err(anyhow::anyhow!("all 30 attempts must fail"));
             };
@@ -4557,7 +4567,16 @@ async fn inv10_f23_ack_timeout_after_preface_is_dc_level_while_connect_timeout_i
 
     let claim_a =
         EgressHealth::try_claim(&st.egress_health, 0, 2, Instant::now()).context("claim DC-A")?;
-    let Err(err_a) = dial_egress_candidate(&st, 0, 2, 2, &[0x11; 64], actual_per_try).await else {
+    let Err(err_a) = dial_egress_candidate(
+        &st,
+        0,
+        2,
+        2,
+        connect::EgressDialMode::DirectStream(&[0x11; 64]),
+        actual_per_try,
+    )
+    .await
+    else {
         anyhow::bail!("DC-A must time out waiting for ACK");
     };
     assert!(
@@ -4617,8 +4636,15 @@ async fn inv10_f23_ack_timeout_after_preface_is_dc_level_while_connect_timeout_i
 
     let claim_dead = EgressHealth::try_claim(&st2.egress_health, 0, 2, Instant::now())
         .context("claim dead node")?;
-    let Err(err_dead) =
-        dial_egress_candidate(&st2, 0, 2, 2, &[0x33; 64], Duration::from_secs(1)).await
+    let Err(err_dead) = dial_egress_candidate(
+        &st2,
+        0,
+        2,
+        2,
+        connect::EgressDialMode::DirectStream(&[0x33; 64]),
+        Duration::from_secs(1),
+    )
+    .await
     else {
         anyhow::bail!("closed port must fail");
     };
@@ -4896,7 +4922,7 @@ async fn inv10_f23_hung_egress_30_parallel_single_escalation_and_base_cooldown()
                 0,
                 dc,
                 dc.abs(),
-                &[0x11; 64],
+                connect::EgressDialMode::DirectStream(&[0x11; 64]),
                 Duration::from_millis(300),
             )
             .await;

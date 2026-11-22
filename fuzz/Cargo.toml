@@ -60,3 +60,10 @@ path = "fuzz_targets/fuzz_client_transport_frame.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_mtv4_preface_and_frame"
+path = "fuzz_targets/fuzz_mtv4_preface_and_frame.rs"
+test = false
+doc = false
+bench = false

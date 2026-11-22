@@ -542,11 +542,6 @@ impl Config {
         }
         if self.me.enabled {
             ensure!(
-                self.role == Role::Direct,
-                "me.enabled is only supported in direct mode until split MTV4 lands in Phase 3 (current role: {:?})",
-                self.role
-            );
-            ensure!(
                 (1..=16).contains(&self.me.pool_size),
                 "me.pool_size must be 1..=16"
             );
