@@ -304,6 +304,38 @@ fn default_me_config_url() -> String {
     "https://core.telegram.org/getProxyConfig".to_string()
 }
 
+/// Validate ME config URL: `https://` is allowed for any host, while `http://` is permitted
+/// strictly for loopback endpoints (`127.0.0.1`, `[::1]`, `localhost`) used in local tests.
+pub fn validate_me_config_url(url: &str) -> Result<()> {
+    if let Some(rest) = url.strip_prefix("https://") {
+        ensure!(!rest.is_empty(), "empty https:// URL");
+        return Ok(());
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        let authority = rest.split('/').next().unwrap_or("");
+        ensure!(!authority.is_empty(), "empty http:// authority");
+        let host = if let Some(bracketed) = authority.strip_prefix('[') {
+            bracketed
+                .split(']')
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("malformed IPv6 host in http:// URL"))?
+        } else {
+            authority.split(':').next().unwrap_or("")
+        };
+        let is_loopback = host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
+        ensure!(
+            is_loopback,
+            "plain http:// ME config URL is only allowed for loopback addresses; use https://"
+        );
+        return Ok(());
+    }
+    anyhow::bail!("ME config URL must start with https:// (or http:// for loopback tests)");
+}
+
 /// Read and validate an `ad_tag` file (32 hex chars, Unix mode `0600`).
 /// Returns `Ok(None)` if the file is empty/whitespace-only; never includes the tag in error text.
 pub fn load_ad_tag_file(path: &Path) -> Result<Option<[u8; 16]>> {
@@ -526,16 +558,10 @@ impl Config {
                 (1..=300).contains(&self.me.drain_timeout_secs),
                 "me.drain_timeout_secs must be 1..=300"
             );
-            ensure!(
-                self.me.proxy_secret_url.starts_with("https://")
-                    || self.me.proxy_secret_url.starts_with("http://"),
-                "me.proxy_secret_url must start with https:// or http://"
-            );
-            ensure!(
-                self.me.proxy_config_url.starts_with("https://")
-                    || self.me.proxy_config_url.starts_with("http://"),
-                "me.proxy_config_url must start with https:// or http://"
-            );
+            validate_me_config_url(&self.me.proxy_secret_url)
+                .context("invalid me.proxy_secret_url")?;
+            validate_me_config_url(&self.me.proxy_config_url)
+                .context("invalid me.proxy_config_url")?;
             if let Some(ref tag_path) = self.me.ad_tag_file {
                 if tag_path.exists() {
                     let _ = load_ad_tag_file(tag_path)?;

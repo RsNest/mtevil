@@ -435,6 +435,7 @@ pub(crate) fn extract_client_ipv4(addr: Option<SocketAddr>) -> Option<SocketAddr
 /// Fetch `http://` (native bounded async TCP) or `https://` (system `curl` with TLS 1.2+ CA verify)
 /// with strict size bound (`MAX_ME_FETCH_BYTES`) and timeout (`ME_FETCH_TIMEOUT`).
 pub(crate) async fn fetch_url_bounded(url: &str) -> Result<Vec<u8>> {
+    config::validate_me_config_url(url)?;
     if let Some(rest) = url.strip_prefix("http://") {
         fetch_http_plain_bounded(rest).await
     } else if url.starts_with("https://") {
@@ -1135,6 +1136,246 @@ mod tests {
         write_ad_tag_0600(&tag_path, "0123456789abcdef0123456789abcdef\n")?;
         let ok_cfg = Config::load(&bad_tag_cfg)?;
         assert!(ok_cfg.me.enabled);
+
+        // 4. Plain http:// ME config URLs are rejected for non-loopback hosts, allowed only for loopback.
+        assert!(config::validate_me_config_url("https://core.telegram.org/getProxySecret").is_ok());
+        assert!(config::validate_me_config_url("http://127.0.0.1:8080/secret").is_ok());
+        assert!(config::validate_me_config_url("http://[::1]:8080/conf").is_ok());
+        assert!(config::validate_me_config_url("http://localhost:8080/conf").is_ok());
+        assert!(config::validate_me_config_url("http://core.telegram.org/getProxySecret").is_err());
+        assert!(config::validate_me_config_url("http://198.51.100.10/secret").is_err());
+        assert!(config::validate_me_config_url("ftp://core.telegram.org/secret").is_err());
+
+        let bad_http_cfg = dir.join("bad_http.json");
+        std::fs::write(
+            &bad_http_cfg,
+            serde_json::to_string(&json!({
+                "role": "direct",
+                "secret_file": secret_file,
+                "sni": "example.com",
+                "cover": "127.0.0.1:443",
+                "dc": ["2=127.0.0.1:443"],
+                "me": {
+                    "enabled": true,
+                    "proxy_secret_url": "http://198.51.100.10/secret"
+                }
+            }))?,
+        )?;
+        assert!(Config::load(&bad_http_cfg).is_err());
+
+        // 5. extract_client_ipv4: IPv4 and IPv4-mapped IPv6 preserved, pure IPv6 maps to None (0.0.0.0:0).
+        assert_eq!(
+            extract_client_ipv4(Some("198.51.100.77:54321".parse()?)),
+            Some(SocketAddrV4::new(
+                std::net::Ipv4Addr::new(198, 51, 100, 77),
+                54321
+            ))
+        );
+        assert_eq!(
+            extract_client_ipv4(Some("[::ffff:198.51.100.42]:44444".parse()?)),
+            Some(SocketAddrV4::new(
+                std::net::Ipv4Addr::new(198, 51, 100, 42),
+                44444
+            ))
+        );
+        assert_eq!(
+            extract_client_ipv4(Some("[2001:db8::1]:54321".parse()?)),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn me_proxy_v2_client_ip_and_ipv6_zero_address() -> Result<()> {
+        let dir = make_temp_dir("pv2");
+        let me_secret = vec![0x61; 128];
+        let mock_me = spawn_test_mock_me(me_secret.clone()).await?;
+        let conf_text = format!("default 2;\nproxy_for 2 {};\n", mock_me.addr);
+        let (http_addr, http_task) = spawn_test_http_cfg(
+            Arc::new(Mutex::new(me_secret.clone())),
+            Arc::new(Mutex::new(conf_text.into_bytes())),
+        )
+        .await?;
+
+        let counters = Arc::new(telemetry::Counters::default());
+        let me_cfg = config::MeConfig {
+            enabled: true,
+            fallback_to_direct: false,
+            send_client_ip: true,
+            public_ipv4: None,
+            pool_size: 1,
+            refresh_interval_secs: 3600,
+            drain_timeout_secs: 5,
+            ad_tag_file: None,
+            cache_dir: Some(dir.join("cache")),
+            proxy_secret_url: format!("http://{http_addr}/secret"),
+            proxy_config_url: format!("http://{http_addr}/conf"),
+        };
+        let me_rt = MeRuntime::start(me_cfg, dir.join("cache"), counters.clone()).await;
+        for _ in 0..50 {
+            if !me_rt.telemetry_snapshot().degraded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!me_rt.telemetry_snapshot().degraded);
+
+        let client_secret = [0x23; 16];
+        let st = Arc::new(State {
+            secrets: std::sync::RwLock::new(Arc::new(vec![NamedSecret {
+                name: "default".into(),
+                key: Zeroizing::new(client_secret),
+            }])),
+            sni: "example.com".into(),
+            allowed_snis: std::sync::RwLock::new(Arc::new("example.com".into())),
+            cover_resolver: Arc::new(CoverResolver::new(
+                "127.0.0.1:1".into(),
+                Duration::from_secs(60),
+            )),
+            enable_dd: false,
+            proxy_protocol: true,
+            cover_permits: Semaphore::new(4),
+            dcs: HashMap::new(),
+            dc_media_overrides: HashMap::new(),
+            egress_upstreams: Vec::new(),
+            egress_strategy: EgressStrategy::RoundRobin,
+            egress_token: [0; 16],
+            egress_rr: std::sync::atomic::AtomicUsize::new(0),
+            egress_health: std::sync::Mutex::new(EgressHealth::new(0)),
+            egress_probe_notify: Arc::new(tokio::sync::Notify::new()),
+            egress_cooldown: Duration::from_secs(1),
+            egress_cooldown_max: Duration::from_secs(5),
+            egress_probe_interval: Duration::from_secs(30),
+            egress_probe_degraded_interval: Duration::from_secs(5),
+            egress_hedge_ms: 0,
+            egress_use_mtv3: true,
+            client_hello: Duration::from_secs(2),
+            handshake: Duration::from_secs(2),
+            idle: Duration::from_secs(5),
+            drain: Duration::from_secs(1),
+            flight: wire::ServerFlightProfile::default(),
+            flight_shaping: false,
+            client_mss_bulk: None,
+            replay: tokio::sync::Mutex::new(ReplayCache::new(1024, Duration::from_secs(300))),
+            counters: counters.clone(),
+            alert_webhook_url: None,
+            alerts_file: None,
+            diagnostics: false,
+            me: Some(me_rt.clone()),
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let proxy_addr = listener.local_addr()?;
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let srv_task = tokio::spawn(serve(listener, st.clone(), 16, async {
+            let _ = stop_rx.await;
+        }));
+
+        let build_pv2_v4 = |src_ip: [u8; 4], src_port: u16| -> Vec<u8> {
+            let mut h = Vec::with_capacity(28);
+            h.extend_from_slice(b"\r\n\r\n\0\r\nQUIT\n");
+            h.push(0x21); // v2 PROXY
+            h.push(0x11); // AF_INET STREAM
+            h.extend_from_slice(&12u16.to_be_bytes());
+            h.extend_from_slice(&src_ip);
+            h.extend_from_slice(&[127, 0, 0, 1]);
+            h.extend_from_slice(&src_port.to_be_bytes());
+            h.extend_from_slice(&443u16.to_be_bytes());
+            h
+        };
+        let build_pv2_v6 = |src_ip: [u8; 16], src_port: u16| -> Vec<u8> {
+            let mut h = Vec::with_capacity(52);
+            h.extend_from_slice(b"\r\n\r\n\0\r\nQUIT\n");
+            h.push(0x21); // v2 PROXY
+            h.push(0x21); // AF_INET6 STREAM
+            h.extend_from_slice(&36u16.to_be_bytes());
+            h.extend_from_slice(&src_ip);
+            h.extend_from_slice(&[0u8; 16]);
+            h.extend_from_slice(&src_port.to_be_bytes());
+            h.extend_from_slice(&443u16.to_be_bytes());
+            h
+        };
+
+        for pv2 in [
+            build_pv2_v4([198, 51, 100, 77], 54321),
+            build_pv2_v6(
+                std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets(),
+                54322,
+            ),
+        ] {
+            let mut s = TcpStream::connect(proxy_addr).await?;
+            s.write_all(&pv2).await?;
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            let (hello, _, _) = wire::build_client_hello(
+                &client_secret,
+                "example.com",
+                now,
+                &mut rand::rngs::OsRng,
+            )?;
+            s.write_all(&hello).await?;
+            let mut hdr = [0u8; 5];
+            for _ in 0..3 {
+                s.read_exact(&mut hdr).await?;
+                let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                let mut body = vec![0u8; len];
+                s.read_exact(&mut body).await?;
+            }
+            let (init, mut enc, mut dec) = wire::build_client_init_with_kind(
+                &client_secret,
+                2,
+                wire::ClientProtoKind::Intermediate,
+            )?;
+            s.write_all(&wire::record(0x17, &init)?).await?;
+            let payload = vec![0x99; 32];
+            let mut frame =
+                wire::encode_client_frame(wire::ClientProtoKind::Intermediate, &payload, &[])?;
+            wire::crypt(&mut enc, &mut frame);
+            s.write_all(&wire::record(0x17, &frame)?).await?;
+
+            let mut tls_rd = TlsReader::default();
+            let mut plain_buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            let reply = timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(f) = wire::decode_client_frame(
+                        wire::ClientProtoKind::Intermediate,
+                        &mut plain_buf,
+                    )? {
+                        return Ok::<_, anyhow::Error>(f.payload);
+                    }
+                    let n = tls_rd.read_into(&mut s, &mut tmp).await?;
+                    ensure!(n > 0, "EOF");
+                    wire::crypt(&mut dec, &mut tmp[..n]);
+                    plain_buf.extend_from_slice(&tmp[..n]);
+                }
+            })
+            .await??;
+            assert_eq!(reply, payload);
+        }
+
+        {
+            let obs = mock_me.observed.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(obs.len(), 2);
+            // 1st connection: PROXY v2 IPv4 198.51.100.77:54321
+            assert_eq!(
+                obs[0].remote_ip,
+                mtevil_me_pool::ipv4_mapped_16(std::net::Ipv4Addr::new(198, 51, 100, 77))
+            );
+            assert_eq!(obs[0].remote_port, 54321);
+            // 2nd connection: pure IPv6 client -> deterministic 0.0.0.0:0
+            assert_eq!(
+                obs[1].remote_ip,
+                mtevil_me_pool::ipv4_mapped_16(std::net::Ipv4Addr::UNSPECIFIED)
+            );
+            assert_eq!(obs[1].remote_port, 0);
+        }
+
+        let _ = stop_tx.send(());
+        let _ = srv_task.await;
+        me_rt.shutdown();
+        http_task.abort();
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }

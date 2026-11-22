@@ -112,6 +112,8 @@ pub(crate) struct ClientSession {
     pub(crate) user: String,
     pub(crate) transport: wire::ClientTransport,
     pub(crate) tls: Option<TlsReader>,
+    /// Client peer address from PROXY protocol v2 when enabled; otherwise `None` (falls back to `TcpStream::peer_addr`).
+    pub(crate) client_peer: Option<SocketAddr>,
     pub(crate) hello_read_us: u64,
     pub(crate) flight_written_us: Option<u64>,
     pub(crate) diag: HelloDiag,
@@ -141,14 +143,16 @@ pub(crate) async fn relay_client(
         user,
         transport,
         tls,
+        client_peer,
         hello_read_us,
         flight_written_us,
         diag,
     } = session;
     apply_bulk_mss(client, state.client_mss_bulk);
     if let Some(me_rt) = &state.me {
+        let effective_peer = client_peer.or_else(|| client.peer_addr().ok());
         let remote_addr = if me_rt.send_client_ip() {
-            me::extract_client_ipv4(client.peer_addr().ok())
+            me::extract_client_ipv4(effective_peer)
         } else {
             None
         };

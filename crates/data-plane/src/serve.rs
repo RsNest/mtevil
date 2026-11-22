@@ -454,7 +454,7 @@ pub(crate) fn configure_tcp_socket(stream: &TcpStream) -> Result<()> {
 }
 
 pub(crate) enum ProxyV2Outcome {
-    Header,
+    Header(Option<SocketAddr>),
     EmptyEof,
 }
 
@@ -476,8 +476,8 @@ pub(crate) async fn read_proxy_v2<R: AsyncRead + Unpin>(
                 .await
                 .context("proxy_v2_payload_eof")?;
         }
-        wire::parse_proxy_v2_payload(&parsed, &payload)?;
-        Ok(ProxyV2Outcome::Header)
+        let client_addr = wire::parse_proxy_v2_payload(&parsed, &payload)?;
+        Ok(ProxyV2Outcome::Header(client_addr))
     })
     .await
     .context("proxy_v2_timeout")?
@@ -491,9 +491,12 @@ pub(crate) async fn connection_inner(
     configure_tcp_socket(client)?;
     let t0 = Instant::now();
     let us = || t0.elapsed().as_micros() as u64;
+    let mut proxy_v2_client_addr: Option<SocketAddr> = None;
     if state.proxy_protocol {
         match read_proxy_v2(client, state.client_hello).await {
-            Ok(ProxyV2Outcome::Header) => {}
+            Ok(ProxyV2Outcome::Header(addr)) => {
+                proxy_v2_client_addr = addr;
+            }
             Ok(ProxyV2Outcome::EmptyEof) => {
                 telemetry::event(
                     "empty_connection_closed",
@@ -604,6 +607,7 @@ pub(crate) async fn connection_inner(
                     user,
                     transport,
                     tls: None,
+                    client_peer: proxy_v2_client_addr,
                     hello_read_us,
                     flight_written_us: None,
                     diag: HelloDiag {
@@ -757,6 +761,7 @@ pub(crate) async fn connection_inner(
             user: matched_secret.name.clone(),
             transport,
             tls: Some(tls),
+            client_peer: proxy_v2_client_addr,
             hello_read_us,
             flight_written_us: Some(flight_written_us),
             diag: HelloDiag {
