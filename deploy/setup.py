@@ -2360,19 +2360,20 @@ def run_status_command(deploy_dir: Path) -> int:
     print(f"  Состояние:         {health_status}")
     print(f"  Время работы:      {uptime_str}")
     print(f"  Версия для отката: {rollback_ver}")
+    rstats = read_container_runtime_stats(base, svc) if running else None
+    for me_line in format_me_status_lines(role, saved_cfg, rstats):
+        print(me_line)
     if role == "egress":
         accept_legacy = saved_cfg.get("egress_accept_legacy", True) is not False
-        proto_mode = "MTV3 + legacy MTV2 (переходный)" if accept_legacy else "MTV3 only (строгий)"
+        proto_mode = "MTV4 + MTV3 + legacy MTV2 (переходный)" if accept_legacy else "MTV4 + MTV3 (строгий)"
         print(f"  Протокол egress:   {proto_mode}")
-        if running:
-            rstats = read_container_runtime_stats(base, svc)
-            if isinstance(rstats, dict):
-                mtv3_cnt = rstats.get("egress_mtv3_connections")
-                legacy_cnt = rstats.get("egress_legacy_connections")
-                if mtv3_cnt is not None or legacy_cnt is not None:
-                    print(
-                        f"  Подключения:       MTV3={int(mtv3_cnt or 0)}, legacy MTV2={int(legacy_cnt or 0)}"
-                    )
+        if isinstance(rstats, dict):
+            mtv3_cnt = rstats.get("egress_mtv3_connections")
+            legacy_cnt = rstats.get("egress_legacy_connections")
+            if mtv3_cnt is not None or legacy_cnt is not None:
+                print(
+                    f"  Подключения:       MTV3={int(mtv3_cnt or 0)}, legacy MTV2={int(legacy_cnt or 0)}"
+                )
         if accept_legacy:
             print(
                 "  Подсказка MTV3:    после обновления всех edge выставите "
@@ -2905,14 +2906,280 @@ def run_user_command(deploy_dir: Path, action: str, name: str | None = None, sni
     return 1
 
 
+AD_TAG_HEX_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+DEFAULT_AD_TAG_PATH = "/var/lib/mtevil/ad-tag"
+
+
+def validate_ad_tag_hex(raw: str) -> str:
+    cleaned = (raw or "").strip()
+    if not AD_TAG_HEX_RE.match(cleaned):
+        raise ValueError("ad_tag должен содержать ровно 32 hex-символа (16 байт от @MTProxybot)")
+    return cleaned.lower()
+
+
+def mask_ad_tag(tag: str) -> str:
+    cleaned = (tag or "").strip()
+    if len(cleaned) < 8:
+        return "***"
+    return f"{cleaned[:4]}…{cleaned[-4:]}"
+
+
+def format_me_status_lines(
+    role: str,
+    saved_cfg: dict[str, object],
+    rstats: dict[str, object] | None,
+) -> list[str]:
+    me_cfg = saved_cfg.get("me") if isinstance(saved_cfg.get("me"), dict) else {}
+    me_enabled = bool(me_cfg.get("enabled", False))
+    if not me_enabled:
+        return ["  Режим ME:          выключен (Direct)"]
+
+    lines: list[str] = []
+    me_stats = rstats.get("me") if isinstance(rstats, dict) and isinstance(rstats.get("me"), dict) else {}
+    fallback_cfg = bool(me_cfg.get("fallback_to_direct", True))
+    send_ip_cfg = bool(me_cfg.get("send_client_ip", True))
+
+    if role == "edge":
+        fb_total = int(me_stats.get("fallback_direct_total") or 0) if me_stats else 0
+        if not me_stats and isinstance(rstats, dict):
+            fb_total = int(rstats.get("me_fallback_direct_total") or 0)
+        mode_lbl = (
+            f"ME через egress (MTV4, fallback на Direct: {'вкл' if fallback_cfg else 'выкл'})"
+        )
+        lines.append(f"  Режим ME:          {mode_lbl}")
+        lines.append(
+            f"  Клиентский IP ME:  {'передаётся на egress (логика И)' if send_ip_cfg else 'не передаётся (0.0.0.0:0, экспериментально)'}"
+        )
+        if fb_total > 0:
+            lines.append(f"  Fallback ME->Dir:  {fb_total}")
+            lines.append(
+                warn_text(
+                    "  Предупреждение ME: зафиксирован fallback на Direct — проверьте, что узлы egress обновлены до v0.3+ и имеют me.enabled=true."
+                )
+            )
+        return lines
+
+    mode_raw = str(me_stats.get("mode") or "")
+    if mode_raw == "me":
+        mode_label = ok_text("ME активен")
+    elif mode_raw == "me_degraded_fallback_direct":
+        mode_label = warn_text("ME degraded -> fallback на Direct")
+    elif mode_raw == "me_degraded_strict":
+        mode_label = err_text("ME degraded (strict, без Direct fallback)")
+    else:
+        mode_label = "ME включён (ожидание runtime-stats)"
+    lines.append(f"  Режим ME:          {mode_label}")
+    if me_stats:
+        alive = int(me_stats.get("alive_connections") or 0)
+        slots = int(me_stats.get("total_slots") or 0)
+        age = me_stats.get("config_age_secs")
+        age_str = format_duration_ru(age) if isinstance(age, (int, float)) else "нет данных"
+        fb_total = int(me_stats.get("fallback_direct_total") or 0)
+        ref_err = int(me_stats.get("refresh_errors") or 0)
+        bp_drops = int(me_stats.get("backpressure_drops") or 0)
+        cl_drops = int(me_stats.get("dropped_close_ext") or 0)
+        ad_status = "настроен" if me_stats.get("ad_tag") == "configured" else "не задан"
+        lines.append(f"  Пул ME:            {alive}/{slots} живых, возраст конфига: {age_str}")
+        lines.append(
+            f"  Счётчики ME:       fallback={fb_total}, refresh_err={ref_err}, backpressure_drops={bp_drops}, dropped_close_ext={cl_drops}"
+        )
+        lines.append(f"  Рекламный тег:     {ad_status}")
+    return lines
+
+
+def prompt_me_config(
+    role: str,
+    *,
+    network_host: bool,
+    detected_public_ip: str | None,
+    existing_me: dict[str, object] | None,
+    cli_enabled: bool = False,
+    cli_public_ipv4: str | None = None,
+    cli_send_client_ip: bool | None = None,
+    cli_fallback_to_direct: bool | None = None,
+) -> dict[str, object] | None:
+    prev = existing_me if isinstance(existing_me, dict) else {}
+    prev_enabled = bool(prev.get("enabled", False))
+    if cli_enabled:
+        enabled = True
+    else:
+        print("\n" + heading("Режим Telegram Middle-End (ME / ad_tag)"))
+        enabled = ask_yes_no(
+            "Включить режим Telegram Middle-End (ME / рекламный тег ad_tag)?",
+            default=prev_enabled,
+        )
+    if not enabled:
+        return None
+
+    print(
+        warn_text(
+            "Внимание (приватность): в режиме ME по умолчанию (send_client_ip=true) Telegram видит реальный IPv4 клиента, "
+            "как в официальном MTProxy. Режим без передачи IP (0.0.0.0:0) является экспериментальным."
+        )
+    )
+    prev_send_ip = bool(prev.get("send_client_ip", True))
+    send_client_ip = (
+        cli_send_client_ip
+        if cli_send_client_ip is not None
+        else ask_yes_no("Передавать реальный IPv4 клиента в Telegram (me.send_client_ip)?", default=prev_send_ip)
+    )
+    prev_fallback = bool(prev.get("fallback_to_direct", True))
+    fallback_to_direct = (
+        cli_fallback_to_direct
+        if cli_fallback_to_direct is not None
+        else ask_yes_no(
+            "Включить автоматический fallback на Direct при недоступности ME (me.fallback_to_direct)?",
+            default=prev_fallback,
+        )
+    )
+
+    if role == "edge":
+        print(
+            "Подсказка (split): в схеме edge -> egress пул ME и файл ad_tag настраиваются на узлах egress; "
+            "в @MTProxybot регистрируется публичный IP:PORT этого edge."
+        )
+        return {
+            "enabled": True,
+            "fallback_to_direct": fallback_to_direct,
+            "send_client_ip": send_client_ip,
+        }
+
+    pub_ipv4: str | None = cli_public_ipv4
+    if pub_ipv4 is None:
+        prev_pub = str(prev.get("public_ipv4") or "").strip()
+        default_pub = prev_pub or (detected_public_ip or "")
+        if not network_host:
+            print(
+                "Подсказка (NAT/Docker bridge): без --network-host параметр me.public_ipv4 обязателен "
+                "для совпадения KDF Telegram ME."
+            )
+            raw_pub = ask_validated("Публичный IPv4 сервера для KDF ME (me.public_ipv4)", validate_ip, default_pub or None)
+            pub_ipv4 = raw_pub.strip()
+        else:
+            raw_pub = ask(
+                "Публичный IPv4 для KDF ME (Enter = авто с локального интерфейса, обязательно за 1:1 NAT)",
+                default_pub or "",
+            ).strip()
+            pub_ipv4 = validate_ip(raw_pub) if raw_pub else None
+
+    me_block: dict[str, object] = {
+        "enabled": True,
+        "fallback_to_direct": fallback_to_direct,
+        "send_client_ip": send_client_ip,
+        "pool_size": int(prev.get("pool_size") or 2),
+        "ad_tag_file": str(prev.get("ad_tag_file") or DEFAULT_AD_TAG_PATH),
+    }
+    if pub_ipv4:
+        me_block["public_ipv4"] = pub_ipv4
+    return me_block
+
+
+def run_adtag_command(deploy_dir: Path, action: str, tag_value: str | None = None) -> int:
+    check_prerequisites()
+    compose_file = deploy_dir / "compose.yaml"
+    env_file = deploy_dir / ".env"
+    cfg_file = deploy_dir / "config.json"
+    if not compose_file.is_file() or not env_file.is_file() or not cfg_file.is_file():
+        print(err_text(f"Существующая установка не найдена в {deploy_dir}."), file=sys.stderr)
+        return 1
+
+    saved = load_existing_defaults(deploy_dir)
+    saved_cfg = saved.get("config") if isinstance(saved.get("config"), dict) else {}
+    role = str(saved_cfg.get("role") or "direct")
+    if role == "direct" and saved_cfg.get("egress_upstreams"):
+        role = "edge"
+    if role == "edge":
+        print(
+            err_text(
+                "Рекламный тег ad_tag хранится на сервере выхода (direct или egress). "
+                "В @MTProxybot зарегистрируйте IP:PORT этого edge, а полученный ad_tag установите на узлах egress."
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
+    me_cfg = saved_cfg.get("me") if isinstance(saved_cfg.get("me"), dict) else {}
+    ad_tag_path = str(me_cfg.get("ad_tag_file") or DEFAULT_AD_TAG_PATH)
+    project = str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
+    base = compose_cmd(deploy_dir, project)
+    svc = compose_service(base)
+    write_svc = compose_write_service(base)
+    cid = run(base + ["ps", "-q", svc], check=False).stdout.strip()
+
+    act = (action or "show").strip().lower()
+    if act in ("show", "status", "get"):
+        read_cmd = base + (
+            ["exec", "-T", svc, "/bin/sh", "-c", f'if [ -f "{ad_tag_path}" ]; then cat "{ad_tag_path}"; fi']
+            if cid
+            else ["run", "--rm", "-T", "--no-deps", "--entrypoint", "/bin/sh", svc, "-c", f'if [ -f "{ad_tag_path}" ]; then cat "{ad_tag_path}"; fi']
+        )
+        proc = run(read_cmd, check=False)
+        if proc.returncode != 0:
+            print(err_text("Не удалось прочитать файл ad_tag из тома state."), file=sys.stderr)
+            return 1
+        val = (proc.stdout or "").strip()
+        if not val:
+            print("Рекламный тег (ad_tag): не задан.")
+        else:
+            print(f"Рекламный тег (ad_tag): настроен ({mask_ad_tag(val)})")
+        if not bool(me_cfg.get("enabled", False)):
+            print(warn_text("Примечание: режим ME сейчас выключен в config.json (me.enabled=false)."))
+        return 0
+
+    if act == "set":
+        if not tag_value:
+            print(err_text("Укажите 32-hex тег: mtevilctl adtag set <32_hex>"), file=sys.stderr)
+            return 1
+        try:
+            clean_tag = validate_ad_tag_hex(tag_value)
+        except ValueError as exc:
+            print(err_text(str(exc)), file=sys.stderr)
+            return 1
+        # Pass ad_tag via stdin (not CLI args) into init service; atomic write with UID 10001 and 0600.
+        sh_script = (
+            f'umask 077 && tmp="{ad_tag_path}.tmp.$$" && cat > "$tmp" '
+            f'&& chmod 0600 "$tmp" && chown 10001:10001 "$tmp" 2>/dev/null || true '
+            f'&& mv -f "$tmp" "{ad_tag_path}"'
+        )
+        proc = subprocess.run(
+            base + ["run", "--rm", "-T", "--no-deps", "--entrypoint", "/bin/sh", write_svc, "-c", sh_script],
+            input=clean_tag + "\n",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            print(err_text("Не удалось записать файл ad_tag в том state."), file=sys.stderr)
+            return 1
+        print(ok_text(f"Рекламный тег установлен ({mask_ad_tag(clean_tag)}, права 0600, владелец 10001:10001)."))
+        print("Прокси подхватит новый тег автоматически в течение 2 секунд без перезапуска контейнера.")
+        if not bool(me_cfg.get("enabled", False)):
+            print(warn_text("Примечание: режим ME сейчас выключен в config.json (включите его через mtevilctl setup)."))
+        return 0
+
+    if act in ("clear", "del", "delete", "rm"):
+        proc = run(
+            base + ["run", "--rm", "-T", "--no-deps", "--entrypoint", "/bin/sh", write_svc, "-c", f'rm -f "{ad_tag_path}"'],
+            check=False,
+        )
+        if proc.returncode != 0:
+            print(err_text("Не удалось удалить файл ad_tag из тома state."), file=sys.stderr)
+            return 1
+        print(ok_text("Рекламный тег удалён (применится автоматически без перезапуска контейнера)."))
+        return 0
+
+    print(err_text(f"Неизвестное действие '{action}'. Используйте: show, set <32_hex> или clear."), file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Interactive Docker Compose wizard and lifecycle tool for mtevil")
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("wizard", "setup", "reconfigure", "status", "update", "rollback", "traffic", "traf", "link", "sni", "user"),
+        choices=("wizard", "setup", "reconfigure", "status", "update", "rollback", "traffic", "traf", "link", "sni", "user", "adtag"),
         default="wizard",
-        help="Action to perform: wizard (default), setup, status, update, rollback, traffic, link, sni, user",
+        help="Action to perform: wizard (default), setup, status, update, rollback, traffic, link, sni, user, adtag",
     )
     parser.add_argument("extra", nargs="*", help=argparse.SUPPRESS)
     parser.add_argument("--dir", type=Path, default=None, help="Target deployment directory (default: deploy/wizard)")
@@ -2940,10 +3207,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--user", type=str, default=None, help="Named user for link generation")
     parser.add_argument("--all", action="store_true", help="Print links for all configured users")
     parser.add_argument("--dd", action="store_true", help="Print dd-mode link instead of FakeTLS ee-link")
+    parser.add_argument("--me-enabled", action="store_true", help="Enable Telegram Middle-End (ME) mode in wizard")
+    parser.add_argument("--me-public-ipv4", type=str, default=None, help="Explicit public IPv4 for ME KDF (required behind NAT/bridge)")
+    parser.add_argument("--me-send-client-ip", choices=("true", "false"), default=None, help="Whether to forward client IPv4 in ME RPC_PROXY_REQ")
+    parser.add_argument("--me-fallback-to-direct", choices=("true", "false"), default=None, help="Whether to fall back to Direct when ME is degraded")
     args = parser.parse_args(argv)
 
     repo_root = Path(__file__).resolve().parent.parent
-    if args.command in ("status", "update", "rollback", "traffic", "traf", "link", "sni", "user"):
+    if args.command in ("status", "update", "rollback", "traffic", "traf", "link", "sni", "user", "adtag"):
         deploy_dir = (args.dir or default_deploy_dir(repo_root)).resolve()
         if args.command == "status":
             return run_status_command(deploy_dir)
@@ -2971,6 +3242,10 @@ def main(argv: list[str] | None = None) -> int:
             sub_action = args.extra[0] if len(args.extra) >= 1 else "list"
             sub_name = args.extra[1] if len(args.extra) >= 2 else args.user
             return run_user_command(deploy_dir, sub_action, sub_name, sni_override=args.sni)
+        if args.command == "adtag":
+            sub_action = args.extra[0] if len(args.extra) >= 1 else "show"
+            sub_val = args.extra[1] if len(args.extra) >= 2 else None
+            return run_adtag_command(deploy_dir, sub_action, sub_val)
         return run_traffic_command(deploy_dir, live=args.live, max_iterations=args.iterations)
 
     if args.command in ("setup", "reconfigure"):
@@ -3266,6 +3541,29 @@ def main(argv: list[str] | None = None) -> int:
                 "fake_tls_cert_jitter": 256,
                 "flight_shaping": True,
             }
+
+        if args.me_enabled or sys.stdin.isatty() or os.environ.get("MTEVIL_PROMPT_ME") == "1":
+            cli_send_ip = None if args.me_send_client_ip is None else (args.me_send_client_ip == "true")
+            cli_fb = None if args.me_fallback_to_direct is None else (args.me_fallback_to_direct == "true")
+            det_ip = detect_local_global_ipv4()
+            if not det_ip and role == "direct":
+                try:
+                    det_ip = validate_ip(public_host)
+                except Exception:
+                    det_ip = None
+            me_block = prompt_me_config(
+                role,
+                network_host=use_network_host,
+                detected_public_ip=det_ip,
+                existing_me=saved_cfg.get("me") if isinstance(saved_cfg.get("me"), dict) else None,
+                cli_enabled=args.me_enabled,
+                cli_public_ipv4=args.me_public_ipv4,
+                cli_send_client_ip=cli_send_ip,
+                cli_fallback_to_direct=cli_fb,
+            )
+            if me_block is not None:
+                config_data["me"] = me_block
+                advanced_changed.append("Режим ME: включён")
 
         print()
         print(heading("Параметры установки"))
