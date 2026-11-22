@@ -1,0 +1,71 @@
+name: Обратная связь / сообщение о проблеме
+description: Сообщить о баге, регрессии обновления или проблеме с подключением в mtevil
+title: "[feedback] "
+labels: ["feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Пожалуйста, **не прикладывайте** секреты (`proxy-secret`, `egress-token`, `users.json`), приватные ссылки `t.me/proxy` и реальные IP-адреса серверов.
+
+  - type: input
+    id: version
+    attributes:
+      label: Версия mtevil
+      description: Например, v0.2.0 (можно посмотреть в выводе `mtevilctl status`).
+      placeholder: v0.2.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: topology
+    attributes:
+      label: Топология развёртывания
+      options:
+        - direct
+        - edge + egress
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: ОС и версия Docker
+      placeholder: Ubuntu 24.04 x86_64, Docker 27.x
+    validations:
+      required: true
+
+  - type: input
+    id: client
+    attributes:
+      label: Клиент Telegram
+      placeholder: Telegram Desktop 5.x / Telegram iOS / Telegram Android
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Что делал (шаги воспроизведения)
+      placeholder: Опишите последовательность действий или команду, приведшую к проблеме.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_actual
+    attributes:
+      label: Ожидаемое и фактическое поведение
+      placeholder: |
+        Ожидалось: ...
+        Фактически: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: status_output
+    attributes:
+      label: Вывод `mtevilctl status` (без секретов и IP)
+      description: Перед вставкой удалите или замените публичные IP, токены и ссылки.
+      render: text
+    validations:
+      required: false
