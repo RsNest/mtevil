@@ -2417,6 +2417,34 @@ class SetupValidationTests(unittest.TestCase):
                     self.assertEqual(len(edit_lines), 1, f"{tag_name} ({exists=}, {is_draft=}): {edit_lines}")
                     self.assertEqual(edit_lines[0], f"release edit {tag_name} --draft=false {expected_flags}")
 
+    def test_strip_me_block_for_legacy_version_and_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "config.json"
+            original = {
+                "role": "direct",
+                "sni": "ya.ru",
+                "me": {"enabled": True, "send_client_ip": True, "pool_size": 2},
+            }
+            cfg.write_text(setup.json.dumps(original, indent=2) + "\n", encoding="utf-8")
+
+            # v0.3.0 supports `me`: must not strip or create backup.
+            self.assertTrue(setup.version_supports_me_config("v0.3.0"))
+            self.assertTrue(setup.version_supports_me_config("v0.3.0-rc.1"))
+            stripped, bk = setup.strip_me_block_for_legacy_version(cfg, "v0.3.0")
+            self.assertFalse(stripped)
+            self.assertIsNone(bk)
+            self.assertIn("me", setup.json.loads(cfg.read_text(encoding="utf-8")))
+
+            # v0.2.0 does NOT support `me`: must create backup and strip `me`.
+            self.assertFalse(setup.version_supports_me_config("v0.2.0"))
+            stripped, bk = setup.strip_me_block_for_legacy_version(cfg, "v0.2.0")
+            self.assertTrue(stripped)
+            self.assertIsNotNone(bk)
+            assert bk is not None
+            self.assertTrue(bk.is_file())
+            self.assertEqual(setup.json.loads(bk.read_text(encoding="utf-8"))["me"]["enabled"], True)
+            self.assertNotIn("me", setup.json.loads(cfg.read_text(encoding="utf-8")))
+
 
 if __name__ == "__main__":
     prog = unittest.main(verbosity=2, exit=False)

@@ -39,6 +39,39 @@ def is_prerelease_tag(tag: str) -> bool:
     return key is not None and key[3] < STAGE_RANKS[None]
 
 
+def version_supports_me_config(version: str | None) -> bool:
+    if not version:
+        return True
+    parsed = parse_semver_tag(version)
+    if parsed is None:
+        return True
+    return (parsed[0], parsed[1]) >= (0, 3)
+
+
+def strip_me_block_for_legacy_version(
+    cfg_file: Path, target_version: str | None
+) -> tuple[bool, Path | None]:
+    """Strip the `me` block from `config.json` when downgrading/rolling back to `< v0.3.0`,
+    saving a 0600 backup `config.json.pre-me-downgrade` before modifying `config.json`."""
+    if version_supports_me_config(target_version) or not cfg_file.is_file():
+        return False, None
+    raw = cfg_file.read_text(encoding="utf-8")
+    data = json.loads(raw)
+    if not isinstance(data, dict) or "me" not in data:
+        return False, None
+    backup_path = cfg_file.with_name(f"{cfg_file.name}.pre-me-downgrade")
+    backup_path.write_text(raw, encoding="utf-8")
+    try:
+        os.chmod(backup_path, 0o600)
+    except OSError:
+        pass
+    data.pop("me", None)
+    tmp = cfg_file.with_name(f".{cfg_file.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, cfg_file)
+    return True, backup_path
+
+
 def select_latest_release(
     releases: list[dict[str, object]],
     *,
@@ -1863,6 +1896,23 @@ def perform_rollback(
     for name in ("compose.yaml", ".env", "config.json"):
         shutil.copyfile(deploy_dir / f"{name}.rollback", deploy_dir / name)
 
+    try:
+        stripped, backup_path = strip_me_block_for_legacy_version(
+            deploy_dir / "config.json", target_version
+        )
+        if stripped and backup_path is not None:
+            print(
+                f"Блок 'me' не поддерживается в {target_version}: сохранён бэкап {backup_path.name} и удалён блок 'me' из config.json."
+            )
+    except Exception as exc:
+        print(
+            err_text(
+                f"Не удалось подготовить config.json для отката на {target_version}: {exc}. Текущий контейнер не затронут."
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
     env_path = deploy_dir / ".env"
     env_path.write_text(
         set_env_image(env_path.read_text(encoding="utf-8", errors="ignore"), chosen_image),
@@ -1969,6 +2019,23 @@ def run_update_command(
     if not explicit_image and cur_version == target_version:
         print(ok_text(f"Уже установлена актуальная версия {target_version}. Перезапуск не требуется."))
         return 0
+
+    # If downgrading to < v0.3.0 (e.g. v0.2.0), strip the `me` block BEFORE re-exec or restart
+    # (saving a 0600 backup) so v0.2.0's strict deny_unknown_fields parser can start cleanly.
+    try:
+        stripped_me, me_backup = strip_me_block_for_legacy_version(cfg_file, target_version)
+        if stripped_me and me_backup is not None:
+            print(
+                f"Блок 'me' не поддерживается в {target_version}: сохранён бэкап {me_backup.name} и удалён блок 'me' из config.json."
+            )
+    except Exception as exc:
+        print(
+            err_text(
+                f"Переход на {target_version} отменён до остановки сервиса: ошибка обработки блока 'me' в config.json ({exc})."
+            ),
+            file=sys.stderr,
+        )
+        return 1
 
     # Download helper scripts from the target release and hand off execution (re-exec)
     # BEFORE mutating .env or recreating the container, so the target release's own update
