@@ -330,6 +330,7 @@ dependencies = [
  "hmac",
  "mtevil-egress",
  "mtevil-guard",
+ "mtevil-me-pool",
  "mtevil-proto",
  "rand",
  "serde",
