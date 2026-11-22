@@ -1356,6 +1356,66 @@ def download_url_atomic(
                 pass
 
 
+def migrate_compose_and_replay_on_update(deploy_dir: Path, cfg_file: Path, compose_file: Path) -> bool:
+    """Migrate pre-v0.2 compose.yaml (rw state volume) and config.json replay_file to isolated state:ro + replay."""
+    try:
+        compose_text = compose_file.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    has_legacy_rw_state = (
+        "state:/var/lib/mtevil" in compose_text and "state:/var/lib/mtevil:ro" not in compose_text
+    )
+    needs_compose = has_legacy_rw_state or (
+        "state:/var/lib/mtevil" in compose_text
+        and ("replay:/var/lib/mtevil-replay" not in compose_text or "\n  init:\n" not in compose_text)
+    )
+    if not needs_compose:
+        return False
+    try:
+        cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(cfg, dict):
+        return False
+
+    role = str(cfg.get("role") or "direct")
+    network_host = "network_mode: host" in compose_text
+    include_build = "\n  build:\n" in compose_text
+    health_host = "127.0.0.1"
+    health_port: int | None = None
+    listen = str(cfg.get("listen") or "").strip()
+    if network_host and ":" in listen:
+        h_part, p_part = listen.rsplit(":", 1)
+        h_part = h_part.strip("[]")
+        if h_part and h_part not in ("0.0.0.0", "::"):
+            health_host = h_part
+        try:
+            health_port = int(p_part)
+        except ValueError:
+            health_port = None
+    raw_max_conn = cfg.get("max_connections")
+    max_conn = raw_max_conn if isinstance(raw_max_conn, int) else None
+
+    new_compose = render_compose(
+        Path(__file__).resolve().parent.parent,
+        deploy_dir,
+        role,
+        network_host=network_host,
+        health_host=health_host,
+        health_port=health_port,
+        include_build=include_build,
+        max_connections=max_conn,
+    )
+    compose_file.write_text(new_compose, encoding="utf-8")
+
+    if cfg.get("replay_file") == "/var/lib/mtevil/replay.bin" or (
+        role in ("direct", "edge") and "replay_file" not in cfg
+    ):
+        cfg["replay_file"] = "/var/lib/mtevil-replay/replay.bin"
+        cfg_file.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    return True
+
+
 def strip_legacy_default_mss(cfg_file: Path) -> bool:
     """Remove legacy default client_mss=100 / client_mss_bulk=1380 that clamped client SYN-ACK MSS."""
     if not cfg_file.is_file():
@@ -1818,6 +1878,7 @@ def run_update_command(
         return 1
 
     strip_legacy_default_mss(cfg_file)
+    migrate_compose_and_replay_on_update(deploy_dir, cfg_file, compose_file)
     orig_env_text = env_file.read_text(encoding="utf-8", errors="ignore")
     env_file.write_text(set_env_image(orig_env_text, target_image), encoding="utf-8")
 

@@ -2125,6 +2125,36 @@ class SetupValidationTests(unittest.TestCase):
             self.assertEqual(len(del_cmds), 1)
             self.assertIn(" run --rm -T --no-deps --entrypoint /usr/local/bin/mtevil init user-del ", del_cmds[0])
 
+            # Verify v0.1.5 -> v0.2.0 migration of legacy rw state compose.yaml + replay_file.
+            d_mig = d / "mig_v015"
+            d_mig.mkdir()
+            (d_mig / "compose.yaml").write_text(
+                "services:\n  mtevil:\n    image: ${MTEVIL_IMAGE}\n    network_mode: host\n"
+                "    volumes:\n      - ./config.json:/etc/mtevil/config.json:ro\n      - state:/var/lib/mtevil\n"
+                "volumes:\n  state:\n",
+                encoding="utf-8",
+            )
+            (d_mig / "config.json").write_text(
+                setup.json.dumps({
+                    "role": "direct",
+                    "listen": "0.0.0.0:24443",
+                    "replay_file": "/var/lib/mtevil/replay.bin",
+                    "max_connections": 256,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(setup.migrate_compose_and_replay_on_update(d_mig, d_mig / "config.json", d_mig / "compose.yaml"))
+            mig_compose = (d_mig / "compose.yaml").read_text(encoding="utf-8")
+            self.assertIn("state:/var/lib/mtevil:ro", mig_compose)
+            self.assertIn("replay:/var/lib/mtevil-replay", mig_compose)
+            self.assertIn("\n  init:\n", mig_compose)
+            self.assertIn("network_mode: host", mig_compose)
+            self.assertIn('"127.0.0.1:24443"', mig_compose)
+            mig_cfg = setup.json.loads((d_mig / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(mig_cfg["replay_file"], "/var/lib/mtevil-replay/replay.bin")
+            # Idempotent on second call.
+            self.assertFalse(setup.migrate_compose_and_replay_on_update(d_mig, d_mig / "config.json", d_mig / "compose.yaml"))
+
     def test_release_publish_flags_and_updater_channel_selection(self):
         # 1. Verify compute_release_publish_flags across prereleases, newer stable, older stable, and draft handling.
         existing = [
@@ -2198,6 +2228,9 @@ class SetupValidationTests(unittest.TestCase):
         wf_text = (repo_root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
         self.assertIn("setup.compute_release_publish_flags(tag, published)", wf_text)
         self.assertNotIn("--prerelease=false ${latest_flag}", wf_text)
+        self.assertNotIn("branches:\n      - main", wf_text)
+        self.assertIn('tags:\n      - "v*"', wf_text)
+        self.assertIn('docs/releases/${tag}.md', wf_text)
         self.assertEqual(wf_text.count('gh release edit "${tag}" --draft=false "${prerelease_flag}" "${latest_flag}"'), 2)
 
         bash_bin = "/bin/bash" if Path("/bin/bash").is_file() else None
