@@ -1146,3 +1146,52 @@ wire-точность. Перебор высоких портов сгорает
   - Контейнер в Docker bridge **без** `--public-ipv4` (`clt_ip` приватный `172.17.x.x`): **FAIL** (`EOF` на `RPC_HANDSHAKE`, несовпадение KDF).
   - Контейнер в Docker bridge **с** `--public-ipv4` (1:1 port-preserving NAT): **PASS** (`resPQ#05162463`, `100 B`, `RTT = 26.2 мс`).
 - Примечание: передача реального `ad_tag` и отображение спонсорского канала в клиенте Telegram требуют регистрации тестового прокси в `@MTProxybot` и в Фазе 0 не выполнялись.
+
+
+## 2026-11-22 · Подготовка `v0.3.0` (`feature/me-pool`): регрессия Direct (10×30), нагрузка ME (`pool_size`), совместимость версий (`MTV4` / `v0.2.0`)
+
+Среда: одноразовый Linux x86_64 стенд (`Docker`), без затрагивания production-узлов.
+
+### 1. Регрессия Direct (`me.enabled = false`, чередование `v0.2.0` и `feature/me-pool`)
+Метод: прямой `asyncio`-генератор волн по 30 параллельных клиентов на порт прокси (без `docker exec`), 10 чередующихся прогонов на каждый вариант и сценарий (`300` проб на вариант в каждом сценарии):
+
+| Сценарий (`me.enabled = false`) | Версия | Ошибки | `p50` (мс) | `p95` (мс) | `max` (мс) |
+|---|---|---:|---:|---:|---:|
+| `direct` | `v0.2.0` | 0/300 (0.00%) | 277.5 | 526.3 | 526.3 |
+| `direct` | `feature/me-pool` | **0/300 (0.00%)** | **222.3** | **355.6** | **355.6** |
+| `split_kill` (`docker kill` primary) | `v0.2.0` | 0/300 (0.00%) | 656.2 | 753.8 | 753.8 |
+| `split_kill` (`docker kill` primary) | `feature/me-pool` | **0/300 (0.00%)** | **626.8** | **733.0** | **733.0** |
+| `split_blackhole` (`iptables DROP` primary) | `v0.2.0` | 0/300 (0.00%) | 649.2 | 1611.5 | 1611.5 |
+| `split_blackhole` (`iptables DROP` primary) | `feature/me-pool` | **0/300 (0.00%)** | 677.4 | **797.3** | **797.3** |
+| `split_both_down` (оба `egress` вниз → восстановление) | `v0.2.0` | 1/300 (0.33%) | 195.8 | 10110.5 | 10110.5 |
+| `split_both_down` (оба `egress` вниз → восстановление) | `feature/me-pool` | **0/300 (0.00%)** | 230.5 | **334.0** | **334.0** |
+
+Итог: регрессий в Direct при `me.enabled = false` нет (`0/1200` ошибок на ветке против `1/1200` на `v0.2.0`).
+
+### 2. Нагрузка на реальный Telegram ME (`pool_size = 1, 2, 4` × 30 и 100 параллельных сессий)
+Во всех прогонах: `backpressure_drops = 0`, `dropped_close_ext = 0`, `fallback_direct = 0`, `degraded = false`, `log_err_lines = 0`:
+
+| `pool_size` | Активные слоты ME | Волна 30 сессий (ошибки / время) | Волна 100 сессий (ошибки / время) |
+|---:|---:|---|---|
+| `1` | `12/12` | `0/30` · `162.4 мс` | `0/100` · `645.6 мс` |
+| `2` *(по умолчанию)* | `24/24` | `0/30` · **`147.6 мс`** | `0/100` · **`576.3 мс`** |
+| `4` | `48/48` | `0/30` · `204.1 мс` | `0/100` · `544.8 мс` |
+
+Выбор по умолчанию: `pool_size = 2` (быстрее на 30 сессиях, −10.7% против `pool_size = 1` на 100 сессиях, резерв на каждый DC и вдвое меньше простаивающих сокетов, чем при `4`).
+
+### 3. Живой split `MTV4` → реальный Telegram ME (все 3 клиентских транспорта)
+- `probe-telegram` через `edge → egress` (`MTV4` → ME): **PASS** (`rtt_ms = 9`).
+- `abridged`: `100 B`, `7.2 мс` (**PASS**); `intermediate`: `100 B`, `14.2 мс` (**PASS**); `padded-intermediate`: `111 B`, `11.2 мс` (**PASS**).
+
+### 4. Совместимость версий (`edge v0.3` + `egress v0.2.0` и даунгрейд)
+- **`3a` (`edge v0.3` с `me.enabled = true, fallback_to_direct = true` + `egress v0.2.0`):** `20/20` успешных сессий через автоматический fallback на `MTV3` Direct; отдельный `mtv4_cooldown` (`30 с`) не переводит узел `v0.2.0` в cooldown для `MTV3`; `v02_rate_limited = 0`.
+- **`3b` (`edge v0.3` с `me.enabled = true, fallback_to_direct = false` + `egress1 v0.2.0` + `egress2 v0.3 ME`):** `20/20` успешных сессий через `egress2` по `MTV4` после быстрого исключения `egress1` из `MTV4`-кандидатов.
+- **`3c` (откат/даунгрейд конфига с блоком `me` на `v0.2.0`):** `strip_me_block_for_legacy_version` сохранил резервную копию `config.json.pre-me-downgrade` (`0600`) и удалил блок `me`; контейнер `v0.2.0` стартовал и прошёл `probe-telegram` (`rtt_ms = 7`).
+
+### 5. Живые проверки `adtag` и обновлений/отката (`TEST_COMMIT = 618e5bf`)
+Образ-кандидат собран из `618e5bf` (`MTEVIL_VERSION=v0.3.0`, локальный временный registry `127.0.0.1:5050` без публикации в GHCR):
+- **`TEST_A_ADTAG_LIVE`:** `mtevilctl adtag set` через `stdin` без аргумента CLI → `права 0600, владелец 10001:10001, чтение от UID 10001 подтверждено`; демон без перезапуска залогировал `{"event":"me_ad_tag_reloaded","details":{"status":"configured"}}`; `mtevilctl status` показал `Рекламный тег: настроен`; значение тега не попало ни в вывод, ни в логи, ни в `status` (**PASS**).
+- **`TEST_B1_DIRECT_UPGRADE_V02_TO_V03`:** обновление `ghcr.io/rsnest/mtevil:v0.2.0` → кандидат `618e5bf` (`direct`) через `setup.py update`: пользовательский комментарий в `compose.yaml` сохранён, `me` остался выключен, пользователь `alice` успешно прошёл сквозную пробу Telegram (**PASS**).
+- **`TEST_B2_DIRECT_ROLLBACK_TO_V02`:** `setup.py rollback` → `v0.2.0`, пользователь `alice` подключился (**PASS**).
+- **`TEST_B3_ENABLE_ME_THEN_DOWNGRADE_V02`:** включён `me` на кандидате (`alice` подключилась) → `setup.py update --version v0.2.0` автоматически вырезал блок `me`, сохранил `config.json.pre-me-downgrade` (`0600`), контейнер `v0.2.0` стартовал и обслужил `alice` (**PASS**).
+- **`TEST_C_SPLIT_UPGRADE_EGRESS_THEN_EDGE`:** обновление `edge → egress` с `v0.2.0` на `618e5bf` в порядке `egress` → `edge`: после обновления `egress` прежний `edge v0.2.0` + `alice` продолжили работать; после обновления `edge` `alice` подключилась, `me` остался выключен (**PASS**).
