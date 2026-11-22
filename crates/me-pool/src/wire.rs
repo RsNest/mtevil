@@ -14,10 +14,40 @@ pub const RPC_PONG: u32 = 0x8430_eaa7;
 pub const CRYPTO_AES: u32 = 1;
 pub const RPC_PADDING_WORD: u32 = 4;
 
-/// `RPC_PROXY_REQ` flags.
-pub const FLAG_HAS_AD_TAG: u32 = 0x08;
-pub const FLAG_MAGIC: u32 = 0x1000;
-pub const FLAG_EXTMODE2: u32 = 0x20000;
+/// `RPC_PROXY_REQ` extra TL constructor (`proxy_tag#db1e26ae`, little-endian on wire).
+pub const TL_PROXY_TAG: u32 = 0xdb1e_26ae;
+/// Byte length of the `FLAG_HAS_AD_TAG` extra payload after the 4-byte `extra_size` field:
+/// `TL_PROXY_TAG` (4) + `tl_encode_bytes(&[u8; 16])` (1 + 16 + 3 = 20) = 24 bytes.
+pub const AD_TAG_EXTRA_SIZE: u32 = 24;
+
+/// `RPC_PROXY_REQ` flags (little-endian u32 on wire, verified against MIT `alexbers/mtprotoproxy`
+/// and Apache-2.0 `seriyps/mtproto_proxy`).
+pub const FLAG_NOT_ENCRYPTED: u32 = 0x0000_0002;
+pub const FLAG_HAS_AD_TAG: u32 = 0x0000_0008;
+pub const FLAG_MAGIC: u32 = 0x0000_1000;
+pub const FLAG_EXTMODE2: u32 = 0x0002_0000;
+pub const FLAG_PAD: u32 = 0x0800_0000;
+pub const FLAG_INTERMEDIATE: u32 = 0x2000_0000;
+pub const FLAG_ABRIDGED: u32 = 0x4000_0000;
+pub const FLAG_QUICKACK: u32 = 0x8000_0000;
+
+/// Client MTProto framing transport reported to Telegram ME in `RPC_PROXY_REQ` flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeClientProto {
+    Abridged,
+    Intermediate,
+    PaddedIntermediate,
+}
+
+impl MeClientProto {
+    pub const fn wire_flags(self) -> u32 {
+        match self {
+            Self::Abridged => FLAG_ABRIDGED,
+            Self::Intermediate => FLAG_INTERMEDIATE,
+            Self::PaddedIntermediate => FLAG_INTERMEDIATE | FLAG_PAD,
+        }
+    }
+}
 
 /// Maximum accepted ME RPC frame size (1 MiB) checked before allocation (INV-08).
 pub const MAX_RPC_FRAME_LEN: usize = 1024 * 1024;
@@ -159,6 +189,8 @@ pub fn encode_proxy_req(
     conn_id: u64,
     remote_addr: Option<SocketAddrV4>,
     our_addr: SocketAddrV4,
+    proto: MeClientProto,
+    quick_ack: bool,
     ad_tag: Option<&[u8; 16]>,
     mtproto_payload: &[u8],
 ) -> Result<Vec<u8>> {
@@ -167,11 +199,22 @@ pub fn encode_proxy_req(
         "MTProto payload length {} must be 4-byte aligned",
         mtproto_payload.len()
     );
-    let mut flags = FLAG_EXTMODE2 | FLAG_MAGIC;
+    let mut flags = FLAG_MAGIC | FLAG_EXTMODE2 | proto.wire_flags();
+    if quick_ack {
+        flags |= FLAG_QUICKACK;
+    }
+    if mtproto_payload.len() >= 8 && mtproto_payload[..8] == [0u8; 8] {
+        flags |= FLAG_NOT_ENCRYPTED;
+    }
     let extra = match ad_tag {
         Some(tag) => {
             flags |= FLAG_HAS_AD_TAG;
-            tl_encode_bytes(tag)?
+            let tl_tag = tl_encode_bytes(tag)?;
+            let mut section = Vec::with_capacity(8 + tl_tag.len());
+            section.extend_from_slice(&AD_TAG_EXTRA_SIZE.to_le_bytes());
+            section.extend_from_slice(&TL_PROXY_TAG.to_le_bytes());
+            section.extend_from_slice(&tl_tag);
+            section
         }
         None => Vec::new(),
     };

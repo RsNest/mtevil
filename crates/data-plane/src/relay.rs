@@ -156,7 +156,7 @@ pub(crate) async fn relay_client(
         } else {
             None
         };
-        match me_rt.open_session(transport.dc, remote_addr) {
+        match me_rt.open_session(transport.dc, remote_addr, transport.kind) {
             Ok(me_session) => {
                 let ad_tag_configured = me_rt.current_ad_tag().is_some();
                 return me::relay_me_session(
@@ -191,7 +191,7 @@ pub(crate) async fn relay_client(
         } else {
             None
         };
-        match connect_upstream_mtv4(state, transport.dc, remote_addr).await {
+        match connect_upstream_mtv4(state, transport.dc, transport.kind, remote_addr).await {
             Ok((upstream, route)) => {
                 return me::relay_edge_mtv4_session(
                     client,

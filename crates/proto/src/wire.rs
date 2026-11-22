@@ -822,10 +822,15 @@ pub const EGRESS_PREFACE_V3_LEN: usize = 126;
 pub const EGRESS_PREFACE_V4_LEN: usize = 70;
 pub const EGRESS_V3_MAX_SKEW_SECS: u64 = 30;
 pub const MTV4_FLAG_HAS_CLIENT_IP: u8 = 0x01;
+pub const MTV4_FLAG_PROTO_MASK: u8 = 0x06;
+pub const MTV4_FLAG_PROTO_PADDED_INTERMEDIATE: u8 = 0x00;
+pub const MTV4_FLAG_PROTO_INTERMEDIATE: u8 = 0x02;
+pub const MTV4_FLAG_PROTO_ABRIDGED: u8 = 0x04;
 pub const MTV4_FRAME_HEADER_LEN: usize = 5;
 pub const MTV4_FRAME_PAYLOAD: u8 = 0x01;
 pub const MTV4_FRAME_QUICK_ACK: u8 = 0x02;
 pub const MTV4_FRAME_EOF: u8 = 0x03;
+pub const MTV4_FRAME_PAYLOAD_QUICK_ACK: u8 = 0x04;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EgressPrefaceV3 {
@@ -906,16 +911,37 @@ pub struct EgressPrefaceV4 {
     pub timestamp: u64,
     pub nonce: [u8; 16],
     pub flags: u8,
+    pub proto: crate::ClientProtoKind,
     pub client_addr: Option<std::net::SocketAddrV4>,
 }
 
-/// Build an authenticated 70-byte `MTV4` preface for split `edge -> egress` ME mode.
-/// `client_addr` is placed inside the HMAC-authenticated header only when `Some(...)`.
+/// Build an authenticated 70-byte `MTV4` preface for split `edge -> egress` ME mode
+/// (defaulting client transport flags to `PaddedIntermediate`).
 pub fn build_egress_preface_v4(
     token: &[u8; 16],
     dc: i16,
     timestamp: u64,
     nonce: &[u8; 16],
+    client_addr: Option<std::net::SocketAddrV4>,
+) -> Result<[u8; EGRESS_PREFACE_V4_LEN]> {
+    build_egress_preface_v4_with_proto(
+        token,
+        dc,
+        timestamp,
+        nonce,
+        crate::ClientProtoKind::PaddedIntermediate,
+        client_addr,
+    )
+}
+
+/// Build an authenticated 70-byte `MTV4` preface for split `edge -> egress` ME mode,
+/// encoding both the client transport kind and optional `client_addr` inside the HMAC header.
+pub fn build_egress_preface_v4_with_proto(
+    token: &[u8; 16],
+    dc: i16,
+    timestamp: u64,
+    nonce: &[u8; 16],
+    proto: crate::ClientProtoKind,
     client_addr: Option<std::net::SocketAddrV4>,
 ) -> Result<[u8; EGRESS_PREFACE_V4_LEN]> {
     ensure!(
@@ -927,12 +953,18 @@ pub fn build_egress_preface_v4(
     signed[4..6].copy_from_slice(&dc.to_be_bytes());
     signed[6..14].copy_from_slice(&timestamp.to_be_bytes());
     signed[14..30].copy_from_slice(nonce);
+    let mut flags = match proto {
+        crate::ClientProtoKind::PaddedIntermediate => MTV4_FLAG_PROTO_PADDED_INTERMEDIATE,
+        crate::ClientProtoKind::Intermediate => MTV4_FLAG_PROTO_INTERMEDIATE,
+        crate::ClientProtoKind::Abridged => MTV4_FLAG_PROTO_ABRIDGED,
+    };
     if let Some(addr) = client_addr {
-        signed[30] = MTV4_FLAG_HAS_CLIENT_IP;
-        signed[31] = 0;
+        flags |= MTV4_FLAG_HAS_CLIENT_IP;
         signed[32..36].copy_from_slice(&addr.ip().octets());
         signed[36..38].copy_from_slice(&addr.port().to_be_bytes());
     }
+    signed[30] = flags;
+    signed[31] = 0;
     let tag = mac(token, &signed)?;
     let mut out = [0u8; EGRESS_PREFACE_V4_LEN];
     out[..38].copy_from_slice(&signed);
@@ -977,9 +1009,15 @@ pub fn verify_egress_preface_v4(
     let flags = preface[30];
     let reserved = preface[31];
     ensure!(
-        (flags & !MTV4_FLAG_HAS_CLIENT_IP) == 0 && reserved == 0,
+        (flags & !(MTV4_FLAG_HAS_CLIENT_IP | MTV4_FLAG_PROTO_MASK)) == 0 && reserved == 0,
         "unsupported MTV4 flags or reserved byte"
     );
+    let proto = match flags & MTV4_FLAG_PROTO_MASK {
+        MTV4_FLAG_PROTO_PADDED_INTERMEDIATE => crate::ClientProtoKind::PaddedIntermediate,
+        MTV4_FLAG_PROTO_INTERMEDIATE => crate::ClientProtoKind::Intermediate,
+        MTV4_FLAG_PROTO_ABRIDGED => crate::ClientProtoKind::Abridged,
+        _ => anyhow::bail!("unsupported MTV4 client protocol bits"),
+    };
     let client_addr = if (flags & MTV4_FLAG_HAS_CLIENT_IP) != 0 {
         let ip = std::net::Ipv4Addr::new(preface[32], preface[33], preface[34], preface[35]);
         let port = u16::from_be_bytes([preface[36], preface[37]]);
@@ -992,6 +1030,7 @@ pub fn verify_egress_preface_v4(
         timestamp,
         nonce,
         flags,
+        proto,
         client_addr,
     })
 }
@@ -999,6 +1038,7 @@ pub fn verify_egress_preface_v4(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mtv4Frame {
     Payload(Vec<u8>),
+    PayloadQuickAck(Vec<u8>),
     QuickAck(u32),
     Eof,
 }
@@ -1008,7 +1048,7 @@ pub fn parse_mtv4_frame_header(header: &[u8; MTV4_FRAME_HEADER_LEN]) -> Result<(
     let kind = header[0];
     let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
     match kind {
-        MTV4_FRAME_PAYLOAD => {
+        MTV4_FRAME_PAYLOAD | MTV4_FRAME_PAYLOAD_QUICK_ACK => {
             ensure!(
                 (4..=crate::MAX_MTPROTO_FRAME_LEN).contains(&len) && len.is_multiple_of(4),
                 "MTV4 payload frame length {len} out of bounds or unaligned"
@@ -1028,15 +1068,20 @@ pub fn parse_mtv4_frame_header(header: &[u8; MTV4_FRAME_HEADER_LEN]) -> Result<(
 /// Encode an `MTV4` frame into `[kind: u8][len: u32 BE][body]`.
 pub fn encode_mtv4_frame(frame: &Mtv4Frame) -> Result<Vec<u8>> {
     match frame {
-        Mtv4Frame::Payload(body) => {
+        Mtv4Frame::Payload(body) | Mtv4Frame::PayloadQuickAck(body) => {
             ensure!(
                 (4..=crate::MAX_MTPROTO_FRAME_LEN).contains(&body.len())
                     && body.len().is_multiple_of(4),
                 "MTV4 payload length {} invalid",
                 body.len()
             );
+            let kind = if matches!(frame, Mtv4Frame::PayloadQuickAck(_)) {
+                MTV4_FRAME_PAYLOAD_QUICK_ACK
+            } else {
+                MTV4_FRAME_PAYLOAD
+            };
             let mut out = Vec::with_capacity(MTV4_FRAME_HEADER_LEN + body.len());
-            out.push(MTV4_FRAME_PAYLOAD);
+            out.push(kind);
             out.extend_from_slice(&(body.len() as u32).to_be_bytes());
             out.extend_from_slice(body);
             Ok(out)
@@ -1072,6 +1117,9 @@ pub fn decode_mtv4_frame_from_slice(buf: &mut Vec<u8>) -> Result<Option<Mtv4Fram
     }
     let frame = match kind {
         MTV4_FRAME_PAYLOAD => Mtv4Frame::Payload(buf[MTV4_FRAME_HEADER_LEN..total].to_vec()),
+        MTV4_FRAME_PAYLOAD_QUICK_ACK => {
+            Mtv4Frame::PayloadQuickAck(buf[MTV4_FRAME_HEADER_LEN..total].to_vec())
+        }
         MTV4_FRAME_QUICK_ACK => {
             let key = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]);
             Mtv4Frame::QuickAck(key)

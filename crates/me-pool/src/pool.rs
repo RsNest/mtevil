@@ -1,5 +1,6 @@
 use crate::config::MeConfigBundle;
 use crate::conn::{MeConnCounters, MeConnOptions, MeConnection, MeSession};
+use crate::wire::MeClientProto;
 use anyhow::{ensure, Result};
 use mtevil_egress::compute_egress_cooldown;
 use std::collections::HashMap;
@@ -365,6 +366,7 @@ impl MePool {
         &self,
         dc_id: i16,
         remote_addr: Option<SocketAddrV4>,
+        proto: MeClientProto,
         ad_tag: Option<[u8; 16]>,
     ) -> Result<MeSession> {
         let candidates: Vec<MeConnection> = {
@@ -399,7 +401,7 @@ impl MePool {
             "no healthy ME connections available for DC {dc_id}"
         );
         let idx = self.rr.fetch_add(1, Ordering::Relaxed) % candidates.len();
-        candidates[idx].open_session(remote_addr, ad_tag)
+        candidates[idx].open_session(remote_addr, proto, ad_tag)
     }
 
     pub fn health(&self) -> MePoolHealth {

@@ -2,7 +2,8 @@
 //! and client-to-ME framed relay for `direct` mode (ADR-002 Phase 2).
 use super::*;
 use mtevil_me_pool::{
-    MeConfigBundle, MeConnOptions, MeDiskCache, MeInboundEvent, MePool, MePoolConfig, MeSession,
+    MeClientProto, MeConfigBundle, MeConnOptions, MeDiskCache, MeInboundEvent, MePool,
+    MePoolConfig, MeSession,
 };
 use rand::{Rng, RngCore};
 use std::net::{IpAddr, SocketAddrV4};
@@ -313,6 +314,7 @@ impl MeRuntime {
         &self,
         dc_id: i16,
         remote_addr: Option<SocketAddrV4>,
+        proto: wire::ClientProtoKind,
     ) -> Result<MeSession> {
         let pool = {
             let guard = self.pool.lock().unwrap_or_else(|e| e.into_inner());
@@ -321,7 +323,7 @@ impl MeRuntime {
                 .ok_or_else(|| anyhow::anyhow!("ME pool not initialized yet"))?
         };
         let ad_tag = self.current_ad_tag();
-        pool.open_session(dc_id, remote_addr, ad_tag)
+        pool.open_session(dc_id, remote_addr, to_me_proto(proto), ad_tag)
     }
 
     pub(crate) fn record_fallback_to_direct(&self, session_id: u64, dc_id: i16, reason: &str) {
@@ -592,6 +594,14 @@ impl EdgeMeSettings {
     }
 }
 
+pub(crate) fn to_me_proto(kind: wire::ClientProtoKind) -> MeClientProto {
+    match kind {
+        wire::ClientProtoKind::Abridged => MeClientProto::Abridged,
+        wire::ClientProtoKind::Intermediate => MeClientProto::Intermediate,
+        wire::ClientProtoKind::PaddedIntermediate => MeClientProto::PaddedIntermediate,
+    }
+}
+
 /// Read one `MTV4` frame from an async reader, checking length bounds before allocating (INV-08).
 pub(crate) async fn read_mtv4_frame<R: tokio::io::AsyncRead + Unpin>(
     r: &mut R,
@@ -608,6 +618,11 @@ pub(crate) async fn read_mtv4_frame<R: tokio::io::AsyncRead + Unpin>(
             let mut body = vec![0u8; len];
             r.read_exact(&mut body).await?;
             Ok(Some(wire::Mtv4Frame::Payload(body)))
+        }
+        wire::MTV4_FRAME_PAYLOAD_QUICK_ACK => {
+            let mut body = vec![0u8; len];
+            r.read_exact(&mut body).await?;
+            Ok(Some(wire::Mtv4Frame::PayloadQuickAck(body)))
         }
         wire::MTV4_FRAME_QUICK_ACK => {
             let mut key_bytes = [0u8; 4];
@@ -722,8 +737,12 @@ pub(crate) async fn relay_edge_mtv4_session(
                 );
                 dec_buf.extend_from_slice(chunk);
                 while let Some(frame) = wire::decode_client_frame(kind, &mut dec_buf)? {
-                    let wire_frame =
-                        wire::encode_mtv4_frame(&wire::Mtv4Frame::Payload(frame.payload))?;
+                    let mtv4_frame = if frame.quick_ack {
+                        wire::Mtv4Frame::PayloadQuickAck(frame.payload)
+                    } else {
+                        wire::Mtv4Frame::Payload(frame.payload)
+                    };
+                    let wire_frame = wire::encode_mtv4_frame(&mtv4_frame)?;
                     timeout(RELAY_WRITE_TIMEOUT, uw.write_all(&wire_frame))
                         .await
                         .context("edge_mtv4_upload_timeout")?
@@ -745,7 +764,8 @@ pub(crate) async fn relay_edge_mtv4_session(
         async {
             while let Some(frame) = read_mtv4_frame(&mut ur).await? {
                 match frame {
-                    wire::Mtv4Frame::Payload(payload) => {
+                    wire::Mtv4Frame::Payload(payload)
+                    | wire::Mtv4Frame::PayloadQuickAck(payload) => {
                         if let Some(c) = &relay.counters {
                             c.upstream_rx_bytes.fetch_add(
                                 (wire::MTV4_FRAME_HEADER_LEN + payload.len()) as u64,
@@ -842,9 +862,29 @@ pub(crate) async fn relay_egress_mtv4_me(
                         counters
                             .downstream_rx_bytes
                             .fetch_add(wire_len as u64, Ordering::Relaxed);
-                        timeout(RELAY_WRITE_TIMEOUT, me_tx.send_frame(&payload))
-                            .await
-                            .context("egress_mtv4_me_send_timeout")??;
+                        timeout(
+                            RELAY_WRITE_TIMEOUT,
+                            me_tx.send_frame_with_flags(&payload, false),
+                        )
+                        .await
+                        .context("egress_mtv4_me_send_timeout")??;
+                        counters
+                            .upstream_tx_bytes
+                            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    }
+                    wire::Mtv4Frame::PayloadQuickAck(payload) => {
+                        let wire_len = wire::MTV4_FRAME_HEADER_LEN + payload.len();
+                        relay.uploaded.fetch_add(wire_len as u64, Ordering::Relaxed);
+                        relay.stamp(&relay.first_up_us, &relay.last_up_us);
+                        counters
+                            .downstream_rx_bytes
+                            .fetch_add(wire_len as u64, Ordering::Relaxed);
+                        timeout(
+                            RELAY_WRITE_TIMEOUT,
+                            me_tx.send_frame_with_flags(&payload, true),
+                        )
+                        .await
+                        .context("egress_mtv4_me_send_timeout")??;
                         counters
                             .upstream_tx_bytes
                             .fetch_add(payload.len() as u64, Ordering::Relaxed);
@@ -994,9 +1034,12 @@ pub(crate) async fn relay_me_session(
                 dec_buf.extend_from_slice(chunk);
                 while let Some(frame) = wire::decode_client_frame(kind, &mut dec_buf)? {
                     let payload_len = frame.payload.len();
-                    timeout(RELAY_WRITE_TIMEOUT, me_tx_sess.send_frame(&frame.payload))
-                        .await
-                        .context("me_upload_send_timeout")??;
+                    timeout(
+                        RELAY_WRITE_TIMEOUT,
+                        me_tx_sess.send_frame_with_flags(&frame.payload, frame.quick_ack),
+                    )
+                    .await
+                    .context("me_upload_send_timeout")??;
                     relay.dc_writes.fetch_add(1, Ordering::Relaxed);
                     relay.stamp(&relay.first_up_us, &relay.last_up_us);
                     if let Some(c) = &relay.counters {
@@ -1084,8 +1127,8 @@ impl MeSessionRecv {
 
 struct MeSessionSend(mtevil_me_pool::MeSessionSender);
 impl MeSessionSend {
-    async fn send_frame(&self, payload: &[u8]) -> Result<()> {
-        self.0.send_frame(payload).await
+    async fn send_frame_with_flags(&self, payload: &[u8], quick_ack: bool) -> Result<()> {
+        self.0.send_frame_with_flags(payload, quick_ack).await
     }
     fn close(self) {
         self.0.close();
@@ -1151,6 +1194,7 @@ mod tests {
     const TEST_FLAG_HAS_AD_TAG: u32 = 0x08;
 
     struct TestMeObserved {
+        flags: u32,
         remote_ip: [u8; 16],
         remote_port: u32,
         ad_tag: Option<[u8; 16]>,
@@ -1295,12 +1339,25 @@ mod tests {
                             let rport =
                                 u32::from_le_bytes([rpay[32], rpay[33], rpay[34], rpay[35]]);
                             let (ad_tag, body_off) = if flags & TEST_FLAG_HAS_AD_TAG != 0 {
-                                if rpay.len() < 76 || rpay[56] != 16 {
+                                // Independent wire parser matching MIT alexbers/mtprotoproxy:
+                                // [extra_size=24: u32 LE][TL_PROXY_TAG=0xdb1e26ae: u32 LE][len=16][16B tag][3 zero align bytes]
+                                if rpay.len() < 56 + 28 {
+                                    return;
+                                }
+                                let extra_size =
+                                    u32::from_le_bytes([rpay[56], rpay[57], rpay[58], rpay[59]]);
+                                let tl_tag =
+                                    u32::from_le_bytes([rpay[60], rpay[61], rpay[62], rpay[63]]);
+                                if extra_size != 24
+                                    || tl_tag != 0xdb1e_26ae
+                                    || rpay[64] != 16
+                                    || rpay[81..84] != [0u8; 3]
+                                {
                                     return;
                                 }
                                 let mut tag = [0u8; 16];
-                                tag.copy_from_slice(&rpay[57..73]);
-                                (Some(tag), 76)
+                                tag.copy_from_slice(&rpay[65..81]);
+                                (Some(tag), 84)
                             } else {
                                 (None, 56)
                             };
@@ -1308,6 +1365,7 @@ mod tests {
                             obs.lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .push(TestMeObserved {
+                                    flags,
                                     remote_ip: rip,
                                     remote_port: rport,
                                     ad_tag,
@@ -2750,7 +2808,14 @@ mod tests {
             compat_counters,
         );
         // 1st MTV4 attempt hits v0.2.0 egress -> EOF -> Mtv4Unsupported (sets mtv4_cooldown, NOT EgressHealth!)
-        assert!(connect_upstream_mtv4(&compat_state, 2, None).await.is_err());
+        assert!(connect_upstream_mtv4(
+            &compat_state,
+            2,
+            wire::ClientProtoKind::PaddedIntermediate,
+            None,
+        )
+        .await
+        .is_err());
         assert_eq!(mtv4_hits.load(Ordering::Relaxed), 1);
         // Node must NOT be in EgressHealth cooldown (breaker state == 0 = healthy)
         let breaker = EgressHealth::snapshot_breaker_states(
@@ -2766,7 +2831,14 @@ mod tests {
         assert_eq!(r_mtv3, "egress");
         assert_eq!(mtv3_hits.load(Ordering::Relaxed), 1);
         // 2nd MTV4 attempt skips v0.2.0 in 0ms without sending another failing MTV4 preface (avoids v0.2.0 rate-limit!)
-        assert!(connect_upstream_mtv4(&compat_state, 2, None).await.is_err());
+        assert!(connect_upstream_mtv4(
+            &compat_state,
+            2,
+            wire::ClientProtoKind::PaddedIntermediate,
+            None,
+        )
+        .await
+        .is_err());
         assert_eq!(mtv4_hits.load(Ordering::Relaxed), 1);
         v02_sim_task.abort();
 
@@ -2780,6 +2852,205 @@ mod tests {
         let _ = eg2_task.await;
         me_rt.shutdown();
         dc_task.abort();
+        http_task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn me_client_frames_verify_transport_encrypted_quickack_and_adtag_flags() -> Result<()> {
+        let dir = make_temp_dir("client-flags");
+        let me_secret = vec![0x55; 128];
+        let mock_me = spawn_test_mock_me(me_secret.clone()).await?;
+        let conf_text = format!("default 2;\nproxy_for 2 {};\n", mock_me.addr);
+        let (http_addr, http_task) = spawn_test_http_cfg(
+            Arc::new(Mutex::new(me_secret.clone())),
+            Arc::new(Mutex::new(conf_text.into_bytes())),
+        )
+        .await?;
+
+        let tag_path = dir.join("ad-tag");
+        write_ad_tag_0600(&tag_path, "0123456789abcdef0123456789abcdef")?;
+
+        let counters = Arc::new(telemetry::Counters::default());
+        let me_cfg = config::MeConfig {
+            enabled: true,
+            fallback_to_direct: false,
+            send_client_ip: true,
+            public_ipv4: None,
+            pool_size: 1,
+            refresh_interval_secs: 3600,
+            drain_timeout_secs: 5,
+            ad_tag_file: Some(tag_path),
+            cache_dir: Some(dir.join("cache")),
+            proxy_secret_url: format!("http://{http_addr}/secret"),
+            proxy_config_url: format!("http://{http_addr}/conf"),
+        };
+        let me_rt = MeRuntime::start(me_cfg, dir.join("cache"), counters.clone()).await;
+        for _ in 0..50 {
+            if !me_rt.telemetry_snapshot().degraded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!me_rt.telemetry_snapshot().degraded);
+
+        let client_secret = [0x34; 16];
+        let mut st_dcs = HashMap::new();
+        st_dcs.insert(2, SocketAddr::from(([127, 0, 0, 1], 1)));
+        let st = Arc::new(State {
+            secrets: std::sync::RwLock::new(Arc::new(vec![NamedSecret {
+                name: "default".into(),
+                key: Zeroizing::new(client_secret),
+            }])),
+            sni: "example.com".into(),
+            allowed_snis: std::sync::RwLock::new(Arc::new("example.com".into())),
+            cover_resolver: Arc::new(CoverResolver::new(
+                "127.0.0.1:1".into(),
+                Duration::from_secs(60),
+            )),
+            enable_dd: false,
+            proxy_protocol: false,
+            cover_permits: Semaphore::new(4),
+            dcs: st_dcs,
+            dc_media_overrides: HashMap::new(),
+            egress_upstreams: Vec::new(),
+            egress_strategy: EgressStrategy::RoundRobin,
+            egress_token: [0; 16],
+            egress_rr: std::sync::atomic::AtomicUsize::new(0),
+            egress_health: std::sync::Mutex::new(EgressHealth::new(0)),
+            mtv4_cooldown: std::sync::Mutex::new(Vec::new()),
+            egress_probe_notify: Arc::new(tokio::sync::Notify::new()),
+            egress_cooldown: Duration::from_secs(1),
+            egress_cooldown_max: Duration::from_secs(5),
+            egress_probe_interval: Duration::from_secs(30),
+            egress_probe_degraded_interval: Duration::from_secs(5),
+            egress_hedge_ms: 0,
+            egress_use_mtv3: true,
+            client_hello: Duration::from_secs(2),
+            handshake: Duration::from_secs(2),
+            idle: Duration::from_secs(5),
+            drain: Duration::from_secs(1),
+            flight: wire::ServerFlightProfile::default(),
+            flight_shaping: false,
+            client_mss_bulk: None,
+            replay: tokio::sync::Mutex::new(ReplayCache::new(1024, Duration::from_secs(300))),
+            counters: counters.clone(),
+            alert_webhook_url: None,
+            alerts_file: None,
+            diagnostics: false,
+            me: Some(me_rt.clone()),
+            edge_me: None,
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let proxy_addr = listener.local_addr()?;
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let srv_task = tokio::spawn(serve(listener, st.clone(), 32, async {
+            let _ = stop_rx.await;
+        }));
+
+        // 1. Unencrypted MTProto frame (auth_key_id == 0) over Abridged with client quick-ack bit
+        let mut unenc_payload = vec![0u8; 24];
+        unenc_payload[16..20].copy_from_slice(&4u32.to_le_bytes());
+        unenc_payload[20..24].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        // 2. Encrypted MTProto client frame (non-zero 8-byte auth_key_id) over PaddedIntermediate without quick-ack
+        let mut enc_payload = vec![0u8; 32];
+        enc_payload[..8].copy_from_slice(&[0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18]);
+        enc_payload[8..].fill(0x5a);
+        // 3. Encrypted MTProto client frame over Intermediate with quick-ack bit
+        let enc_inter = enc_payload.clone();
+
+        let send_one = |kind: wire::ClientProtoKind, payload: Vec<u8>, set_qa: bool| async move {
+            let mut s = TcpStream::connect(proxy_addr).await?;
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            let (hello, _, _) = wire::build_client_hello(
+                &client_secret,
+                "example.com",
+                now,
+                &mut rand::rngs::OsRng,
+            )?;
+            s.write_all(&hello).await?;
+            let mut hdr = [0u8; 5];
+            for _ in 0..3 {
+                s.read_exact(&mut hdr).await?;
+                let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                let mut body = vec![0u8; len];
+                s.read_exact(&mut body).await?;
+            }
+            let (init, mut enc, mut dec) =
+                wire::build_client_init_with_kind(&client_secret, 2, kind)?;
+            s.write_all(&wire::record(0x17, &init)?).await?;
+            let mut frame = wire::encode_client_frame(kind, &payload, &[])?;
+            if set_qa {
+                match kind {
+                    wire::ClientProtoKind::Abridged => frame[0] |= 0x80,
+                    wire::ClientProtoKind::Intermediate
+                    | wire::ClientProtoKind::PaddedIntermediate => frame[3] |= 0x80,
+                }
+            }
+            wire::crypt(&mut enc, &mut frame);
+            s.write_all(&wire::record(0x17, &frame)?).await?;
+
+            let mut tls_rd = TlsReader::default();
+            let mut plain_buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let reply = timeout(Duration::from_secs(3), async {
+                loop {
+                    let n = tls_rd.read_into(&mut s, &mut tmp).await?;
+                    if n == 0 {
+                        anyhow::bail!("unexpected EOF");
+                    }
+                    wire::crypt(&mut dec, &mut tmp[..n]);
+                    plain_buf.extend_from_slice(&tmp[..n]);
+                    if let Some(f) = wire::decode_client_frame(kind, &mut plain_buf)? {
+                        return Ok::<_, anyhow::Error>(f.payload);
+                    }
+                }
+            })
+            .await??;
+            assert_eq!(reply, payload);
+            Ok::<_, anyhow::Error>(())
+        };
+
+        send_one(wire::ClientProtoKind::Abridged, unenc_payload, true).await?;
+        send_one(
+            wire::ClientProtoKind::PaddedIntermediate,
+            enc_payload,
+            false,
+        )
+        .await?;
+        send_one(wire::ClientProtoKind::Intermediate, enc_inter, true).await?;
+
+        {
+            let obs = mock_me.observed.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(obs.len(), 3);
+            let base = mtevil_me_pool::FLAG_MAGIC
+                | mtevil_me_pool::FLAG_EXTMODE2
+                | mtevil_me_pool::FLAG_HAS_AD_TAG;
+            assert_eq!(
+                obs[0].flags,
+                base | mtevil_me_pool::FLAG_ABRIDGED
+                    | mtevil_me_pool::FLAG_NOT_ENCRYPTED
+                    | mtevil_me_pool::FLAG_QUICKACK
+            );
+            assert_eq!(
+                obs[1].flags,
+                base | mtevil_me_pool::FLAG_INTERMEDIATE | mtevil_me_pool::FLAG_PAD
+            );
+            assert_eq!(
+                obs[2].flags,
+                base | mtevil_me_pool::FLAG_INTERMEDIATE | mtevil_me_pool::FLAG_QUICKACK
+            );
+            let exp_tag = mtevil_me_pool::parse_ad_tag_hex("0123456789abcdef0123456789abcdef")?;
+            for o in obs.iter() {
+                assert_eq!(o.ad_tag, Some(exp_tag));
+            }
+        }
+
+        let _ = stop_tx.send(());
+        let _ = srv_task.await;
+        me_rt.shutdown();
         http_task.abort();
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

@@ -1,7 +1,7 @@
 use crate::crypto::{derive_me_aes_key_iv, KdfPurpose, MeCbcDecryptor, MeCbcEncryptor};
 use crate::wire::{
     decode_rpc_frame, encode_close_ext, encode_handshake, encode_nonce, encode_ping, encode_pong,
-    encode_proxy_req, pack_rpc_frame, parse_rpc_message, RpcMessage, CRYPTO_AES,
+    encode_proxy_req, pack_rpc_frame, parse_rpc_message, MeClientProto, RpcMessage, CRYPTO_AES,
 };
 use anyhow::{bail, ensure, Context, Result};
 use rand::RngCore;
@@ -93,6 +93,7 @@ pub struct MeConnection {
 pub struct MeSession {
     conn_id: u64,
     remote_addr: Option<SocketAddrV4>,
+    proto: MeClientProto,
     ad_tag: Option<[u8; 16]>,
     shared: Arc<ConnShared>,
     rx: mpsc::Receiver<MeInboundEvent>,
@@ -105,6 +106,14 @@ impl MeSession {
     }
 
     pub async fn send_frame(&self, mtproto_payload: &[u8]) -> Result<()> {
+        self.send_frame_with_flags(mtproto_payload, false).await
+    }
+
+    pub async fn send_frame_with_flags(
+        &self,
+        mtproto_payload: &[u8],
+        quick_ack: bool,
+    ) -> Result<()> {
         ensure!(
             self.shared.alive.load(Ordering::Relaxed),
             "ME connection is closed"
@@ -113,6 +122,8 @@ impl MeSession {
             self.conn_id,
             self.remote_addr,
             self.shared.our_addr,
+            self.proto,
+            quick_ack,
             self.ad_tag.as_ref(),
             mtproto_payload,
         )?;
@@ -148,6 +159,7 @@ impl MeSession {
         let sender = MeSessionSender {
             conn_id: self.conn_id,
             remote_addr: self.remote_addr,
+            proto: self.proto,
             ad_tag: self.ad_tag,
             shared: self.shared.clone(),
             closed: false,
@@ -204,6 +216,7 @@ impl MeSessionReceiver {
 pub struct MeSessionSender {
     conn_id: u64,
     remote_addr: Option<SocketAddrV4>,
+    proto: MeClientProto,
     ad_tag: Option<[u8; 16]>,
     shared: Arc<ConnShared>,
     closed: bool,
@@ -211,6 +224,14 @@ pub struct MeSessionSender {
 
 impl MeSessionSender {
     pub async fn send_frame(&self, mtproto_payload: &[u8]) -> Result<()> {
+        self.send_frame_with_flags(mtproto_payload, false).await
+    }
+
+    pub async fn send_frame_with_flags(
+        &self,
+        mtproto_payload: &[u8],
+        quick_ack: bool,
+    ) -> Result<()> {
         ensure!(
             self.shared.alive.load(Ordering::Relaxed),
             "ME connection is closed"
@@ -219,6 +240,8 @@ impl MeSessionSender {
             self.conn_id,
             self.remote_addr,
             self.shared.our_addr,
+            self.proto,
+            quick_ack,
             self.ad_tag.as_ref(),
             mtproto_payload,
         )?;
@@ -615,6 +638,7 @@ impl MeConnection {
     pub fn open_session(
         &self,
         remote_addr: Option<SocketAddrV4>,
+        proto: MeClientProto,
         ad_tag: Option<[u8; 16]>,
     ) -> Result<MeSession> {
         ensure!(self.is_alive(), "ME connection is closed");
@@ -631,6 +655,7 @@ impl MeConnection {
         Ok(MeSession {
             conn_id,
             remote_addr,
+            proto,
             ad_tag,
             shared: self.shared.clone(),
             rx,

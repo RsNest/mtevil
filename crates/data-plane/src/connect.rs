@@ -622,6 +622,7 @@ fn clear_mtv4_cooldown(state: &State, idx: usize) {
 pub(crate) enum EgressDialMode<'a> {
     DirectStream(&'a [u8; 64]),
     FramedMe {
+        proto: wire::ClientProtoKind,
         client_addr: Option<std::net::SocketAddrV4>,
     },
 }
@@ -636,12 +637,20 @@ fn build_egress_wire_preface_for_mode(
         EgressDialMode::DirectStream(dc_header) => {
             build_egress_wire_preface(token, dc_id, dc_header, use_mtv3)
         }
-        EgressDialMode::FramedMe { client_addr } => {
+        EgressDialMode::FramedMe { proto, client_addr } => {
             use rand::RngCore;
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
             let mut nonce = [0u8; 16];
             rand::rngs::OsRng.fill_bytes(&mut nonce);
-            Ok(wire::build_egress_preface_v4(token, dc_id, now, &nonce, client_addr)?.to_vec())
+            Ok(wire::build_egress_preface_v4_with_proto(
+                token,
+                dc_id,
+                now,
+                &nonce,
+                proto,
+                client_addr,
+            )?
+            .to_vec())
         }
     }
 }
@@ -878,13 +887,19 @@ pub(crate) async fn connect_upstream(
 pub(crate) async fn connect_upstream_mtv4(
     state: &State,
     dc_id: i16,
+    proto: wire::ClientProtoKind,
     client_addr: Option<std::net::SocketAddrV4>,
 ) -> Result<(TcpStream, &'static str)> {
     ensure!(
         !state.egress_upstreams.is_empty(),
         "MTV4 requires at least one egress upstream"
     );
-    connect_egress_with_mode(state, dc_id, EgressDialMode::FramedMe { client_addr }).await
+    connect_egress_with_mode(
+        state,
+        dc_id,
+        EgressDialMode::FramedMe { proto, client_addr },
+    )
+    .await
 }
 
 async fn connect_egress_with_mode(

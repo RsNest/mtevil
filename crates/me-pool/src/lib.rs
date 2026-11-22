@@ -14,7 +14,9 @@ pub use pool::{MePool, MePoolConfig, MePoolHealth};
 pub use wire::{
     build_req_pq_multi, decode_rpc_frame, encode_close_ext, encode_handshake, encode_nonce,
     encode_ping, encode_pong, encode_proxy_req, ipv4_mapped_16, pack_rpc_frame, parse_rpc_message,
-    tl_encode_bytes, validate_res_pq, RpcMessage,
+    tl_encode_bytes, validate_res_pq, MeClientProto, RpcMessage, AD_TAG_EXTRA_SIZE, FLAG_ABRIDGED,
+    FLAG_EXTMODE2, FLAG_HAS_AD_TAG, FLAG_INTERMEDIATE, FLAG_MAGIC, FLAG_NOT_ENCRYPTED, FLAG_PAD,
+    FLAG_QUICKACK, TL_PROXY_TAG,
 };
 
 #[cfg(test)]
@@ -255,13 +257,27 @@ mod tests {
                                 let rport =
                                     u32::from_le_bytes([rpay[32], rpay[33], rpay[34], rpay[35]]);
                                 let (ad_tag_seen, body_off) = if flags & FLAG_HAS_AD_TAG != 0 {
-                                    // TL short bytes: [len=16][16 bytes][3 pad bytes] = 20 bytes
-                                    if rpay.len() < 56 + 20 || rpay[56] != 16 {
+                                    // Independent wire parser per MIT alexbers/mtprotoproxy & Apache-2.0 seriyps/mtproto_proxy:
+                                    // [extra_size: u32 LE = 24][TL_PROXY_TAG: u32 LE = 0xdb1e26ae][len=16][16 bytes][3 zero align bytes]
+                                    if rpay.len() < 56 + 28 {
+                                        return;
+                                    }
+                                    let extra_size = u32::from_le_bytes([
+                                        rpay[56], rpay[57], rpay[58], rpay[59],
+                                    ]);
+                                    let tl_tag = u32::from_le_bytes([
+                                        rpay[60], rpay[61], rpay[62], rpay[63],
+                                    ]);
+                                    if extra_size != 24
+                                        || tl_tag != 0xdb1e_26ae
+                                        || rpay[64] != 16
+                                        || rpay[81..84] != [0u8; 3]
+                                    {
                                         return;
                                     }
                                     let mut tag = [0u8; 16];
-                                    tag.copy_from_slice(&rpay[57..73]);
-                                    (Some(tag), 76)
+                                    tag.copy_from_slice(&rpay[65..81]);
+                                    (Some(tag), 84)
                                 } else {
                                     (None, 56)
                                 };
@@ -423,11 +439,16 @@ mod tests {
                 ))
             };
             let tag = if i % 3 == 0 { Some(ad_tag) } else { None };
+            let proto = match i % 3 {
+                0 => MeClientProto::Abridged,
+                1 => MeClientProto::Intermediate,
+                _ => MeClientProto::PaddedIntermediate,
+            };
             handles.push(tokio::spawn(async move {
-                let mut sess = c.open_session(remote, tag)?;
+                let mut sess = c.open_session(remote, proto, tag)?;
                 let mut msg = [0u8; 16];
                 msg[0..4].copy_from_slice(&i.to_le_bytes());
-                sess.send_frame(&msg).await?;
+                sess.send_frame_with_flags(&msg, i % 5 == 0).await?;
                 let reply = timeout(Duration::from_secs(3), sess.recv_frame())
                     .await
                     .context("recv reply timeout")?
@@ -472,7 +493,7 @@ mod tests {
         .await?;
 
         // Slow session never reads; trigger > SESSION_INBOUND_QUEUE_CAP replies for it.
-        let _slow = conn.open_session(None, None)?;
+        let _slow = conn.open_session(None, MeClientProto::PaddedIntermediate, None)?;
         srv.burst_count
             .store(SESSION_INBOUND_QUEUE_CAP + 8, Ordering::Relaxed);
         _slow.send_frame(&[0xaa; 16]).await?;
@@ -489,7 +510,7 @@ mod tests {
 
         // Healthy session on the SAME ME connection must still work cleanly.
         srv.burst_count.store(1, Ordering::Relaxed);
-        let mut fast = conn.open_session(None, None)?;
+        let mut fast = conn.open_session(None, MeClientProto::PaddedIntermediate, None)?;
         fast.send_frame(&[0xbb; 16]).await?;
         let reply = timeout(Duration::from_secs(2), fast.recv_frame())
             .await?
@@ -546,7 +567,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let mut sess = pool.open_session(2, None, None)?;
+        let mut sess = pool.open_session(2, None, MeClientProto::PaddedIntermediate, None)?;
         sess.send_frame(&[0x55; 16]).await?;
         let rep = timeout(Duration::from_secs(2), sess.recv_frame())
             .await?
@@ -626,9 +647,10 @@ mod tests {
         }
         assert!(!pool.health().degraded);
 
-        let mut active_sess = pool.open_session(2, None, None)?;
-        let flood_sess = pool.open_session(2, None, None)?;
-        let close_sess = pool.open_session(2, None, None)?;
+        let mut active_sess =
+            pool.open_session(2, None, MeClientProto::PaddedIntermediate, None)?;
+        let flood_sess = pool.open_session(2, None, MeClientProto::PaddedIntermediate, None)?;
+        let close_sess = pool.open_session(2, None, MeClientProto::PaddedIntermediate, None)?;
 
         let t0 = tokio::time::Instant::now();
         // Saturate OS TCP send buffer + ME_OUTBOUND_QUEUE_CAP so writer stalls on write_all
@@ -679,7 +701,7 @@ mod tests {
             srv.accepts.load(Ordering::Relaxed) >= 2 && !pool.health().degraded,
             "pool must reconnect after stalled ME socket closes"
         );
-        let mut recovered = pool.open_session(2, None, None)?;
+        let mut recovered = pool.open_session(2, None, MeClientProto::PaddedIntermediate, None)?;
         recovered.send_frame(&[0x42; 16]).await?;
         let reply = timeout(Duration::from_secs(2), recovered.recv_frame())
             .await?
@@ -725,7 +747,8 @@ mod tests {
         assert!(health.degraded);
         assert_eq!(health.alive_connections, 0);
         assert!(
-            pool.open_session(2, None, None).is_err(),
+            pool.open_session(2, None, MeClientProto::PaddedIntermediate, None)
+                .is_err(),
             "open_session must fail immediately when all ME sockets are down"
         );
         let attempts = srv.accepts.load(Ordering::Relaxed);
@@ -816,7 +839,7 @@ mod tests {
         assert!(!pool.health().degraded);
 
         // Open existing session on srv1 before hot-swap.
-        let mut sess_old = pool.open_session(2, None, None)?;
+        let mut sess_old = pool.open_session(2, None, MeClientProto::PaddedIntermediate, None)?;
         sess_old.send_frame(&[0x11; 16]).await?;
         let rep1 = timeout(Duration::from_secs(2), sess_old.recv_frame())
             .await?
@@ -844,7 +867,7 @@ mod tests {
         assert_eq!(rep2, vec![0x22; 16]);
 
         // New session must route to srv2.
-        let mut sess_new = pool.open_session(2, None, None)?;
+        let mut sess_new = pool.open_session(2, None, MeClientProto::PaddedIntermediate, None)?;
         sess_new.send_frame(&[0x33; 16]).await?;
         let rep3 = timeout(Duration::from_secs(2), sess_new.recv_frame())
             .await?
@@ -860,7 +883,7 @@ mod tests {
         );
 
         // Verify MePoolHealth surfaces backpressure_drops monotonically across the pool.
-        let _slow = pool.open_session(2, None, None)?;
+        let _slow = pool.open_session(2, None, MeClientProto::PaddedIntermediate, None)?;
         srv2.burst_count
             .store(SESSION_INBOUND_QUEUE_CAP + 4, Ordering::Relaxed);
         _slow.send_frame(&[0x44; 16]).await?;
@@ -956,7 +979,7 @@ mod tests {
             },
         )
         .await?;
-        let mut sess = conn.open_session(None, None)?;
+        let mut sess = conn.open_session(None, MeClientProto::PaddedIntermediate, None)?;
         let mut nonce = [0u8; 16];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
         let now_secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -968,6 +991,105 @@ mod tests {
             .context("live ME session closed before resPQ")?;
         validate_res_pq(&reply, &nonce)?;
         conn.close();
+        Ok(())
+    }
+
+    fn decode_hex_vec(s: &str) -> Result<Vec<u8>> {
+        anyhow::ensure!(s.len().is_multiple_of(2), "odd hex length");
+        let (pairs, _) = s.as_bytes().as_chunks::<2>();
+        let mut out = Vec::with_capacity(pairs.len());
+        for pair in pairs {
+            let text = std::str::from_utf8(pair)?;
+            out.push(u8::from_str_radix(text, 16)?);
+        }
+        Ok(out)
+    }
+
+    struct RefProxyReqCase<'a> {
+        name: &'a str,
+        remote: Option<SocketAddrV4>,
+        proto: MeClientProto,
+        quick_ack: bool,
+        ad_tag: Option<&'a [u8; 16]>,
+        payload: &'a [u8],
+        exp_hex: &'a str,
+    }
+
+    /// Independent wire-format vectors generated from MIT `alexbers/mtprotoproxy`
+    /// (`mtprotoproxy.py` lines 934-977) and cross-checked with Apache-2.0
+    /// `seriyps/mtproto_proxy` (`src/mtp_rpc.erl` lines 48-142).
+    #[test]
+    fn rpc_proxy_req_matches_independent_mit_reference_vectors() -> Result<()> {
+        let conn_id: u64 = 0x0102_0304_0506_0708;
+        let remote = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 10), 54321);
+        let our = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 443);
+        let tag = parse_ad_tag_hex("00112233445566778899aabbccddeeff")?;
+        // Unencrypted MTProto frame (auth_key_id == 0)
+        let unenc = decode_hex_vec("0000000000000000040000000100000004000000aabbccdd")?;
+        // Encrypted MTProto client frame (non-zero 8-byte auth_key_id)
+        let enc = decode_hex_vec("a1b2c3d4e5f6071811223344556677889900aabbccddeeff")?;
+
+        let cases = [
+            RefProxyReqCase {
+                name: "intermediate_unenc_notag",
+                remote: Some(remote),
+                proto: MeClientProto::Intermediate,
+                quick_ack: false,
+                ad_tag: None,
+                payload: &unenc,
+                exp_hex: "eef1ce3602100220080706050403020100000000000000000000ffffcb00710a31d4000000000000000000000000ffffc6336407bb0100000000000000000000040000000100000004000000aabbccdd",
+            },
+            RefProxyReqCase {
+                name: "secure_enc_tag",
+                remote: Some(remote),
+                proto: MeClientProto::PaddedIntermediate,
+                quick_ack: false,
+                ad_tag: Some(&tag),
+                payload: &enc,
+                exp_hex: "eef1ce3608100228080706050403020100000000000000000000ffffcb00710a31d4000000000000000000000000ffffc6336407bb01000018000000ae261edb1000112233445566778899aabbccddeeff000000a1b2c3d4e5f6071811223344556677889900aabbccddeeff",
+            },
+            RefProxyReqCase {
+                name: "abridged_enc_tag_qa",
+                remote: Some(remote),
+                proto: MeClientProto::Abridged,
+                quick_ack: true,
+                ad_tag: Some(&tag),
+                payload: &enc,
+                exp_hex: "eef1ce36081002c0080706050403020100000000000000000000ffffcb00710a31d4000000000000000000000000ffffc6336407bb01000018000000ae261edb1000112233445566778899aabbccddeeff000000a1b2c3d4e5f6071811223344556677889900aabbccddeeff",
+            },
+            RefProxyReqCase {
+                name: "secure_unenc_tag_qa_zeroip",
+                remote: None,
+                proto: MeClientProto::PaddedIntermediate,
+                quick_ack: true,
+                ad_tag: Some(&tag),
+                payload: &unenc,
+                exp_hex: "eef1ce360a1002a8080706050403020100000000000000000000ffff000000000000000000000000000000000000ffffc6336407bb01000018000000ae261edb1000112233445566778899aabbccddeeff0000000000000000000000040000000100000004000000aabbccdd",
+            },
+            RefProxyReqCase {
+                name: "intermediate_enc_notag_qa",
+                remote: Some(remote),
+                proto: MeClientProto::Intermediate,
+                quick_ack: true,
+                ad_tag: None,
+                payload: &enc,
+                exp_hex: "eef1ce36001002a0080706050403020100000000000000000000ffffcb00710a31d4000000000000000000000000ffffc6336407bb010000a1b2c3d4e5f6071811223344556677889900aabbccddeeff",
+            },
+        ];
+
+        for c in cases {
+            let got = encode_proxy_req(
+                conn_id,
+                c.remote,
+                our,
+                c.proto,
+                c.quick_ack,
+                c.ad_tag,
+                c.payload,
+            )?;
+            let exp = decode_hex_vec(c.exp_hex)?;
+            assert_eq!(got, exp, "MIT reference vector mismatch for {}", c.name);
+        }
         Ok(())
     }
 }

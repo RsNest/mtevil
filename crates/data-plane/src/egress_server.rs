@@ -376,7 +376,7 @@ pub(crate) async fn egress_connection(
         } else {
             None
         };
-        let me_session = match me_rt.open_session(parsed.dc, effective_client_addr) {
+        let me_session = match me_rt.open_session(parsed.dc, effective_client_addr, parsed.proto) {
             Ok(sess) => sess,
             Err(err) => {
                 let _ = timeout(handshake, edge.write_all(&[EGRESS_ACK_ERR])).await;
