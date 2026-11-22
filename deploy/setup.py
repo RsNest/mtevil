@@ -3127,19 +3127,38 @@ def run_adtag_command(deploy_dir: Path, action: str, tag_value: str | None = Non
         return 0
 
     if act == "set":
-        if not tag_value:
-            print(err_text("Укажите 32-hex тег: mtevilctl adtag set <32_hex>"), file=sys.stderr)
+        raw_input = tag_value
+        if not raw_input:
+            try:
+                if sys.stdin.isatty():
+                    raw_input = getpass.getpass("Введите 32-hex ad_tag от @MTProxybot (ввод скрыт): ")
+                else:
+                    raw_input = sys.stdin.readline()
+            except (EOFError, KeyboardInterrupt):
+                print(err_text("Ввод ad_tag отменён."), file=sys.stderr)
+                return 1
+        if not (raw_input or "").strip():
+            print(
+                err_text("Не передан ad_tag. Используйте 'mtevilctl adtag set' (скрытый ввод) или stdin."),
+                file=sys.stderr,
+            )
             return 1
         try:
-            clean_tag = validate_ad_tag_hex(tag_value)
+            clean_tag = validate_ad_tag_hex(raw_input)
         except ValueError as exc:
             print(err_text(str(exc)), file=sys.stderr)
             return 1
-        # Pass ad_tag via stdin (not CLI args) into init service; atomic write with UID 10001 and 0600.
+
+        # Pass ad_tag via stdin (not CLI args) into init service; atomic write with strict chmod 0600
+        # and chown 10001:10001 (without ignoring errors via `|| true`).
         sh_script = (
-            f'umask 077 && tmp="{ad_tag_path}.tmp.$$" && cat > "$tmp" '
-            f'&& chmod 0600 "$tmp" && chown 10001:10001 "$tmp" 2>/dev/null || true '
-            f'&& mv -f "$tmp" "{ad_tag_path}"'
+            f'set -eu; umask 077; tmp="{ad_tag_path}.tmp.$$"; '
+            f'trap \'rm -f "$tmp"\' EXIT; '
+            f'cat > "$tmp"; '
+            f'chmod 0600 "$tmp"; '
+            f'if [ "$(id -u)" -eq 0 ]; then chown 10001:10001 "$tmp"; fi; '
+            f'mv -f "$tmp" "{ad_tag_path}"; '
+            f'trap - EXIT'
         )
         proc = subprocess.run(
             base + ["run", "--rm", "-T", "--no-deps", "--entrypoint", "/bin/sh", write_svc, "-c", sh_script],
@@ -3149,9 +3168,63 @@ def run_adtag_command(deploy_dir: Path, action: str, tag_value: str | None = Non
             check=False,
         )
         if proc.returncode != 0:
-            print(err_text("Не удалось записать файл ad_tag в том state."), file=sys.stderr)
+            detail = (proc.stderr or proc.stdout or "").strip()
+            print(
+                err_text(f"Не удалось записать файл ad_tag в том state ({detail or 'код ' + str(proc.returncode)})."),
+                file=sys.stderr,
+            )
             return 1
-        print(ok_text(f"Рекламный тег установлен ({mask_ad_tag(clean_tag)}, права 0600, владелец 10001:10001)."))
+
+        # Verify actual owner/mode and readability strictly as UID 10001.
+        verify_script = (
+            f'set -eu; test -r "{ad_tag_path}"; '
+            f'test "$(wc -c < "{ad_tag_path}")" -ge 32; '
+            f'stat -c "%u:%g %a" "{ad_tag_path}"'
+        )
+        verify_cmd = base + (
+            ["exec", "-T", "--user", "10001:10001", svc, "/bin/sh", "-c", verify_script]
+            if cid
+            else [
+                "run",
+                "--rm",
+                "-T",
+                "--no-deps",
+                "--user",
+                "10001:10001",
+                "--entrypoint",
+                "/bin/sh",
+                svc,
+                "-c",
+                verify_script,
+            ]
+        )
+        verify_proc = run(verify_cmd, check=False)
+        if verify_proc.returncode != 0 or not (verify_proc.stdout or "").strip():
+            detail = (verify_proc.stderr or verify_proc.stdout or "").strip()
+            print(
+                err_text(
+                    f"Файл ad_tag записан, но проверка чтения от UID 10001 не прошла: {detail or 'нет доступа'}."
+                ),
+                file=sys.stderr,
+            )
+            return 1
+        actual_meta = verify_proc.stdout.strip().splitlines()[-1].strip()
+        meta_parts = actual_meta.split()
+        actual_owner = meta_parts[0] if len(meta_parts) >= 1 else "unknown"
+        actual_mode = meta_parts[1] if len(meta_parts) >= 2 else "unknown"
+        if actual_mode != "600":
+            print(
+                err_text(
+                    f"Небезопасные права на {ad_tag_path}: {actual_mode} (ожидалось 600, владелец {actual_owner})."
+                ),
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            ok_text(
+                f"Рекламный тег установлен ({mask_ad_tag(clean_tag)}, права 0{actual_mode}, владелец {actual_owner}, чтение от UID 10001 подтверждено)."
+            )
+        )
         print("Прокси подхватит новый тег автоматически в течение 2 секунд без перезапуска контейнера.")
         if not bool(me_cfg.get("enabled", False)):
             print(warn_text("Примечание: режим ME сейчас выключен в config.json (включите его через mtevilctl setup)."))

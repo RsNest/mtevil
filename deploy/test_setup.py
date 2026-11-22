@@ -2548,6 +2548,8 @@ class SetupValidationTests(unittest.TestCase):
             def fake_run(cmd, check=True):
                 if "ps" in cmd:
                     return subprocess.CompletedProcess(cmd, 0, stdout="cid123\n", stderr="")
+                if "stat -c" in " ".join(cmd):
+                    return subprocess.CompletedProcess(cmd, 0, stdout="10001:10001 600\n", stderr="")
                 if "cat" in " ".join(cmd):
                     return subprocess.CompletedProcess(cmd, 0, stdout=raw_tag + "\n", stderr="")
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -2560,9 +2562,12 @@ class SetupValidationTests(unittest.TestCase):
                 mock.patch.object(setup, "compose_write_service", return_value="init"),
                 mock.patch.object(setup, "run", side_effect=fake_run),
                 mock.patch.object(setup.subprocess, "run", side_effect=fake_subproc_run),
+                mock.patch.object(setup.sys.stdin, "isatty", return_value=True),
+                mock.patch.object(setup.getpass, "getpass", return_value=raw_tag),
                 contextlib.redirect_stdout(out_set),
             ):
-                rc_set = setup.run_adtag_command(d, "set", raw_tag)
+                # Hidden interactive prompt (no CLI arg -> getpass, avoids shell history)
+                rc_set = setup.run_adtag_command(d, "set", None)
                 rc_show = setup.run_adtag_command(d, "show")
                 rc_clear = setup.run_adtag_command(d, "clear")
             self.assertEqual((rc_set, rc_show, rc_clear), (0, 0, 0))
@@ -2570,11 +2575,28 @@ class SetupValidationTests(unittest.TestCase):
             set_cmd, set_stdin = recorded_runs[0]
             self.assertIn("init", set_cmd)
             self.assertNotIn(raw_tag, " ".join(set_cmd))
+            self.assertNotIn("|| true", " ".join(set_cmd))
             self.assertEqual(set_stdin, raw_tag + "\n")
             self.assertIn("chmod 0600", " ".join(set_cmd))
             self.assertIn("10001:10001", " ".join(set_cmd))
             self.assertIn("0123…cdef", out_set.getvalue())
+            self.assertIn("владелец 10001:10001", out_set.getvalue())
             self.assertNotIn(raw_tag, out_set.getvalue())
+
+            # Non-TTY stdin pipe works without CLI arg too
+            recorded_runs.clear()
+            with (
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "compose_cmd", return_value=["docker", "compose"]),
+                mock.patch.object(setup, "compose_service", return_value="mtevil"),
+                mock.patch.object(setup, "compose_write_service", return_value="init"),
+                mock.patch.object(setup, "run", side_effect=fake_run),
+                mock.patch.object(setup.subprocess, "run", side_effect=fake_subproc_run),
+                mock.patch("sys.stdin", io.StringIO(raw_tag + "\n")),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(setup.run_adtag_command(d, "set", None), 0)
+            self.assertEqual(recorded_runs[0][1], raw_tag + "\n")
 
         # 5. Migration v0.2.0 -> v0.3 preserves custom compose and keeps ME disabled
         with tempfile.TemporaryDirectory() as td:
