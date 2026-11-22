@@ -30,6 +30,16 @@ impl EdgeRouteState {
     }
 }
 
+pub(crate) const ACK_TIMEOUT_ESCALATION_WINDOW: Duration = Duration::from_secs(10);
+pub(crate) const ACK_TIMEOUT_ESCALATION_DISTINCT_DCS: usize = 2;
+pub(crate) const ACK_TIMEOUT_ESCALATION_CONSECUTIVE: usize = 3;
+
+#[derive(Default, Clone)]
+pub(crate) struct AckTimeoutWindow {
+    pub(crate) entries: std::collections::VecDeque<(Instant, i16)>,
+    pub(crate) last_success: Option<Instant>,
+}
+
 #[derive(Default)]
 pub(crate) struct EgressHealth {
     pub(crate) nodes: Vec<CooldownSlot>,
@@ -37,6 +47,7 @@ pub(crate) struct EgressHealth {
     pub(crate) dc_slots: HashMap<(usize, i16), CooldownSlot>,
     pub(crate) route_state: EdgeRouteState,
     pub(crate) node_ack_samples_ms: Vec<std::collections::VecDeque<u64>>,
+    pub(crate) node_ack_timeouts: Vec<AckTimeoutWindow>,
     pub(crate) node_down_notifiers: Vec<Arc<tokio::sync::Notify>>,
 }
 
@@ -66,6 +77,7 @@ impl EgressHealth {
             node_ack_samples_ms: (0..node_count)
                 .map(|_| std::collections::VecDeque::with_capacity(32))
                 .collect(),
+            node_ack_timeouts: vec![AckTimeoutWindow::default(); node_count],
             node_down_notifiers: (0..node_count)
                 .map(|_| Arc::new(tokio::sync::Notify::new()))
                 .collect(),
@@ -78,6 +90,7 @@ impl EgressHealth {
         elapsed: Duration,
     ) {
         let ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        let now = Instant::now();
         let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
         while h.node_ack_samples_ms.len() <= idx {
             h.node_ack_samples_ms
@@ -88,6 +101,52 @@ impl EgressHealth {
             samples.pop_front();
         }
         samples.push_back(ms.max(1));
+        while h.node_ack_timeouts.len() <= idx {
+            h.node_ack_timeouts.push(AckTimeoutWindow::default());
+        }
+        h.node_ack_timeouts[idx].entries.clear();
+        h.node_ack_timeouts[idx].last_success = Some(now);
+    }
+
+    /// Record a post-preface ACK timeout on `(idx, dc)` and return `true` if the node should
+    /// escalate to node-level cooldown + `node_down` (>=2 distinct DCs or >=3 consecutive
+    /// ACK timeouts within 10s with no successful ACK in that window).
+    pub(crate) fn record_ack_timeout_and_check_escalation(
+        health: &std::sync::Mutex<Self>,
+        idx: usize,
+        dc: i16,
+        now: Instant,
+    ) -> bool {
+        let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
+        while h.node_ack_timeouts.len() <= idx {
+            h.node_ack_timeouts.push(AckTimeoutWindow::default());
+        }
+        let win = &mut h.node_ack_timeouts[idx];
+        while let Some(&(ts, _)) = win.entries.front() {
+            if now.saturating_duration_since(ts) > ACK_TIMEOUT_ESCALATION_WINDOW {
+                win.entries.pop_front();
+            } else {
+                break;
+            }
+        }
+        win.entries.push_back((now, dc));
+        let first_ts = win.entries.front().map(|(t, _)| *t).unwrap_or(now);
+        let no_ok_in_window = win.last_success.is_none_or(|t| t < first_ts);
+        let mut distinct_dcs: Vec<i16> = Vec::with_capacity(win.entries.len());
+        for &(_, d) in &win.entries {
+            if !distinct_dcs.contains(&d) {
+                distinct_dcs.push(d);
+            }
+        }
+        if no_ok_in_window
+            && (distinct_dcs.len() >= ACK_TIMEOUT_ESCALATION_DISTINCT_DCS
+                || win.entries.len() >= ACK_TIMEOUT_ESCALATION_CONSECUTIVE)
+        {
+            win.entries.clear();
+            true
+        } else {
+            false
+        }
     }
 
     /// Adaptive per-try connect/ACK timeout for node `idx`: `max(300 ms, 2 × p95(node_ack_samples_ms[idx]))`

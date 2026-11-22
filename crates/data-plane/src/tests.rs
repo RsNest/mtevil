@@ -4557,8 +4557,8 @@ async fn inv10_f23_ack_timeout_after_preface_is_dc_level_while_connect_timeout_i
         anyhow::bail!("DC-A must time out waiting for ACK");
     };
     assert!(
-        matches!(err_a, EgressAttemptErr::Dc(_)),
-        "ACK timeout after full preface write must be classified as Dc-level"
+        matches!(err_a, EgressAttemptErr::DcAckTimeout(_)),
+        "ACK timeout after full preface write must be classified as DcAckTimeout"
     );
     let _ = finalize_egress_error(&st, 0, claim_a, err_a);
 
@@ -4672,4 +4672,156 @@ fn inv10_f23_compare_per_try_floor_policies_slow_route_vs_blackhole() {
     // Policy B cuts unhedged blackhole detection from 800ms down to 300ms (2.67x faster).
     assert_eq!(per_try_a_bh, 800);
     assert_eq!(per_try_b_bh, 300);
+}
+
+#[tokio::test(start_paused = true)]
+async fn inv10_f23_hung_egress_ack_timeout_escalation_and_isolated_dc_isolation() -> Result<()> {
+    let cover = cover_mock().await?;
+
+    // Helper: hung egress accepts TCP, reads preface, never sends ACK.
+    let l_hung = TcpListener::bind("127.0.0.1:0").await?;
+    let a_hung = l_hung.local_addr()?;
+    let t_hung = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut s, _)) = l_hung.accept().await {
+            let mut buf = [0u8; 88];
+            let _ = s.read_exact(&mut buf).await;
+            held.push(s);
+        }
+    });
+
+    // Helper: healthy backup responds immediately with EGRESS_ACK_OK.
+    let l_ok = TcpListener::bind("127.0.0.1:0").await?;
+    let a_ok = l_ok.local_addr()?;
+    let t_ok = tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l_ok.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 88];
+                if s.read_exact(&mut buf).await.is_ok() {
+                    let _ = s.write_all(&[EGRESS_ACK_OK]).await;
+                    let mut drain = [0u8; 16];
+                    let _ = timeout(Duration::from_secs(2), s.read(&mut drain)).await;
+                }
+            });
+        }
+    });
+
+    // Scenario 1 ("egress hung: TCP accepted, no ACK"): 20 sequential connections across different DCs
+    // with hedge disabled (hedge_ms=0) to isolate per_try escalation directly.
+    let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut st).context("unique state")?;
+        sm.egress_upstreams = vec![a_hung, a_ok];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+        sm.egress_hedge_ms = 0;
+        sm.egress_cooldown = Duration::from_secs(10);
+        sm.egress_cooldown_max = Duration::from_secs(60);
+        sm.egress_use_mtv3 = false;
+        sm.handshake = Duration::from_secs(4);
+    }
+    // Seed 4 fast samples on primary so adaptive per_try = 300ms.
+    for _ in 0..4 {
+        EgressHealth::record_ack_latency(&st.egress_health, 0, Duration::from_millis(10));
+    }
+
+    let dcs: [i16; 7] = [2, 4, -2, -4, 1, 3, 5];
+    let mut lats_ms = Vec::with_capacity(21);
+    for i in 0..21usize {
+        let dc = dcs[i % dcs.len()];
+        let t0 = Instant::now();
+        let (s, route) = connect_upstream(&st, dc, &[0x11; 64]).await?;
+        assert_eq!(route, "egress");
+        drop(s);
+        lats_ms.push(t0.elapsed().as_millis() as u64);
+    }
+    lats_ms.sort_unstable();
+    let p50 = lats_ms[lats_ms.len() / 2];
+    let p95 = lats_ms[((lats_ms.len() * 95).div_ceil(100)).saturating_sub(1)];
+    let slow_count = lats_ms.iter().filter(|&&ms| ms >= 250).count();
+    eprintln!("F3B_MEASURE_HUNG_EGRESS: p50={p50}ms p95={p95}ms slow_attempts={slow_count}/21");
+
+    // After escalation on >=2 distinct DCs (2 and 4), primary node 0 MUST be in node-level cooldown!
+    {
+        let h = st.egress_health.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            h.nodes[0].until.is_some(),
+            "hung egress must escalate to node-level cooldown after >=2 distinct DC ACK timeouts"
+        );
+    }
+    // Only the first 2 distinct DCs should have paid per_try (300ms); the remaining 19 skip primary immediately!
+    assert!(
+        slow_count <= 2,
+        "after escalation only <=2 attempts should pay per_try (got {slow_count}/21, p50={p50}ms, p95={p95}ms)"
+    );
+    assert!(
+        p50 < 50,
+        "p50 after escalation should be near 0ms (got {p50}ms)"
+    );
+    assert!(
+        p95 <= 350,
+        "p95 should remain bounded by per_try (got {p95}ms)"
+    );
+
+    // Scenario 2: one slow DC (DC 2) on a healthy node (DC 4 responds OK) -> stays DC-level, node NOT cooled down.
+    let l_partial = TcpListener::bind("127.0.0.1:0").await?;
+    let a_partial = l_partial.local_addr()?;
+    let t_partial = tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l_partial.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 88];
+                if s.read_exact(&mut buf).await.is_ok() {
+                    let dc = i16::from_le_bytes([buf[4], buf[5]]);
+                    if dc == 2 {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    } else {
+                        let _ = s.write_all(&[EGRESS_ACK_OK]).await;
+                        let mut drain = [0u8; 16];
+                        let _ = timeout(Duration::from_secs(2), s.read(&mut drain)).await;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut st2 = state(cover.addr, "127.0.0.1:1".parse()?);
+    {
+        let sm = Arc::get_mut(&mut st2).context("unique state")?;
+        sm.egress_upstreams = vec![a_partial, a_ok];
+        sm.egress_strategy = EgressStrategy::Ordered;
+        sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
+        sm.egress_hedge_ms = 0;
+        sm.egress_cooldown = Duration::from_secs(10);
+        sm.egress_cooldown_max = Duration::from_secs(60);
+        sm.egress_use_mtv3 = false;
+        sm.handshake = Duration::from_secs(4);
+    }
+    for _ in 0..4 {
+        EgressHealth::record_ack_latency(&st2.egress_health, 0, Duration::from_millis(10));
+    }
+    // One isolated ACK timeout on DC 2 fails over to backup, cooling down only (node 0, DC 2).
+    let (s_dc2, _) = connect_upstream(&st2, 2, &[0x22; 64]).await?;
+    drop(s_dc2);
+    {
+        let h2 = st2.egress_health.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            h2.nodes[0].until.is_none(),
+            "single DC timeout must not cool down whole node"
+        );
+        assert!(h2.dc_slots.get(&(0, 2)).and_then(|s| s.until).is_some());
+    }
+    // DC 4 on the SAME primary node 0 succeeds immediately without touching backup!
+    let (s_dc4, _) = connect_upstream(&st2, 4, &[0x33; 64]).await?;
+    drop(s_dc4);
+
+    for t in [t_hung, t_ok, t_partial] {
+        t.abort();
+    }
+    Ok(())
 }

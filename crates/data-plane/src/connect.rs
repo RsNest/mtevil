@@ -571,6 +571,9 @@ pub(crate) async fn connect_dc_candidates(
 pub(crate) enum EgressAttemptErr {
     Node(anyhow::Error),
     Dc(anyhow::Error),
+    /// Post-preface ACK timeout: DC-level by default, escalates to node-level if >=2 distinct DCs
+    /// or >=3 consecutive ACK timeouts occur within 10s with no successful ACK.
+    DcAckTimeout(anyhow::Error),
     /// Attempt was cancelled because another concurrent attempt already signaled this node down.
     /// Must NOT record an extra failure or inflate cooldown backoff.
     SignaledDown(anyhow::Error),
@@ -640,8 +643,8 @@ pub(crate) async fn dial_egress_candidate(
             Err(_) => {
                 if preface_written.load(Relaxed) {
                     // TCP established and full preface was written; missing ACK within per_try
-                    // is a soft/DC-level timeout so only (node, dc) cools down without node_down.
-                    Err(EgressAttemptErr::Dc(anyhow::anyhow!(
+                    // is DC-level by default, escalating to node-level on multi-DC/repeated timeouts.
+                    Err(EgressAttemptErr::DcAckTimeout(anyhow::anyhow!(
                         "egress_ack_timeout (dc {dc_abs})"
                     )))
                 } else {
@@ -722,6 +725,22 @@ pub(crate) fn finalize_egress_error(
     match err {
         EgressAttemptErr::Dc(e) => {
             claim.record_dc_failure(state.egress_cooldown, state.egress_cooldown_max);
+            e
+        }
+        EgressAttemptErr::DcAckTimeout(e) => {
+            let escalated = EgressHealth::record_ack_timeout_and_check_escalation(
+                &state.egress_health,
+                idx,
+                claim.dc,
+                Instant::now(),
+            );
+            if escalated {
+                EgressHealth::set_node_availability(&state.egress_health, idx, false);
+                claim.record_node_failure(state.egress_cooldown, state.egress_cooldown_max);
+                EgressHealth::notify_node_down(&state.egress_health, idx);
+            } else {
+                claim.record_dc_failure(state.egress_cooldown, state.egress_cooldown_max);
+            }
             e
         }
         EgressAttemptErr::Node(e) => {
