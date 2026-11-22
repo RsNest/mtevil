@@ -314,6 +314,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Phase 0.3 ME protocol spike")
     ap.add_argument("--dc", type=int, default=2, help="DC id from proxy-multi.conf (default: 2)")
     ap.add_argument("--ad-tag", default="", help="Optional 32-hex ad_tag (16 bytes) from @MTProxybot")
+    ap.add_argument("--remote-ip", default="192.0.2.1", help="Client remote_ip sent in RPC_PROXY_REQ (default: 192.0.2.1)")
+    ap.add_argument("--remote-port", type=int, default=12345, help="Client remote_port sent in RPC_PROXY_REQ (default: 12345)")
+    ap.add_argument("--public-ipv4", default="", help="Override local IPv4 used in ME KDF (for NAT/Docker bridge)")
     ap.add_argument("--timeout", type=float, default=10.0)
     args = ap.parse_args()
 
@@ -351,12 +354,13 @@ def main() -> int:
             raise ValueError(f"RPC_NONCE mismatch: op={srv_op:#x} schema={srv_schema} ksel={srv_ksel.hex()}")
         print(f"      RPC_NONCE OK (server_ts={srv_ts})")
 
-        # Derive AES-256-CBC keys
+        # Derive AES-256-CBC keys (clt_ip may be overridden via --public-ipv4 behind NAT/Docker bridge)
+        kdf_clt_ip = args.public_ipv4.strip() or clt_ip
         enc_key, enc_iv = derive_me_aes_key_iv(
-            srv_nonce, clt_nonce, clt_ts, srv_ip, clt_port, b"CLIENT", clt_ip, srv_port, proxy_secret
+            srv_nonce, clt_nonce, clt_ts, srv_ip, clt_port, b"CLIENT", kdf_clt_ip, srv_port, proxy_secret
         )
         dec_key, dec_iv = derive_me_aes_key_iv(
-            srv_nonce, clt_nonce, clt_ts, srv_ip, clt_port, b"SERVER", clt_ip, srv_port, proxy_secret
+            srv_nonce, clt_nonce, clt_ts, srv_ip, clt_port, b"SERVER", kdf_clt_ip, srv_port, proxy_secret
         )
         enc = _Aes256Cbc(enc_key, enc_iv)
         dec = _Aes256Cbc(dec_key, dec_iv)
@@ -391,9 +395,9 @@ def main() -> int:
 
         proxy_req = (
             struct.pack("<IIQ", RPC_PROXY_REQ, flags, conn_id)
-            + ipv4_mapped_16("192.0.2.1")
-            + struct.pack("<I", 12345)
-            + ipv4_mapped_16(clt_ip)
+            + ipv4_mapped_16(args.remote_ip)
+            + struct.pack("<I", args.remote_port)
+            + ipv4_mapped_16(kdf_clt_ip)
             + struct.pack("<I", clt_port)
             + extra
             + req_pq

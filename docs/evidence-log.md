@@ -1141,4 +1141,8 @@ wire-точность. Перебор высоких портов сгорает
   3. `RPC_NONCE` (`0x7acb87aa`, `seq=-2`) — **OK**.
   4. Деривация ключей `AES-256-CBC` (`CLIENT`/`SERVER`, `md5(s[1:])[:12] + sha1(s)`, `iv = md5(s[2:])`) + `RPC_HANDSHAKE` (`0x7682eef5`, `flags=0`, `seq=-1`, 4-байтовый padding `0x00000004`) — **OK**.
   5. `RPC_PROXY_REQ` (`0x36cef1ee`, `seq=0`) с `req_pq_multi` → получен валидный `RPC_PROXY_ANS` (`0x4403da0d`) с `resPQ#05162463` и совпавшим 16-байтовым `nonce` (`100` байт, `RTT = 16.7 мс`).
+- Дополнительные проверки спайка для ADR-002 (приватность и Docker bridge NAT):
+  - `remote_ip=0.0.0.0`, `remote_port=0` (host net): **PASS** (`resPQ#05162463`, `100 B`, `RTT = 22.1 мс`) — Telegram ME принимает нулевой клиентский IP (`me.send_client_ip = false`).
+  - Контейнер в Docker bridge **без** `--public-ipv4` (`clt_ip` приватный `172.17.x.x`): **FAIL** (`EOF` на `RPC_HANDSHAKE`, несовпадение KDF).
+  - Контейнер в Docker bridge **с** `--public-ipv4` (1:1 port-preserving NAT): **PASS** (`resPQ#05162463`, `100 B`, `RTT = 26.2 мс`).
 - Примечание: передача реального `ad_tag` и отображение спонсорского канала в клиенте Telegram требуют регистрации тестового прокси в `@MTProxybot` и в Фазе 0 не выполнялись.
