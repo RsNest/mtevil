@@ -18,6 +18,189 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(setup)
 
 
+class _Aes256Ctr:
+    """Minimal pure-Python AES-256-CTR (128-bit big-endian counter) for mock DC tests."""
+
+    _SBOX = (
+        0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76,
+        0xCA, 0x82, 0xC9, 0x7D, 0xFA, 0x59, 0x47, 0xF0, 0xAD, 0xD4, 0xA2, 0xAF, 0x9C, 0xA4, 0x72, 0xC0,
+        0xB7, 0xFD, 0x93, 0x26, 0x36, 0x3F, 0xF7, 0xCC, 0x34, 0xA5, 0xE5, 0xF1, 0x71, 0xD8, 0x31, 0x15,
+        0x04, 0xC7, 0x23, 0xC3, 0x18, 0x96, 0x05, 0x9A, 0x07, 0x12, 0x80, 0xE2, 0xEB, 0x27, 0xB2, 0x75,
+        0x09, 0x83, 0x2C, 0x1A, 0x1B, 0x6E, 0x5A, 0xA0, 0x52, 0x3B, 0xD6, 0xB3, 0x29, 0xE3, 0x2F, 0x84,
+        0x53, 0xD1, 0x00, 0xED, 0x20, 0xFC, 0xB1, 0x5B, 0x6A, 0xCB, 0xBE, 0x39, 0x4A, 0x4C, 0x58, 0xCF,
+        0xD0, 0xEF, 0xAA, 0xFB, 0x43, 0x4D, 0x33, 0x85, 0x45, 0xF9, 0x02, 0x7F, 0x50, 0x3C, 0x9F, 0xA8,
+        0x51, 0xA3, 0x40, 0x8F, 0x92, 0x9D, 0x38, 0xF5, 0xBC, 0xB6, 0xDA, 0x21, 0x10, 0xFF, 0xF3, 0xD2,
+        0xCD, 0x0C, 0x13, 0xEC, 0x5F, 0x97, 0x44, 0x17, 0xC4, 0xA7, 0x7E, 0x3D, 0x64, 0x5D, 0x19, 0x73,
+        0x60, 0x81, 0x4F, 0xDC, 0x22, 0x2A, 0x90, 0x88, 0x46, 0xEE, 0xB8, 0x14, 0xDE, 0x5E, 0x0B, 0xDB,
+        0xE0, 0x32, 0x3A, 0x0A, 0x49, 0x06, 0x24, 0x5C, 0xC2, 0xD3, 0xAC, 0x62, 0x91, 0x95, 0xE4, 0x79,
+        0xE7, 0xC8, 0x37, 0x6D, 0x8D, 0xD5, 0x4E, 0xA9, 0x6C, 0x56, 0xF4, 0xEA, 0x65, 0x7A, 0xAE, 0x08,
+        0xBA, 0x78, 0x25, 0x2E, 0x1C, 0xA6, 0xB4, 0xC6, 0xE8, 0xDD, 0x74, 0x1F, 0x4B, 0xBD, 0x8B, 0x8A,
+        0x70, 0x3E, 0xB5, 0x66, 0x48, 0x03, 0xF6, 0x0E, 0x61, 0x35, 0x57, 0xB9, 0x86, 0xC1, 0x1D, 0x9E,
+        0xE1, 0xF8, 0x98, 0x11, 0x69, 0xD9, 0x8E, 0x94, 0x9B, 0x1E, 0x87, 0xE9, 0xCE, 0x55, 0x28, 0xDF,
+        0x8C, 0xA1, 0x89, 0x0D, 0xBF, 0xE6, 0x42, 0x68, 0x41, 0x99, 0x2D, 0x0F, 0xB0, 0x54, 0xBB, 0x16,
+    )
+    _RCON = (0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80)
+
+    def __init__(self, key: bytes, iv: bytes) -> None:
+        assert len(key) == 32 and len(iv) == 16
+        w = [list(key[i : i + 4]) for i in range(0, 32, 4)]
+        for i in range(8, 60):
+            t = list(w[i - 1])
+            if i % 8 == 0:
+                t = [self._SBOX[b] for b in t[1:] + t[:1]]
+                t[0] ^= self._RCON[i // 8 - 1]
+            elif i % 8 == 4:
+                t = [self._SBOX[b] for b in t]
+            w.append([a ^ b for a, b in zip(w[i - 8], t)])
+        self._rkeys = [bytes(sum(w[r * 4 : (r + 1) * 4], [])) for r in range(15)]
+        self._ctr = int.from_bytes(iv, "big")
+        self._buf = b""
+
+    @staticmethod
+    def _xtime(a: int) -> int:
+        return ((a << 1) ^ 0x1B) & 0xFF if a & 0x80 else (a << 1) & 0xFF
+
+    def _encrypt_block(self, block: bytes) -> bytes:
+        s = [a ^ b for a, b in zip(block, self._rkeys[0])]
+        sb = self._SBOX
+        xt = self._xtime
+        for r in range(1, 15):
+            s = [sb[b] for b in s]
+            # ShiftRows (column-major)
+            s = [
+                s[0], s[5], s[10], s[15],
+                s[4], s[9], s[14], s[3],
+                s[8], s[13], s[2], s[7],
+                s[12], s[1], s[6], s[11],
+            ]
+            if r < 14:
+                for c in range(0, 16, 4):
+                    a0, a1, a2, a3 = s[c : c + 4]
+                    t = a0 ^ a1 ^ a2 ^ a3
+                    s[c] ^= t ^ xt(a0 ^ a1)
+                    s[c + 1] ^= t ^ xt(a1 ^ a2)
+                    s[c + 2] ^= t ^ xt(a2 ^ a3)
+                    s[c + 3] ^= t ^ xt(a3 ^ a0)
+            rk = self._rkeys[r]
+            s = [a ^ b for a, b in zip(s, rk)]
+        return bytes(s)
+
+    def xor(self, data: bytes) -> bytes:
+        out = bytearray(len(data))
+        pos = 0
+        while pos < len(data):
+            if not self._buf:
+                blk = self._ctr.to_bytes(16, "big")
+                self._ctr = (self._ctr + 1) & ((1 << 128) - 1)
+                self._buf = self._encrypt_block(blk)
+            take = min(len(data) - pos, len(self._buf))
+            for i in range(take):
+                out[pos + i] = data[pos + i] ^ self._buf[i]
+            self._buf = self._buf[take:]
+            pos += take
+        return bytes(out)
+
+
+class _MockTelegramDcServer:
+    """Distinguishable local MTProto DC mock that separates background probes from real client req_pq_multi."""
+
+    def __init__(self) -> None:
+        import threading
+
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(64)
+        self._sock.settimeout(0.2)
+        self.port = self._sock.getsockname()[1]
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self.probe_connections = 0
+        self.client_nonces: list[bytes] = []
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def _recv_exact(conn: socket.socket, n: int) -> bytes | None:
+        buf = bytearray()
+        while len(buf) < n:
+            try:
+                chunk = conn.recv(n - len(buf))
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def _handle(self, conn: socket.socket) -> None:
+        import struct
+        import time
+
+        try:
+            conn.settimeout(2.0)
+            hdr = self._recv_exact(conn, 64)
+            if hdr is None:
+                return
+            frame_enc = self._recv_exact(conn, 44)
+            if frame_enc is None:
+                # Background probe / check-egress closes right after 64-byte DC header.
+                with self._lock:
+                    self.probe_connections += 1
+                return
+            dec = _Aes256Ctr(hdr[8:40], hdr[40:56])
+            dec.xor(bytes(64))  # advance past 64-byte obfuscated2 init header
+            frame = dec.xor(frame_enc)
+            if (
+                len(frame) == 44
+                and frame[0:4] == struct.pack("<I", 40)
+                and frame[4:12] == b"\x00" * 8
+                and frame[24:28] == b"\xf1\x8e\x7e\xbe"
+            ):
+                nonce = frame[28:44]
+                with self._lock:
+                    self.client_nonces.append(nonce)
+                msg_id = ((int(time.time()) << 32) & ~3) + 1
+                resp = (
+                    struct.pack("<I", 40)
+                    + (b"\x00" * 8)
+                    + struct.pack("<Q", msg_id)
+                    + struct.pack("<I", 20)
+                    + b"\x63\x24\x16\x05"
+                    + nonce
+                )
+                rev = hdr[8:56][::-1]
+                enc = _Aes256Ctr(rev[:32], rev[32:48])
+                conn.sendall(enc.xor(resp))
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _serve(self) -> None:
+        import threading
+
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def close(self) -> None:
+        self._stop.set()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=2.0)
+
+
 class SetupValidationTests(unittest.TestCase):
     def test_ipv4_and_ipv6_literals(self) -> None:
         self.assertEqual(setup.validate_host("192.0.2.10"), "192.0.2.10")
@@ -106,6 +289,23 @@ class SetupValidationTests(unittest.TestCase):
         )
         self.assertNotIn("build:", yaml_text)
         self.assertIn("image:", yaml_text)
+        self.assertIn("- state:/var/lib/mtevil:ro", yaml_text)
+        self.assertIn("- replay:/var/lib/mtevil-replay", yaml_text)
+        self.assertIn("\n  init:\n", yaml_text)
+        self.assertIn("soft: 4096", yaml_text)
+        self.assertIn("hard: 4096", yaml_text)
+        self.assertEqual(setup.compute_compose_nofile(256), 4096)
+        self.assertEqual(setup.compute_compose_nofile(2048), 4608)
+        self.assertEqual(setup.compute_compose_nofile(4096), 8704)
+        yaml_high = setup.render_compose(
+            repo_root,
+            repo_root / "deploy" / "wizard",
+            "direct",
+            include_build=False,
+            max_connections=4096,
+        )
+        self.assertIn("soft: 8704", yaml_high)
+        self.assertIn("hard: 8704", yaml_high)
 
     def test_is_port_available_and_restore_backup(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -423,6 +623,8 @@ class SetupValidationTests(unittest.TestCase):
         edge_port = self._free_port()
         old_tok = "11111111111111111111111111111111"
         new_tok = "22222222222222222222222222222222"
+        dc_eg1 = _MockTelegramDcServer()
+        dc_eg2 = _MockTelegramDcServer()
 
         with (
             tempfile.TemporaryDirectory() as td_eg1,
@@ -436,7 +638,7 @@ class SetupValidationTests(unittest.TestCase):
             p_eg2 = f"mtevil-eg2-{eg2_port}"
             p_edge = f"mtevil-edge-{edge_port}"
             try:
-                # 1. Start real Egress 1 with old_tok (--network-host implies advanced mode; role 3 = egress).
+                # 1. Start real Egress 1 with old_tok and point its DCs to distinguishable mock DC 1.
                 stdin_eg1 = f"3\n127.0.0.1\n{eg1_port}\ny\nn\n{old_tok}\n"
                 with (
                     mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d_eg1), "--project", p_eg1, "--image", image, "--no-build", "--network-host"]),
@@ -445,8 +647,14 @@ class SetupValidationTests(unittest.TestCase):
                     mock.patch.object(sys, "stderr", io.StringIO()),
                 ):
                     self.assertEqual(setup.main(), 0)
+                eg1_cfg = setup.json.loads((d_eg1 / "config.json").read_text(encoding="utf-8"))
+                eg1_cfg["dc"] = [f"{i}=127.0.0.1:{dc_eg1.port}" for i in range(1, 6)]
+                (d_eg1 / "config.json").write_text(setup.json.dumps(eg1_cfg, indent=2) + "\n", encoding="utf-8")
+                eg1_base = setup.compose_cmd(d_eg1, p_eg1)
+                setup.run(eg1_base + ["up", "-d", "--force-recreate", setup.compose_service(eg1_base)])
+                setup.wait_healthy(eg1_base)
 
-                # 2. Start real Egress 2 with new_tok (--network-host implies advanced mode; role 3 = egress).
+                # 2. Start real Egress 2 with new_tok and point its DCs to distinguishable mock DC 2.
                 stdin_eg2 = f"3\n127.0.0.1\n{eg2_port}\ny\nn\n{new_tok}\n"
                 with (
                     mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d_eg2), "--project", p_eg2, "--image", image, "--no-build", "--network-host"]),
@@ -455,8 +663,14 @@ class SetupValidationTests(unittest.TestCase):
                     mock.patch.object(sys, "stderr", io.StringIO()),
                 ):
                     self.assertEqual(setup.main(), 0)
+                eg2_cfg = setup.json.loads((d_eg2 / "config.json").read_text(encoding="utf-8"))
+                eg2_cfg["dc"] = [f"{i}=127.0.0.1:{dc_eg2.port}" for i in range(1, 6)]
+                (d_eg2 / "config.json").write_text(setup.json.dumps(eg2_cfg, indent=2) + "\n", encoding="utf-8")
+                eg2_base = setup.compose_cmd(d_eg2, p_eg2)
+                setup.run(eg2_base + ["up", "-d", "--force-recreate", setup.compose_service(eg2_base)])
+                setup.wait_healthy(eg2_base)
 
-                # 3. Start real Edge connected to Egress 1 with old_tok (role 2 = edge).
+                # 3. Start real Edge connected to Egress 1 with old_tok (background probes remain enabled).
                 stdin_edge1 = f"2\n127.0.0.1\n{edge_port}\n\n\n\n127.0.0.1:{eg1_port}\nn\n1\ny\n{old_tok}\n"
                 with (
                     mock.patch.object(sys, "argv", ["setup.py", "--dir", str(d_edge), "--project", p_edge, "--image", image, "--no-build", "--network-host"]),
@@ -468,13 +682,6 @@ class SetupValidationTests(unittest.TestCase):
 
                 edge_base = setup.compose_cmd(d_edge, p_edge)
                 self.assertEqual(setup.read_volume_secret(edge_base, "/var/lib/mtevil/egress-token"), old_tok)
-
-                # Prepare the prototype vector proxy-secret BEFORE rotation so that after
-                # setup.main() rolls back and exits, we do NOT restart Edge in the test!
-                vec_secret_hex = "000102030405060708090a0b0c0d0e0f"
-                setup.write_volume_secret_stdin(edge_base, "/var/lib/mtevil/proxy-secret", vec_secret_hex)
-                setup.run(edge_base + ["up", "-d", "--force-recreate", setup.compose_service(edge_base)])
-                setup.wait_healthy(edge_base)
 
                 # 4. Reconfigure Edge to rotate to Egress 2 + new_tok:
                 #    check-egress passes against real Egress 2, new_tok is written to real Docker volume,
@@ -502,60 +709,51 @@ class SetupValidationTests(unittest.TestCase):
                     self.assertEqual(setup.main(), 1)
                 self.assertEqual(wait_calls, 2)
 
-                # 5. Without restarting Edge in the test, connect a client immediately through
-                #    edge's listening port and verify the session appears on Egress 1!
+                # 5. Without restarting Edge in the test, send a real end-to-end client request
+                #    (FakeTLS + obfuscated2 + MTProto req_pq_multi) through Edge's listening port
+                #    and verify the client-specific payload reached Egress 1's DC and NOT Egress 2's DC!
                 self.assertEqual(setup.read_volume_secret(edge_base, "/var/lib/mtevil/egress-token"), old_tok)
+                with dc_eg1._lock:
+                    dc_eg1.client_nonces.clear()
+                with dc_eg2._lock:
+                    dc_eg2.client_nonces.clear()
 
-                eg1_base = setup.compose_cmd(d_eg1, p_eg1)
-                eg2_base = setup.compose_cmd(d_eg2, p_eg2)
-                eg1_before = setup.run(eg1_base + ["logs", setup.compose_service(eg1_base)]).stdout.count('"event":"session_open"')
-                eg2_before = setup.run(eg2_base + ["logs", setup.compose_service(eg2_base)]).stdout.count('"event":"session_open"')
-
-                repo_root = Path(__file__).resolve().parent.parent
-                init_frame = bytes.fromhex((repo_root / "tests" / "vectors" / "prototype" / "client-init.hex").read_text(encoding="utf-8").strip())
-                ch_template = bytearray(bytes.fromhex((repo_root / "tests" / "vectors" / "prototype" / "synthetic-ch.hex").read_text(encoding="utf-8").strip()))
-                import hashlib
-                import hmac
-                import struct
-                import time
-                ch_template[11:43] = b"\x00" * 32
-                digest = hmac.new(bytes.fromhex(vec_secret_hex), bytes(ch_template), hashlib.sha256).digest()
-                ts = struct.pack("<I", int(time.time()) & 0xFFFFFFFF)
-                ch_template[11:43] = digest[:28] + bytes(a ^ b for a, b in zip(digest[28:32], ts))
-                client_payload = bytes(ch_template) + b"\x17\x03\x03\x00\x40" + init_frame
-
-                # Connect to edge's listening port from inside the shared container network namespace
-                # and complete FakeTLS ClientHello -> ServerHello -> obfuscated2 inner frame -> Egress 1!
-                ch_b64 = __import__("base64").b64encode(bytes(ch_template)).decode("ascii")
-                init_b64 = __import__("base64").b64encode(b"\x17\x03\x03\x00\x40" + init_frame).decode("ascii")
-                bash_client = (
-                    f"exec 3<>/dev/tcp/127.0.0.1/{edge_port} && "
-                    f"printf '%s' '{ch_b64}' | base64 -d >&3 && "
-                    "dd bs=1 count=1 <&3 >/dev/null 2>&1 && "
-                    f"printf '%s' '{init_b64}' | base64 -d >&3 && "
-                    "sleep 0.5 && exec 3>&-"
-                )
-                client_proc = setup.run(
+                probe_proc = setup.run(
                     edge_base
                     + [
                         "exec",
                         "-T",
                         setup.compose_service(edge_base),
-                        "/bin/bash",
-                        "-c",
-                        bash_client,
+                        "/usr/local/bin/mtevil",
+                        "probe-telegram",
+                        "--config",
+                        "/etc/mtevil/config.json",
+                        "--address",
+                        f"127.0.0.1:{edge_port}",
+                        "--dc",
+                        "2",
                     ],
                     check=False,
                 )
-                self.assertEqual(client_proc.returncode, 0, client_proc.stdout + client_proc.stderr)
+                self.assertEqual(probe_proc.returncode, 0, probe_proc.stdout + probe_proc.stderr)
 
-                edge_logs = setup.run(edge_base + ["logs", setup.compose_service(edge_base)]).stdout
-                eg1_after = setup.run(eg1_base + ["logs", setup.compose_service(eg1_base)]).stdout.count('"event":"session_open"')
-                eg2_after = setup.run(eg2_base + ["logs", setup.compose_service(eg2_base)]).stdout.count('"event":"session_open"')
-                self.assertIn('"event":"authenticated"', edge_logs)
-                self.assertGreater(eg1_after, eg1_before, f"Egress 1 did not receive forwarded session; edge logs:\n{edge_logs}")
-                self.assertEqual(eg2_after, eg2_before, "Egress 2 must not receive session after rollback to Egress 1")
+                with dc_eg1._lock:
+                    eg1_nonces = list(dc_eg1.client_nonces)
+                with dc_eg2._lock:
+                    eg2_nonces = list(dc_eg2.client_nonces)
+                self.assertEqual(
+                    len(eg1_nonces),
+                    1,
+                    f"Expected client req_pq_multi payload to traverse Egress 1 (got eg1={len(eg1_nonces)}, eg2={len(eg2_nonces)})",
+                )
+                self.assertEqual(
+                    len(eg2_nonces),
+                    0,
+                    f"Client req_pq_multi payload must NOT traverse Egress 2 after rollback (got eg2={len(eg2_nonces)})",
+                )
             finally:
+                dc_eg1.close()
+                dc_eg2.close()
                 for d_path, proj in ((d_edge, p_edge), (d_eg2, p_eg2), (d_eg1, p_eg1)):
                     if (d_path / "compose.yaml").exists():
                         subprocess.run(setup.compose_cmd(d_path, proj) + ["down", "-v"], capture_output=True)
@@ -1874,6 +2072,350 @@ class SetupValidationTests(unittest.TestCase):
             ):
                 self.assertEqual(setup.main(), 0)
             self.assertIn("Пользователь 'phone' удалён", out_del.getvalue())
+
+    def test_state_ro_user_and_sni_use_init_service_and_replay_stats_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            repo_root = Path(__file__).resolve().parent.parent
+            compose_text = setup.render_compose(repo_root, d, "direct", include_build=False)
+            (d / "compose.yaml").write_text(compose_text, encoding="utf-8")
+            (d / ".env").write_text(
+                "MTEVIL_PROJECT=mtevil-ro\nMTEVIL_IMAGE=mtevil:v0.2.0-rc.1\nMTEVIL_BIND=0.0.0.0\nMTEVIL_PORT=443\nMTEVIL_PUBLIC_HOST=203.0.113.77\n",
+                encoding="utf-8",
+            )
+            (d / "config.json").write_text(
+                '{"role":"direct","sni":"example.com","cover":"example.com:443","users_file":"/var/lib/mtevil/users.json","replay_file":"/var/lib/mtevil-replay/replay.bin"}\n',
+                encoding="utf-8",
+            )
+            calls: list[list[str]] = []
+
+            def fake_run(argv, **_kw):
+                calls.append(list(argv))
+                cmd = " ".join(argv)
+                if "ps -q" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, stdout="cid999\n", stderr="")
+                if "user-add" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+                if "mtevil link" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, stdout="alice: https://t.me/proxy?server=203.0.113.77&port=443&secret=eeaa\n", stderr="")
+                if "user-del" in cmd:
+                    return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "user", "add", "alice", "--dir", str(d)]),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "run", side_effect=fake_run),
+            ):
+                self.assertEqual(setup.main(), 0)
+            add_cmds = [" ".join(c) for c in calls if "user-add" in " ".join(c)]
+            self.assertEqual(len(add_cmds), 1)
+            self.assertIn(" run --rm -T --no-deps --entrypoint /usr/local/bin/mtevil init user-add ", add_cmds[0])
+
+            calls.clear()
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "user", "del", "alice", "--dir", str(d)]),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "run", side_effect=fake_run),
+            ):
+                self.assertEqual(setup.main(), 0)
+            del_cmds = [" ".join(c) for c in calls if "user-del" in " ".join(c)]
+            self.assertEqual(len(del_cmds), 1)
+            self.assertIn(" run --rm -T --no-deps --entrypoint /usr/local/bin/mtevil init user-del ", del_cmds[0])
+
+            # Verify v0.1.5 -> v0.2.0 migration across:
+            # 1) standard compose, 2) customized compose (+ .pre-v0.2 backup preservation on retry),
+            # 3) host-network edge compose, 4) corrupted compose (fails before touching files or stopping container).
+            d_std = d / "mig_std"
+            d_std.mkdir()
+            std_compose = (
+                "name: ${MTEVIL_PROJECT:-mtevil-direct}\n\n"
+                "services:\n"
+                "  mtevil:\n"
+                "    image: ${MTEVIL_IMAGE:-ghcr.io/rsnest/mtevil:v0.1.5}\n"
+                "    ports:\n"
+                '      - "0.0.0.0:443:24443/tcp"\n'
+                "    volumes:\n"
+                "      - ./config.json:/etc/mtevil/config.json:ro\n"
+                "      - state:/var/lib/mtevil\n\n"
+                "volumes:\n"
+                "  state:\n"
+            )
+            std_cfg = setup.json.dumps({"role": "direct", "listen": "0.0.0.0:24443", "replay_file": "/var/lib/mtevil/replay.bin"}) + "\n"
+            (d_std / "compose.yaml").write_text(std_compose, encoding="utf-8")
+            (d_std / "config.json").write_text(std_cfg, encoding="utf-8")
+            self.assertTrue(setup.migrate_compose_and_replay_on_update(d_std, d_std / "config.json", d_std / "compose.yaml"))
+            self.assertEqual((d_std / "compose.yaml.pre-v0.2").read_text(encoding="utf-8"), std_compose)
+            self.assertEqual((d_std / "config.json.pre-v0.2").read_text(encoding="utf-8"), std_cfg)
+            std_after = (d_std / "compose.yaml").read_text(encoding="utf-8")
+            self.assertIn("state:/var/lib/mtevil:ro", std_after)
+            self.assertIn("replay:/var/lib/mtevil-replay", std_after)
+            self.assertIn("\n  init:\n", std_after)
+            self.assertIn("\n  replay:\n", std_after)
+            self.assertEqual(setup.json.loads((d_std / "config.json").read_text(encoding="utf-8"))["replay_file"], "/var/lib/mtevil-replay/replay.bin")
+            self.assertFalse(setup.migrate_compose_and_replay_on_update(d_std, d_std / "config.json", d_std / "compose.yaml"))
+
+            # 2) Custom compose: ports, environment, extra volumes, ulimits, labels, cpus/mem, extra service preserved!
+            d_cust = d / "mig_custom"
+            d_cust.mkdir()
+            cust_compose = (
+                "name: ${MTEVIL_PROJECT:-mtevil-custom}\n\n"
+                "services:\n"
+                "  mtevil:\n"
+                "    image: ${MTEVIL_IMAGE:-ghcr.io/rsnest/mtevil:v0.1.5}\n"
+                "    ports:\n"
+                '      - "127.0.0.1:8443:24443/tcp"\n'
+                "    environment:\n"
+                "      - CUSTOM_ENV=keep_me\n"
+                "    labels:\n"
+                '      com.example.role: "custom-proxy"\n'
+                "    cpus: \"1.50\"\n"
+                "    mem_limit: 512m\n"
+                "    ulimits:\n"
+                "      nofile:\n"
+                "        soft: 16384\n"
+                "        hard: 16384\n"
+                "    volumes:\n"
+                "      - ./config.json:/etc/mtevil/config.json:ro\n"
+                "      - state:/var/lib/mtevil\n"
+                "      - ./extra-certs:/etc/extra:ro\n"
+                "  sidecar:\n"
+                "    image: alpine:3.20\n"
+                '    command: ["sleep", "infinity"]\n\n'
+                "volumes:\n"
+                "  state:\n"
+                "  custom_vol:\n"
+            )
+            (d_cust / "compose.yaml").write_text(cust_compose, encoding="utf-8")
+            (d_cust / "config.json").write_text(std_cfg, encoding="utf-8")
+            self.assertTrue(setup.migrate_compose_and_replay_on_update(d_cust, d_cust / "config.json", d_cust / "compose.yaml"))
+            cust_after = (d_cust / "compose.yaml").read_text(encoding="utf-8")
+            for must_keep in (
+                '127.0.0.1:8443:24443/tcp',
+                'CUSTOM_ENV=keep_me',
+                'com.example.role: "custom-proxy"',
+                'cpus: "1.50"',
+                'mem_limit: 512m',
+                'soft: 16384',
+                './extra-certs:/etc/extra:ro',
+                '  sidecar:',
+                '  custom_vol:',
+                'state:/var/lib/mtevil:ro',
+                'replay:/var/lib/mtevil-replay',
+                '  init:',
+                '  replay:',
+            ):
+                self.assertIn(must_keep, cust_after)
+            # Retry after modifying compose.yaml must NOT overwrite existing .pre-v0.2 backup!
+            (d_cust / "compose.yaml").write_text(cust_compose.replace("CUSTOM_ENV=keep_me", "CUSTOM_ENV=retry"), encoding="utf-8")
+            self.assertTrue(setup.migrate_compose_and_replay_on_update(d_cust, d_cust / "config.json", d_cust / "compose.yaml"))
+            self.assertIn("CUSTOM_ENV=keep_me", (d_cust / "compose.yaml.pre-v0.2").read_text(encoding="utf-8"))
+
+            # 3) Host-network edge compose
+            d_edge = d / "mig_edge"
+            d_edge.mkdir()
+            edge_compose = (
+                "services:\n"
+                "  mtevil:\n"
+                "    image: ${MTEVIL_IMAGE}\n"
+                "    network_mode: host\n"
+                "    volumes:\n"
+                "      - ./config.json:/etc/mtevil/config.json:ro\n"
+                "      - state:/var/lib/mtevil\n"
+                "    healthcheck:\n"
+                '      test: [CMD, /usr/local/bin/mtevil, health, --address, "127.0.0.1:443"]\n'
+                "volumes:\n"
+                "  state:\n"
+            )
+            (d_edge / "compose.yaml").write_text(edge_compose, encoding="utf-8")
+            (d_edge / "config.json").write_text(
+                setup.json.dumps({"role": "edge", "listen": "0.0.0.0:443", "replay_file": "/var/lib/mtevil/replay.bin"}) + "\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(setup.migrate_compose_and_replay_on_update(d_edge, d_edge / "config.json", d_edge / "compose.yaml"))
+            edge_after = (d_edge / "compose.yaml").read_text(encoding="utf-8")
+            self.assertIn("network_mode: host", edge_after)
+            self.assertIn('"127.0.0.1:443"', edge_after)
+            self.assertIn("state:/var/lib/mtevil:ro", edge_after)
+            self.assertIn("replay:/var/lib/mtevil-replay", edge_after)
+
+            # 4) Corrupted compose (tab indentation / missing volumes section) -> MigrationError without touching files!
+            for bad_name, bad_yaml in (
+                ("bad_tab", "services:\n\tmtevil:\n\t\tvolumes:\n\t\t\t- state:/var/lib/mtevil\nvolumes:\n  state:\n"),
+                ("bad_no_vols", "services:\n  mtevil:\n    volumes:\n      - state:/var/lib/mtevil\n"),
+            ):
+                d_bad = d / bad_name
+                d_bad.mkdir()
+                (d_bad / "compose.yaml").write_text(bad_yaml, encoding="utf-8")
+                (d_bad / "config.json").write_text(std_cfg, encoding="utf-8")
+                with self.assertRaises(setup.MigrationError):
+                    setup.migrate_compose_and_replay_on_update(d_bad, d_bad / "config.json", d_bad / "compose.yaml")
+                self.assertEqual((d_bad / "compose.yaml").read_text(encoding="utf-8"), bad_yaml)
+                self.assertEqual((d_bad / "config.json").read_text(encoding="utf-8"), std_cfg)
+                self.assertFalse((d_bad / "compose.yaml.pre-v0.2").exists())
+
+    def test_release_publish_flags_and_updater_channel_selection(self):
+        # 1. Verify compute_release_publish_flags across prereleases, newer stable, older stable, and draft handling.
+        existing = [
+            {"tagName": "v0.1.5", "isDraft": False, "isPrerelease": False},
+        ]
+        # Prereleases (RC, alpha, beta) MUST publish as prerelease and explicitly NOT Latest.
+        self.assertEqual(
+            setup.compute_release_publish_flags("v0.2.0-rc.1", existing),
+            ("--prerelease=true", "--latest=false"),
+        )
+        self.assertEqual(
+            setup.compute_release_publish_flags("v0.1.0-alpha.6", existing),
+            ("--prerelease=true", "--latest=false"),
+        )
+        self.assertEqual(
+            setup.compute_release_publish_flags("v0.2.0-alpha.1", existing),
+            ("--prerelease=true", "--latest=false"),
+        )
+        self.assertEqual(
+            setup.compute_release_publish_flags("v0.2.0-beta.1", existing),
+            ("--prerelease=true", "--latest=false"),
+        )
+        # Newer stable v0.2.0 becomes Latest (even when v0.2.0-rc.1 is already published).
+        existing_with_rc = existing + [
+            {"tagName": "v0.2.0-rc.1", "isDraft": False, "isPrerelease": True},
+        ]
+        self.assertEqual(
+            setup.compute_release_publish_flags("v0.2.0", existing_with_rc),
+            ("--prerelease=false", "--latest"),
+        )
+        # Newer patch stable v0.1.6 becomes Latest despite v0.2.0-rc.1 prerelease.
+        self.assertEqual(
+            setup.compute_release_publish_flags("v0.1.6", existing_with_rc),
+            ("--prerelease=false", "--latest"),
+        )
+        # Older stable tag v0.1.4 MUST NOT steal Latest from v0.1.5.
+        self.assertEqual(
+            setup.compute_release_publish_flags("v0.1.4", existing_with_rc),
+            ("--prerelease=false", "--latest=false"),
+        )
+
+        # 2. Verify default updater (stable channel) vs opt-in prerelease channel against the same release set.
+        def gh_rel(tag: str, *, prerelease: bool = False, draft: bool = False) -> dict:
+            return {
+                "tag_name": tag,
+                "draft": draft,
+                "prerelease": prerelease,
+                "assets": [
+                    {"name": "install.sh", "state": "uploaded", "browser_download_url": f"https://example.invalid/{tag}/install.sh"},
+                    {"name": "setup.py", "state": "uploaded", "browser_download_url": f"https://example.invalid/{tag}/setup.py"},
+                ],
+            }
+
+        rels_with_pre = [
+            gh_rel("v0.1.4", prerelease=False),
+            gh_rel("v0.1.5", prerelease=False),
+            gh_rel("v0.2.0-alpha.1", prerelease=True),
+            gh_rel("v0.2.0-beta.1", prerelease=True),
+            gh_rel("v0.2.0-rc.1", prerelease=True),
+        ]
+        self.assertEqual(setup.select_latest_release(rels_with_pre, allow_prerelease=False), "v0.1.5")
+        self.assertEqual(setup.select_latest_release(rels_with_pre, allow_prerelease=True), "v0.2.0-rc.1")
+
+        rels_with_v020 = rels_with_pre + [gh_rel("v0.2.0", prerelease=False)]
+        self.assertEqual(setup.select_latest_release(rels_with_v020, allow_prerelease=False), "v0.2.0")
+        self.assertEqual(setup.select_latest_release(rels_with_v020, allow_prerelease=True), "v0.2.0")
+
+        # 3. Verify .github/workflows/release.yml wires compute_release_publish_flags and passes both flags
+        #    for both new releases and existing drafts, and test offline with a mocked `gh` CLI when bash is available.
+        repo_root = Path(__file__).resolve().parent.parent
+        wf_text = (repo_root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        self.assertIn("setup.compute_release_publish_flags(tag, published)", wf_text)
+        self.assertNotIn("--prerelease=false ${latest_flag}", wf_text)
+        self.assertNotIn("branches:\n      - main", wf_text)
+        self.assertIn('tags:\n      - "v*"', wf_text)
+        self.assertIn('docs/releases/${tag}.md', wf_text)
+        self.assertEqual(wf_text.count('gh release edit "${tag}" --draft=false "${prerelease_flag}" "${latest_flag}"'), 2)
+
+        bash_bin = "/bin/bash" if Path("/bin/bash").is_file() else None
+        if bash_bin is not None:
+            with tempfile.TemporaryDirectory() as td:
+                d = Path(td)
+                fake_bin = d / "bin"
+                fake_bin.mkdir()
+                gh_log = d / "gh_calls.log"
+                gh_state = d / "gh_state.json"
+                fake_gh = fake_bin / "gh"
+                fake_gh.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import json, os, sys\n"
+                    "args = sys.argv[1:]\n"
+                    "with open(os.environ['GH_LOG'], 'a', encoding='utf-8') as f:\n"
+                    "    f.write(' '.join(args) + '\\n')\n"
+                    "st = json.loads(open(os.environ['GH_STATE'], encoding='utf-8').read())\n"
+                    "if args[:2] == ['release', 'list']:\n"
+                    "    print(json.dumps(st['published']))\n"
+                    "    raise SystemExit(0)\n"
+                    "if args[:2] == ['release', 'view']:\n"
+                    "    if not st.get('exists'):\n"
+                    "        raise SystemExit(1)\n"
+                    "    if 'isDraft' in args:\n"
+                    "        print('true' if st.get('is_draft') else 'false')\n"
+                    "    elif 'assets' in args:\n"
+                    "        print('')\n"
+                    "    raise SystemExit(0)\n"
+                    "raise SystemExit(0)\n",
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                setup.os.chmod(fake_gh, 0o755)
+
+                publish_script = (
+                    'set -euo pipefail\n'
+                    'tag="$1"\n'
+                    'read -r prerelease_flag latest_flag < <(python3 - "${tag}" <<\'PY\'\n'
+                    'import json, subprocess, sys\n'
+                    'sys.path.insert(0, "deploy")\n'
+                    'import setup\n'
+                    'tag = sys.argv[1]\n'
+                    'raw = subprocess.check_output(["gh", "release", "list", "--limit", "100", "--json", "tagName,isDraft,isPrerelease"], text=True)\n'
+                    'pre_flag, lat_flag = setup.compute_release_publish_flags(tag, json.loads(raw))\n'
+                    'print(pre_flag, lat_flag)\n'
+                    'PY\n'
+                    ')\n'
+                    'if gh release view "${tag}" >/dev/null 2>&1; then\n'
+                    '  is_draft="$(gh release view "${tag}" --json isDraft -q .isDraft)"\n'
+                    '  if [ "${is_draft}" = "true" ]; then\n'
+                    '    gh release edit "${tag}" --draft=false "${prerelease_flag}" "${latest_flag}"\n'
+                    '  fi\n'
+                    'else\n'
+                    '  gh release create "${tag}" --draft\n'
+                    '  gh release edit "${tag}" --draft=false "${prerelease_flag}" "${latest_flag}"\n'
+                    'fi\n'
+                )
+                script_path = d / "pub.sh"
+                script_path.write_text(publish_script, encoding="utf-8", newline="\n")
+
+                cases = [
+                    ("v0.2.0-rc.1", False, False, "--prerelease=true --latest=false"),
+                    ("v0.2.0-rc.1", True, True, "--prerelease=true --latest=false"),
+                    ("v0.1.0-alpha.6", False, False, "--prerelease=true --latest=false"),
+                    ("v0.2.0-beta.1", False, False, "--prerelease=true --latest=false"),
+                    ("v0.2.0", False, False, "--prerelease=false --latest"),
+                    ("v0.1.4", False, False, "--prerelease=false --latest=false"),
+                ]
+                for tag_name, exists, is_draft, expected_flags in cases:
+                    gh_log.write_text("", encoding="utf-8")
+                    gh_state.write_text(
+                        setup.json.dumps({"published": existing, "exists": exists, "is_draft": is_draft}),
+                        encoding="utf-8",
+                    )
+                    env = dict(setup.os.environ)
+                    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+                    env["GH_LOG"] = str(gh_log)
+                    env["GH_STATE"] = str(gh_state)
+                    p = subprocess.run([bash_bin, str(script_path), tag_name], cwd=str(repo_root), env=env, capture_output=True, text=True)
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    edit_lines = [l for l in gh_log.read_text(encoding="utf-8").splitlines() if l.startswith("release edit ")]
+                    self.assertEqual(len(edit_lines), 1, f"{tag_name} ({exists=}, {is_draft=}): {edit_lines}")
+                    self.assertEqual(edit_lines[0], f"release edit {tag_name} --draft=false {expected_flags}")
 
 
 if __name__ == "__main__":

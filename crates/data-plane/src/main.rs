@@ -1,5 +1,9 @@
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
+use mtevil_egress::compute_egress_cooldown;
+#[cfg(test)]
+use mtevil_egress::{apply_cooldown_jitter_ms, compute_egress_cooldown_unclamped_ms};
+use mtevil_guard::replay::{self, Decision, ReplayCache};
 use mtevil_proto::{self as wire, AesCtr};
 use sha2::{Digest, Sha256};
 use std::{
@@ -16,13 +20,27 @@ use tokio::{
     time::{timeout, Instant},
 };
 use zeroize::Zeroizing;
-mod replay;
-use replay::{Decision, ReplayCache};
 
 mod config;
 use config::{Config, EgressStrategy, NamedSecret, Role};
 mod telemetry;
 use serde_json::json;
+
+mod alerts;
+mod connect;
+mod cover;
+mod egress_health;
+mod egress_server;
+mod relay;
+mod serve;
+
+use alerts::*;
+use connect::*;
+use cover::*;
+use egress_health::*;
+use egress_server::*;
+use relay::*;
+use serve::*;
 
 const BUILD_VERSION: &str = match option_env!("MTEVIL_BUILD_VERSION") {
     Some(v) => v,
@@ -34,7 +52,7 @@ const BUILD_VERSION: &str = match option_env!("MTEVIL_BUILD_VERSION") {
 struct Args {
     #[command(subcommand)]
     command: Option<Action>,
-    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk"])]
+    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms","egress_probe_interval_secs","egress_probe_degraded_interval_secs","egress_hedge_ms","egress_accept_legacy","egress_use_mtv3","egress_allow_from","egress_max_failed_per_ip","dc_media_override","dc_probe_interval_secs","cover_dns_ttl_secs","diagnostics","metrics_listen"])]
     config: Option<PathBuf>,
     #[arg(long)]
     check_config: bool,
@@ -89,6 +107,48 @@ struct Args {
     /// Bulk-phase TCP MSS applied to the client socket after handshake.
     #[arg(long)]
     client_mss_bulk: Option<u16>,
+    /// Base cooldown in milliseconds for an egress upstream or DC after a failure.
+    #[arg(long)]
+    egress_cooldown_base_ms: Option<u64>,
+    /// Maximum exponential backoff cooldown in milliseconds for an egress upstream or DC.
+    #[arg(long)]
+    egress_cooldown_max_ms: Option<u64>,
+    /// Background egress probe interval in seconds when all egress nodes are healthy.
+    #[arg(long)]
+    egress_probe_interval_secs: Option<u64>,
+    /// Background egress probe interval in seconds while at least one egress node is unavailable.
+    #[arg(long)]
+    egress_probe_degraded_interval_secs: Option<u64>,
+    /// Hedged connect delay in milliseconds for ordered egress strategy (0 = disabled).
+    #[arg(long)]
+    egress_hedge_ms: Option<u64>,
+    /// Whether egress accepts legacy MTV2 prefaces alongside MTV3.
+    #[arg(long)]
+    egress_accept_legacy: Option<bool>,
+    /// Whether edge uses MTV3 when dialing egress.
+    #[arg(long)]
+    egress_use_mtv3: Option<bool>,
+    /// Optional CIDR source allowlist on egress.
+    #[arg(long)]
+    egress_allow_from: Vec<String>,
+    /// Maximum failed authentication attempts per source IP within a 60s sliding window on egress.
+    #[arg(long)]
+    egress_max_failed_per_ip: Option<usize>,
+    /// Configurable media/alternate DC candidate overrides (`ID=IP:PORT`).
+    #[arg(long)]
+    dc_media_override: Vec<String>,
+    /// Background DC self-check interval in seconds on direct/egress (0 = disabled).
+    #[arg(long)]
+    dc_probe_interval_secs: Option<u64>,
+    /// Background cover DNS cache TTL / refresh interval in seconds.
+    #[arg(long)]
+    cover_dns_ttl_secs: Option<u64>,
+    /// Enable per-chunk timeline diagnostic marks on relay paths.
+    #[arg(long)]
+    diagnostics: bool,
+    /// Optional localhost-only Prometheus `/metrics` HTTP listener (disabled by default).
+    #[arg(long)]
+    metrics_listen: Option<SocketAddr>,
 }
 
 #[derive(Subcommand)]
@@ -197,231 +257,48 @@ impl Args {
             client_mss: self.client_mss,
             client_mss_bulk: self.client_mss_bulk,
             alert_webhook_url: None,
+            egress_cooldown_base_ms: self
+                .egress_cooldown_base_ms
+                .unwrap_or_else(config::default_egress_cooldown_base_ms),
+            egress_cooldown_max_ms: self
+                .egress_cooldown_max_ms
+                .unwrap_or_else(config::default_egress_cooldown_max_ms),
+            egress_probe_interval_secs: self
+                .egress_probe_interval_secs
+                .unwrap_or_else(config::default_egress_probe_interval_secs),
+            egress_probe_degraded_interval_secs: self
+                .egress_probe_degraded_interval_secs
+                .unwrap_or_else(config::default_egress_probe_degraded_interval_secs),
+            egress_hedge_ms: self
+                .egress_hedge_ms
+                .unwrap_or_else(config::default_egress_hedge_ms),
+            egress_accept_legacy: self
+                .egress_accept_legacy
+                .unwrap_or_else(config::default_egress_accept_legacy),
+            egress_use_mtv3: self
+                .egress_use_mtv3
+                .unwrap_or_else(config::default_egress_use_mtv3),
+            egress_allow_from: self.egress_allow_from,
+            egress_max_failed_per_ip: self
+                .egress_max_failed_per_ip
+                .unwrap_or_else(config::default_egress_max_failed_per_ip),
+            egress_nonce_cache_capacity: None,
+            dc_media_override: if self.dc_media_override.is_empty() {
+                config::default_dc_media_override()
+            } else {
+                self.dc_media_override
+            },
+            dc_probe_interval_secs: self
+                .dc_probe_interval_secs
+                .unwrap_or_else(config::default_dc_probe_interval_secs),
+            cover_dns_ttl_secs: self
+                .cover_dns_ttl_secs
+                .unwrap_or_else(config::default_cover_dns_ttl_secs),
+            diagnostics: self.diagnostics,
+            metrics_listen: self.metrics_listen,
         };
         config.validate()?;
         Ok(config)
-    }
-}
-
-#[derive(Default, Clone, Copy)]
-struct CooldownSlot {
-    until: Option<Instant>,
-    probing: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-enum EdgeRouteState {
-    #[default]
-    PrimaryOk,
-    FailoverBackup(usize),
-    Degraded {
-        healthy: usize,
-        total: usize,
-    },
-    AllDown,
-}
-
-impl EdgeRouteState {
-    fn as_str(&self) -> &'static str {
-        match self {
-            EdgeRouteState::PrimaryOk => "primary_ok",
-            EdgeRouteState::FailoverBackup(_) => "failover_backup",
-            EdgeRouteState::Degraded { .. } => "degraded",
-            EdgeRouteState::AllDown => "all_down",
-        }
-    }
-}
-
-#[derive(Default)]
-struct EgressHealth {
-    nodes: Vec<CooldownSlot>,
-    node_failed: Vec<bool>,
-    dc_slots: HashMap<(usize, i16), CooldownSlot>,
-    route_state: EdgeRouteState,
-}
-
-struct EdgeAlertEvent {
-    prev: EdgeRouteState,
-    next: EdgeRouteState,
-    primary: SocketAddr,
-    active: Option<SocketAddr>,
-    reason: String,
-    strategy: EgressStrategy,
-}
-
-impl EgressHealth {
-    fn new(node_count: usize) -> Self {
-        Self {
-            nodes: vec![CooldownSlot::default(); node_count],
-            node_failed: vec![false; node_count],
-            dc_slots: HashMap::new(),
-            route_state: EdgeRouteState::PrimaryOk,
-        }
-    }
-
-    fn set_node_availability(
-        health: &std::sync::Mutex<EgressHealth>,
-        idx: usize,
-        available: bool,
-    ) -> (usize, usize) {
-        let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
-        while h.node_failed.len() <= idx {
-            h.node_failed.push(false);
-        }
-        h.node_failed[idx] = !available;
-        let total = h.node_failed.len();
-        let healthy = h.node_failed.iter().filter(|failed| !**failed).count();
-        (healthy, total)
-    }
-
-    fn transition_route_state(
-        health: &std::sync::Mutex<EgressHealth>,
-        next: EdgeRouteState,
-        upstreams: &[SocketAddr],
-        reason: String,
-        strategy: EgressStrategy,
-        active_override: Option<SocketAddr>,
-    ) -> Option<EdgeAlertEvent> {
-        let primary = *upstreams.first()?;
-        let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
-        if h.route_state == next {
-            return None;
-        }
-        let prev = h.route_state;
-        h.route_state = next;
-        let active = active_override.or(match next {
-            EdgeRouteState::PrimaryOk => Some(primary),
-            EdgeRouteState::FailoverBackup(idx) => upstreams.get(idx).copied(),
-            EdgeRouteState::Degraded { .. } => None,
-            EdgeRouteState::AllDown => None,
-        });
-        Some(EdgeAlertEvent {
-            prev,
-            next,
-            primary,
-            active,
-            reason,
-            strategy,
-        })
-    }
-}
-
-struct EgressAttemptClaim<'a> {
-    health: &'a std::sync::Mutex<EgressHealth>,
-    idx: usize,
-    dc: i16,
-    node_probe: bool,
-    dc_probe: bool,
-    completed: bool,
-}
-
-impl<'a> Drop for EgressAttemptClaim<'a> {
-    fn drop(&mut self) {
-        if !self.completed && (self.node_probe || self.dc_probe) {
-            if let Ok(mut h) = self.health.lock() {
-                if self.node_probe {
-                    if let Some(slot) = h.nodes.get_mut(self.idx) {
-                        slot.probing = false;
-                    }
-                }
-                if self.dc_probe {
-                    if let Some(slot) = h.dc_slots.get_mut(&(self.idx, self.dc)) {
-                        slot.probing = false;
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl EgressHealth {
-    fn try_claim<'a>(
-        health: &'a std::sync::Mutex<EgressHealth>,
-        idx: usize,
-        dc: i16,
-        now: Instant,
-    ) -> Option<EgressAttemptClaim<'a>> {
-        let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
-        while h.nodes.len() <= idx {
-            h.nodes.push(CooldownSlot::default());
-        }
-        let mut node_probe = false;
-        let node_slot = &mut h.nodes[idx];
-        if let Some(until) = node_slot.until {
-            if now < until || node_slot.probing {
-                return None;
-            }
-            node_slot.probing = true;
-            node_probe = true;
-        }
-        let mut dc_probe = false;
-        if let Some(dc_slot) = h.dc_slots.get_mut(&(idx, dc)) {
-            if let Some(until) = dc_slot.until {
-                if now < until || dc_slot.probing {
-                    if node_probe {
-                        h.nodes[idx].probing = false;
-                    }
-                    return None;
-                }
-                dc_slot.probing = true;
-                dc_probe = true;
-            }
-        }
-        Some(EgressAttemptClaim {
-            health,
-            idx,
-            dc,
-            node_probe,
-            dc_probe,
-            completed: false,
-        })
-    }
-}
-
-impl<'a> EgressAttemptClaim<'a> {
-    fn record_success(mut self) {
-        self.completed = true;
-        let mut h = self.health.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = h.nodes.get_mut(self.idx) {
-            slot.until = None;
-            slot.probing = false;
-        }
-        if let Some(slot) = h.dc_slots.get_mut(&(self.idx, self.dc)) {
-            slot.until = None;
-            slot.probing = false;
-        }
-    }
-
-    fn record_node_failure(mut self, cooldown: Duration) {
-        self.completed = true;
-        let mut h = self.health.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = h.nodes.get_mut(self.idx) {
-            slot.until = Some(Instant::now() + cooldown);
-            slot.probing = false;
-        }
-        if self.dc_probe {
-            if let Some(slot) = h.dc_slots.get_mut(&(self.idx, self.dc)) {
-                slot.probing = false;
-            }
-        }
-    }
-
-    fn record_dc_failure(mut self, cooldown: Duration) {
-        self.completed = true;
-        let mut h = self.health.lock().unwrap_or_else(|e| e.into_inner());
-        if self.node_probe {
-            if let Some(slot) = h.nodes.get_mut(self.idx) {
-                slot.until = None;
-                slot.probing = false;
-            }
-        }
-        h.dc_slots.insert(
-            (self.idx, self.dc),
-            CooldownSlot {
-                until: Some(Instant::now() + cooldown),
-                probing: false,
-            },
-        );
     }
 }
 
@@ -429,17 +306,24 @@ struct State {
     secrets: std::sync::RwLock<Arc<Vec<NamedSecret>>>,
     sni: String,
     allowed_snis: std::sync::RwLock<Arc<String>>,
-    cover: String,
+    cover_resolver: Arc<CoverResolver>,
     enable_dd: bool,
     proxy_protocol: bool,
     cover_permits: Semaphore,
     dcs: HashMap<i16, SocketAddr>,
+    dc_media_overrides: HashMap<i16, Vec<SocketAddr>>,
     egress_upstreams: Vec<SocketAddr>,
     egress_strategy: EgressStrategy,
     egress_token: [u8; 16],
     egress_rr: std::sync::atomic::AtomicUsize,
     egress_health: std::sync::Mutex<EgressHealth>,
+    egress_probe_notify: Arc<tokio::sync::Notify>,
     egress_cooldown: Duration,
+    egress_cooldown_max: Duration,
+    egress_probe_interval: Duration,
+    egress_probe_degraded_interval: Duration,
+    egress_hedge_ms: u64,
+    egress_use_mtv3: bool,
     client_hello: Duration,
     handshake: Duration,
     idle: Duration,
@@ -451,189 +335,7 @@ struct State {
     counters: Arc<telemetry::Counters>,
     alert_webhook_url: Option<String>,
     alerts_file: Option<PathBuf>,
-}
-
-fn format_edge_alert_message(ev: &EdgeAlertEvent) -> String {
-    if ev.reason == "background_egress_probe_dc2" {
-        return match ev.next {
-            EdgeRouteState::PrimaryOk => "Фоновая проверка DC2: доступность egress восстановилась.".into(),
-            EdgeRouteState::FailoverBackup(_) => format!(
-                "Фоновая проверка DC2: основной egress ({}) недоступен, резервный отвечает.",
-                ev.primary
-            ),
-            EdgeRouteState::Degraded { healthy, total } => {
-                format!("Фоновая проверка DC2: доступно egress {healthy} из {total}.")
-            }
-            EdgeRouteState::AllDown => "Фоновая проверка DC2: все egress недоступны.".into(),
-        };
-    }
-    match ev.next {
-        EdgeRouteState::FailoverBackup(_) => format!(
-            "Основной egress ({}) недоступен — трафик переключён на резервный egress ({}).",
-            ev.primary,
-            ev.active.map(|a| a.to_string()).unwrap_or_else(|| "unknown".into())
-        ),
-        EdgeRouteState::Degraded { healthy, total } => format!(
-            "Часть узлов egress недоступна в режиме round-robin: доступно {} из {} (последний успешный: {}). Причина: {}",
-            healthy,
-            total,
-            ev.active.map(|a| a.to_string()).unwrap_or_else(|| "нет".into()),
-            ev.reason
-        ),
-        EdgeRouteState::AllDown => format!(
-            "Все узлы egress недоступны (основной: {}). Причина: {}",
-            ev.primary, ev.reason
-        ),
-        EdgeRouteState::PrimaryOk => match ev.strategy {
-            EgressStrategy::Ordered => format!(
-                "Основной egress ({}) восстановился — трафик вернулся на основной выход.",
-                ev.primary
-            ),
-            EgressStrategy::RoundRobin => {
-                "Все узлы egress снова доступны в режиме round-robin.".to_string()
-            }
-        },
-    }
-}
-
-fn send_http_alert_webhook(url: &str, payload: &str) -> std::io::Result<()> {
-    use std::{io::{BufRead, BufReader, Write}, net::ToSocketAddrs};
-    // Minimal stdlib-only HTTP POST for http://host[:port]/path webhooks (no extra crate deps).
-    let rest = url.strip_prefix("http://").ok_or_else(|| std::io::Error::other("expected an HTTP webhook URL"))?;
-    let (host_port, path) = match rest.find('/') {
-        Some(pos) => (&rest[..pos], &rest[pos..]),
-        None => (rest, "/"),
-    };
-    let addr = if host_port.contains(':') {
-        host_port.to_string()
-    } else {
-        format!("{host_port}:80")
-    };
-    let body = payload.as_bytes();
-    let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let endpoint = addr.to_socket_addrs()?.next()
-        .ok_or_else(|| std::io::Error::other("webhook address did not resolve"))?;
-    let limit = Duration::from_secs(3);
-    let mut stream = std::net::TcpStream::connect_timeout(&endpoint, limit)?;
-    stream.set_write_timeout(Some(limit))?;
-    stream.set_read_timeout(Some(limit))?;
-    stream.write_all(req.as_bytes())?;
-    stream.write_all(body)?;
-    let mut status = String::new();
-    use std::io::Read;
-    BufReader::new(stream).take(256).read_line(&mut status)?;
-    match status.split_whitespace().nth(1).and_then(|code| code.parse::<u16>().ok()) {
-        Some(200..=299) => Ok(()),
-        _ => Err(std::io::Error::other("webhook did not return HTTP 2xx")),
-    }
-}
-
-fn emit_edge_route_alert(state: &State, ev: EdgeAlertEvent) {
-    let ts_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let message = format_edge_alert_message(&ev);
-    let payload = json!({
-        "ts_unix_ms": ts_unix_ms,
-        "event": "edge_route_alert",
-        "prev_state": ev.prev.as_str(),
-        "state": ev.next.as_str(),
-        "primary": ev.primary.to_string(),
-        "active": ev.active.map(|a| a.to_string()),
-        "reason": ev.reason,
-        "message": message,
-    });
-    telemetry::event("edge_route_alert", 0, payload.clone());
-
-    if let Some(alerts_path) = &state.alerts_file {
-        if let Some(parent) = alerts_path.parent() {
-            if parent.exists() {
-                let line = format!("{payload}\n");
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(alerts_path)
-                {
-                    use std::io::Write;
-                    let _ = f.write_all(line.as_bytes());
-                }
-            }
-        }
-    }
-
-    if let Some(url) = state.alert_webhook_url.clone() {
-        let body = payload.to_string();
-        std::thread::spawn(move || {
-            for delay in [0, 2, 8] {
-                std::thread::sleep(Duration::from_secs(delay));
-                if send_http_alert_webhook(&url, &body).is_ok() {
-                    return;
-                }
-            }
-            telemetry::event("edge_alert_webhook_failed", 0, json!({"attempts": 3}));
-        });
-    }
-}
-
-async fn monitor_edge_egress(state: Arc<State>, period: Duration) {
-    let mut interval = tokio::time::interval(period);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut previous = None;
-    let mut confirmed = None;
-    loop {
-        interval.tick().await;
-        let mut probes = tokio::task::JoinSet::new();
-        for (idx, &address) in state.egress_upstreams.iter().enumerate() {
-            let token = state.egress_token;
-            probes.spawn(async move {
-                let limit = Duration::from_secs(4);
-                let available = timeout(limit, probe_egress_endpoint(address, 0, &token, limit))
-                    .await
-                    .is_ok_and(|probe| probe.dc_reachable);
-                (idx, available)
-            });
-        }
-        let mut available = vec![false; state.egress_upstreams.len()];
-        while let Some(result) = probes.join_next().await {
-            if let Ok((idx, ok)) = result {
-                available[idx] = ok;
-            }
-        }
-        let route = match available.iter().position(|ok| *ok) {
-            None => EdgeRouteState::AllDown,
-            Some(0) if state.egress_strategy == EgressStrategy::Ordered => EdgeRouteState::PrimaryOk,
-            Some(idx) if state.egress_strategy == EgressStrategy::Ordered => EdgeRouteState::FailoverBackup(idx),
-            Some(_) => {
-                let healthy = available.iter().filter(|ok| **ok).count();
-                let total = available.len();
-                if healthy == total {
-                    EdgeRouteState::PrimaryOk
-                } else {
-                    EdgeRouteState::Degraded { healthy, total }
-                }
-            }
-        };
-        // A single transient probe should not trigger an alert. Keep the live
-        // per-DC cooldowns independent from this DC2 observation.
-        if previous == Some(route) && confirmed != Some(route) {
-            confirmed = Some(route);
-            if let Some(event) = EgressHealth::transition_route_state(
-                &state.egress_health,
-                route,
-                &state.egress_upstreams,
-                "background_egress_probe_dc2".to_string(),
-                state.egress_strategy,
-                None,
-            ) {
-                emit_edge_route_alert(&state, event);
-            }
-        }
-        previous = Some(route);
-    }
+    diagnostics: bool,
 }
 
 impl State {
@@ -687,10 +389,7 @@ impl State {
         let cur_snis = self.current_allowed_snis();
         if *cur_snis != next_snis {
             let count = next_snis.split(',').filter(|s| !s.is_empty()).count();
-            *self
-                .allowed_snis
-                .write()
-                .unwrap_or_else(|e| e.into_inner()) = Arc::new(next_snis);
+            *self.allowed_snis.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(next_snis);
             telemetry::event("allowed_sni_reloaded", 0, json!({"sni_count": count}));
         }
     }
@@ -715,105 +414,16 @@ fn spawn_users_reloader(
     })
 }
 
-const RUNTIME_STATS_DEFAULT_PATH: &str = "/var/lib/mtevil/runtime-stats.json";
+const RUNTIME_STATS_DEFAULT_PATH: &str = "/var/lib/mtevil-replay/runtime-stats.json";
+const RUNTIME_STATS_LEGACY_PATH: &str = "/var/lib/mtevil/runtime-stats.json";
 
-// Query TCP_INFO on Linux to measure TCP retransmissions on mtevil's own sockets only,
-// excluding unrelated VPS traffic even when running with network_mode: host.
-#[cfg(unix)]
-#[allow(unsafe_code)]
-fn sample_fd_retrans(fd: Option<std::os::fd::RawFd>, prev: &mut u32, acc: &std::sync::atomic::AtomicU64) {
-    #[cfg(target_os = "linux")]
-    {
-        let Some(raw_fd) = fd else {
-            return;
-        };
-        #[repr(C)]
-        #[derive(Default)]
-        struct LinuxTcpInfoPrefix {
-            tcpi_state: u8,
-            tcpi_ca_state: u8,
-            tcpi_retransmits: u8,
-            tcpi_probes: u8,
-            tcpi_backoff: u8,
-            tcpi_options: u8,
-            tcpi_snd_rcv_wscale: u8,
-            tcpi_delivery_rate_app_limited: u8,
-            tcpi_rto: u32,
-            tcpi_ato: u32,
-            tcpi_snd_mss: u32,
-            tcpi_rcv_mss: u32,
-            tcpi_unacked: u32,
-            tcpi_sacked: u32,
-            tcpi_lost: u32,
-            tcpi_retrans: u32,
-            tcpi_fackets: u32,
-            tcpi_last_data_sent: u32,
-            tcpi_last_ack_sent: u32,
-            tcpi_last_data_recv: u32,
-            tcpi_last_ack_recv: u32,
-            tcpi_pmtu: u32,
-            tcpi_rcv_ssthresh: u32,
-            tcpi_rtt: u32,
-            tcpi_rttvar: u32,
-            tcpi_snd_ssthresh: u32,
-            tcpi_snd_cwnd: u32,
-            tcpi_advmss: u32,
-            tcpi_reordering: u32,
-            tcpi_rcv_rtt: u32,
-            tcpi_rcv_space: u32,
-            tcpi_total_retrans: u32,
-        }
-        extern "C" {
-            fn getsockopt(
-                sockfd: i32,
-                level: i32,
-                optname: i32,
-                optval: *mut std::ffi::c_void,
-                optlen: *mut u32,
-            ) -> i32;
-        }
-        const IPPROTO_TCP: i32 = 6;
-        const TCP_INFO: i32 = 11;
-        let mut info = LinuxTcpInfoPrefix::default();
-        let mut len = std::mem::size_of::<LinuxTcpInfoPrefix>() as u32;
-        let rc = unsafe {
-            getsockopt(
-                raw_fd,
-                IPPROTO_TCP,
-                TCP_INFO,
-                (&mut info as *mut LinuxTcpInfoPrefix).cast::<std::ffi::c_void>(),
-                &mut len,
-            )
-        };
-        if rc == 0 && (len as usize) >= std::mem::size_of::<LinuxTcpInfoPrefix>() {
-            let cur = info.tcpi_total_retrans;
-            if cur >= *prev {
-                let delta = cur - *prev;
-                if delta > 0 {
-                    acc.fetch_add(u64::from(delta), std::sync::atomic::Ordering::Relaxed);
-                }
-                *prev = cur;
-            }
-        }
+fn default_runtime_stats_path() -> PathBuf {
+    let preferred = PathBuf::from(RUNTIME_STATS_DEFAULT_PATH);
+    if preferred.parent().is_some_and(|p| p.is_dir()) {
+        preferred
+    } else {
+        PathBuf::from(RUNTIME_STATS_LEGACY_PATH)
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (fd, prev, acc);
-    }
-}
-
-#[cfg(not(unix))]
-fn sample_fd_retrans(_fd: Option<i32>, _prev: &mut u32, _acc: &std::sync::atomic::AtomicU64) {}
-
-#[cfg(unix)]
-fn stream_raw_fd(stream: &TcpStream) -> Option<std::os::fd::RawFd> {
-    use std::os::fd::{AsFd, AsRawFd};
-    Some(stream.as_fd().as_raw_fd())
-}
-
-#[cfg(not(unix))]
-fn stream_raw_fd(_stream: &TcpStream) -> Option<i32> {
-    None
 }
 
 fn write_runtime_stats_atomic(
@@ -1126,7 +736,14 @@ async fn main() -> Result<()> {
                 let mut results = Vec::with_capacity(config.egress_upstreams.len());
                 let mut all_ok = true;
                 for addr in &config.egress_upstreams {
-                    let probe = probe_egress_endpoint(*addr, dc, &token, per_try).await;
+                    let probe = probe_egress_endpoint_proto(
+                        *addr,
+                        dc,
+                        &token,
+                        per_try,
+                        config.egress_use_mtv3,
+                    )
+                    .await;
                     if !probe.dc_reachable {
                         all_ok = false;
                     }
@@ -1145,10 +762,20 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             Action::Stats { stats_file } => {
-                let text = std::fs::read_to_string(&stats_file)
-                    .with_context(|| format!("reading runtime stats file {}", stats_file.display()))?;
-                let val: serde_json::Value = serde_json::from_str(&text)
-                    .with_context(|| format!("parsing runtime stats file {}", stats_file.display()))?;
+                let effective = if !stats_file.exists()
+                    && stats_file == std::path::Path::new(RUNTIME_STATS_DEFAULT_PATH)
+                    && std::path::Path::new(RUNTIME_STATS_LEGACY_PATH).exists()
+                {
+                    PathBuf::from(RUNTIME_STATS_LEGACY_PATH)
+                } else {
+                    stats_file
+                };
+                let text = std::fs::read_to_string(&effective).with_context(|| {
+                    format!("reading runtime stats file {}", effective.display())
+                })?;
+                let val: serde_json::Value = serde_json::from_str(&text).with_context(|| {
+                    format!("parsing runtime stats file {}", effective.display())
+                })?;
                 println!("{}", serde_json::to_string_pretty(&val)?);
                 return Ok(());
             }
@@ -1195,6 +822,7 @@ async fn main() -> Result<()> {
     let check_config = args.check_config;
     let config = args.runtime_config()?;
     let dcs = config.datacenters().unwrap_or_default();
+    let dc_media_overrides = config.dc_media_overrides().unwrap_or_default();
     let egress_token = config.egress_token()?;
     let stats_path = std::env::var_os("MTEVIL_STATS_FILE")
         .map(PathBuf::from)
@@ -1202,26 +830,58 @@ async fn main() -> Result<()> {
             config
                 .replay_file
                 .as_ref()
-                .or(config.secret_file.as_ref())
+                .and_then(|p| p.parent().map(|dir| dir.join("runtime-stats.json")))
+        })
+        .or_else(|| {
+            let preferred = PathBuf::from(RUNTIME_STATS_DEFAULT_PATH);
+            preferred
+                .parent()
+                .is_some_and(|p| p.is_dir())
+                .then_some(preferred)
+        })
+        .or_else(|| {
+            config
+                .secret_file
+                .as_ref()
                 .or(config.egress_token_file.as_ref())
                 .and_then(|p| p.parent().map(|dir| dir.join("runtime-stats.json")))
         })
-        .unwrap_or_else(|| PathBuf::from(RUNTIME_STATS_DEFAULT_PATH));
+        .unwrap_or_else(default_runtime_stats_path);
     if config.role == Role::Egress {
         if check_config {
             println!("configuration valid");
             return Ok(());
         }
+        let rlimit_nofile = detect_rlimit_nofile();
+        let effective_max =
+            compute_effective_max_connections(config.max_connections, rlimit_nofile)?;
+        let allow_from = config.parsed_egress_allow_from()?;
         let listener = bind_listener(config.listen, None)?;
+        let local_addr = listener.local_addr()?;
+        if !config::is_loopback_or_private_ip(local_addr.ip()) {
+            telemetry::event(
+                "egress_public_listen_warning",
+                0,
+                json!({
+                    "listen": local_addr.to_string(),
+                    "allowlist_empty": allow_from.is_empty(),
+                    "warning": "egress listener is bound to a non-private/non-loopback address"
+                }),
+            );
+        }
         telemetry::event(
             "startup",
             0,
             json!({
                 "version":BUILD_VERSION,
                 "role":"egress",
-                "listen":listener.local_addr()?.to_string(),
+                "listen":local_addr.to_string(),
                 "max_connections":config.max_connections,
+                "effective_max_connections":effective_max,
+                "rlimit_nofile":rlimit_nofile,
                 "authenticated":config.egress_token_file.is_some(),
+                "accept_legacy_mtv2":config.egress_accept_legacy,
+                "allow_from_cidrs":allow_from.len(),
                 "test_only":true
             }),
         );
@@ -1235,18 +895,55 @@ async fn main() -> Result<()> {
             Duration::from_millis(500),
             stats_stop_rx,
         );
+        let (metrics_stop_tx, metrics_stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let metrics_task = match config.metrics_listen {
+            Some(addr) => {
+                let m_listener = TcpListener::bind(addr)
+                    .await
+                    .with_context(|| format!("binding metrics listener on {addr}"))?;
+                Some(spawn_metrics_server(
+                    m_listener,
+                    counters.clone(),
+                    None,
+                    rlimit_nofile,
+                    metrics_stop_rx,
+                ))
+            }
+            None => None,
+        };
+        let security = EgressSecurityConfig {
+            accept_legacy: config.egress_accept_legacy,
+            allow_from,
+            max_failed_per_ip: config.egress_max_failed_per_ip,
+            failed_window: Duration::from_secs(60),
+            max_unauth_handshakes: (effective_max / 4).clamp(4, 128),
+            nonce_cache_capacity: config
+                .egress_nonce_cache_capacity
+                .unwrap_or_else(|| config::default_egress_nonce_cache_capacity(effective_max)),
+            dc_media_overrides: dc_media_overrides.clone(),
+        };
+        let dcs_arc = Arc::new(dcs);
+        let dc_monitor = (config.dc_probe_interval_secs > 0).then(|| {
+            tokio::spawn(monitor_dc_reachability(
+                dcs_arc.clone(),
+                Arc::new(dc_media_overrides),
+                counters.clone(),
+                Duration::from_secs(config.dc_probe_interval_secs),
+            ))
+        });
         #[cfg(unix)]
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let res = serve_egress(
+        let res = serve_egress_with_security(
             listener,
-            Arc::new(dcs),
+            dcs_arc,
             egress_token,
-            config.max_connections,
+            effective_max,
             Duration::from_secs(config.handshake_timeout_secs),
             Duration::from_secs(config.idle_timeout_secs),
             Duration::from_secs(config.drain_timeout_secs),
             counters,
+            security,
             async {
                 #[cfg(unix)]
                 tokio::select! {
@@ -1258,6 +955,14 @@ async fn main() -> Result<()> {
             },
         )
         .await;
+        if let Some(task) = dc_monitor {
+            task.abort();
+            let _ = task.await;
+        }
+        let _ = metrics_stop_tx.send(());
+        if let Some(task) = metrics_task {
+            let _ = task.await;
+        }
         let _ = stats_stop_tx.send(());
         let _ = stats_task.await;
         return res;
@@ -1267,12 +972,24 @@ async fn main() -> Result<()> {
         println!("configuration valid");
         return Ok(());
     }
+    let rlimit_nofile = detect_rlimit_nofile();
+    let effective_max = compute_effective_max_connections(config.max_connections, rlimit_nofile)?;
     let replay_ttl = Duration::from_secs(300);
-    let replay = match &config.replay_file {
-        Some(path) => ReplayCache::load_or_new(path.clone(), 65536, replay_ttl)?,
-        None => ReplayCache::new(65536, replay_ttl),
+    let (replay, replay_load_status) = match &config.replay_file {
+        Some(path) => ReplayCache::load_with_status(path.clone(), 65536, replay_ttl),
+        None => (
+            ReplayCache::new(65536, replay_ttl),
+            replay::ReplayLoadStatus::Disabled,
+        ),
     };
-    let max_cover_connections = (config.max_connections / 4).max(1);
+    if replay_load_status == replay::ReplayLoadStatus::CorruptedReinitialized {
+        telemetry::event(
+            "replay_table_reinitialized",
+            0,
+            json!({"reason": "corrupted_or_unreadable_replay_file"}),
+        );
+    }
+    let max_cover_connections = (effective_max / 4).max(1);
     let user_count = secrets.len();
     let persistent_replay = config.replay_file.is_some();
     let reload_config = (config.users_file.is_some() || config.allowed_sni_file().is_some())
@@ -1284,21 +1001,36 @@ async fn main() -> Result<()> {
     let alerts_file = std::env::var_os("MTEVIL_ALERTS_FILE")
         .map(PathBuf::from)
         .or_else(|| stats_path.parent().map(|dir| dir.join("edge-alerts.jsonl")));
+    let cover_resolver = Arc::new(CoverResolver::new(
+        config.cover,
+        Duration::from_secs(config.cover_dns_ttl_secs),
+    ));
+    let handshake_dur = Duration::from_secs(config.handshake_timeout_secs);
+    let _ = cover_resolver.refresh_once(handshake_dur, &counters).await;
     let state = Arc::new(State {
         secrets: std::sync::RwLock::new(Arc::new(secrets)),
         sni: config.sni,
         allowed_snis: std::sync::RwLock::new(Arc::new(allowed_snis)),
-        cover: config.cover,
+        cover_resolver: cover_resolver.clone(),
         enable_dd: config.enable_dd,
         proxy_protocol: config.proxy_protocol,
         cover_permits: Semaphore::new(max_cover_connections),
         dcs,
+        dc_media_overrides,
         egress_upstreams: config.egress_upstreams,
         egress_strategy: config.egress_strategy,
         egress_token,
         egress_rr: std::sync::atomic::AtomicUsize::new(0),
         egress_health: std::sync::Mutex::new(EgressHealth::new(egress_count)),
-        egress_cooldown: Duration::from_secs(15),
+        egress_probe_notify: Arc::new(tokio::sync::Notify::new()),
+        egress_cooldown: Duration::from_millis(config.egress_cooldown_base_ms),
+        egress_cooldown_max: Duration::from_millis(config.egress_cooldown_max_ms),
+        egress_probe_interval: Duration::from_secs(config.egress_probe_interval_secs),
+        egress_probe_degraded_interval: Duration::from_secs(
+            config.egress_probe_degraded_interval_secs,
+        ),
+        egress_hedge_ms: config.egress_hedge_ms,
+        egress_use_mtv3: config.egress_use_mtv3,
         client_hello: Duration::from_secs(config.client_hello_timeout_secs),
         handshake: Duration::from_secs(config.handshake_timeout_secs),
         idle: Duration::from_secs(config.idle_timeout_secs),
@@ -1313,6 +1045,7 @@ async fn main() -> Result<()> {
         counters,
         alert_webhook_url: config.alert_webhook_url,
         alerts_file,
+        diagnostics: config.diagnostics,
     });
     let role_str: &'static str = if state.egress_upstreams.is_empty() {
         "direct"
@@ -1327,6 +1060,22 @@ async fn main() -> Result<()> {
         Duration::from_millis(500),
         stats_stop_rx,
     );
+    let (metrics_stop_tx, metrics_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let metrics_task = match config.metrics_listen {
+        Some(addr) => {
+            let m_listener = TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("binding metrics listener on {addr}"))?;
+            Some(spawn_metrics_server(
+                m_listener,
+                state.counters.clone(),
+                Some(state.clone()),
+                rlimit_nofile,
+                metrics_stop_rx,
+            ))
+        }
+        None => None,
+    };
     let listener = bind_listener(config.listen, config.client_mss)?;
     telemetry::event(
         "startup",
@@ -1336,9 +1085,13 @@ async fn main() -> Result<()> {
             "role": role_str,
             "listen":listener.local_addr()?.to_string(),
             "max_connections":config.max_connections,
+            "effective_max_connections":effective_max,
+            "rlimit_nofile":rlimit_nofile,
             "max_cover_connections":max_cover_connections,
             "users":user_count,
             "persistent_replay":persistent_replay,
+            "replay_load_status":replay_load_status.as_str(),
+            "replay_loaded_entries":replay_load_status.loaded_entries(),
             "fake_tls_cert_bytes":config.fake_tls_cert_bytes,
             "fake_tls_cert_jitter":config.fake_tls_cert_jitter,
             "flight_shaping":state.flight_shaping,
@@ -1371,29 +1124,61 @@ async fn main() -> Result<()> {
                     .await
                     {
                         Ok(Ok(())) => state.replay.lock().await.mark_flushed(gen),
-                        Ok(Err(err)) => telemetry::event(
-                            "replay_flush_failed",
-                            0,
-                            json!({"error": format!("{err:#}")}),
-                        ),
-                        Err(err) => telemetry::event(
-                            "replay_flush_failed",
-                            0,
-                            json!({"error": format!("{err:#}")}),
-                        ),
+                        Ok(Err(err)) => {
+                            state
+                                .counters
+                                .replay_flush_failed
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            telemetry::event(
+                                "replay_flush_failed",
+                                0,
+                                json!({"error": format!("{err:#}")}),
+                            );
+                        }
+                        Err(err) => {
+                            state
+                                .counters
+                                .replay_flush_failed
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            telemetry::event(
+                                "replay_flush_failed",
+                                0,
+                                json!({"error": format!("{err:#}")}),
+                            );
+                        }
                     }
                 }
             }
         })
     });
-    let egress_monitor = (!state.egress_upstreams.is_empty())
-        .then(|| tokio::spawn(monitor_edge_egress(state.clone(), Duration::from_secs(30))));
+    let egress_monitor = (!state.egress_upstreams.is_empty()).then(|| {
+        let interval = state.egress_probe_interval;
+        tokio::spawn(monitor_edge_egress(state.clone(), interval))
+    });
+    let dc_monitor =
+        (state.egress_upstreams.is_empty() && config.dc_probe_interval_secs > 0).then(|| {
+            tokio::spawn(monitor_dc_reachability(
+                Arc::new(state.dcs.clone()),
+                Arc::new(state.dc_media_overrides.clone()),
+                state.counters.clone(),
+                Duration::from_secs(config.dc_probe_interval_secs),
+            ))
+        });
+    let (cover_stop_tx, cover_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let cover_dns_task = (!cover_resolver.is_static_ip()).then(|| {
+        spawn_cover_resolver(
+            cover_resolver,
+            state.counters.clone(),
+            handshake_dur,
+            cover_stop_rx,
+        )
+    });
     let (users_stop_tx, users_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let users_task = reload_config
         .map(|cfg| spawn_users_reloader(state.clone(), cfg, Duration::from_secs(1), users_stop_rx));
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let res = serve(listener, state.clone(), config.max_connections, async {
+    let res = serve(listener, state.clone(), effective_max, async {
         #[cfg(unix)]
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {},
@@ -1405,8 +1190,20 @@ async fn main() -> Result<()> {
     .await;
     let _ = stats_stop_tx.send(());
     let _ = stats_task.await;
+    let _ = metrics_stop_tx.send(());
+    if let Some(task) = metrics_task {
+        let _ = task.await;
+    }
     if let Some(task) = egress_monitor {
         task.abort();
+        let _ = task.await;
+    }
+    if let Some(task) = dc_monitor {
+        task.abort();
+        let _ = task.await;
+    }
+    let _ = cover_stop_tx.send(());
+    if let Some(task) = cover_dns_task {
         let _ = task.await;
     }
     let _ = users_stop_tx.send(());
@@ -1418,1906 +1215,17 @@ async fn main() -> Result<()> {
         let _ = task.await;
     }
     if let Err(err) = state.replay.lock().await.flush_snapshot() {
-        telemetry::event("replay_flush_failed", 0, json!({"error": format!("{err:#}")}));
+        state
+            .counters
+            .replay_flush_failed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        telemetry::event(
+            "replay_flush_failed",
+            0,
+            json!({"error": format!("{err:#}")}),
+        );
     }
     res
-}
-
-async fn serve(
-    listener: TcpListener,
-    state: Arc<State>,
-    max_connections: usize,
-    shutdown: impl std::future::Future<Output = ()>,
-) -> Result<()> {
-    let permits = Arc::new(Semaphore::new(max_connections));
-    let mut tasks = tokio::task::JoinSet::new();
-    tokio::pin!(shutdown);
-    loop {
-        // Reap completed tasks before admitting another. A semaphore only bounds
-        // live sessions; without reaping, completed JoinSet entries can accumulate.
-        while tasks.try_join_next().is_some() {}
-        // Acquire before accept: bounded tasks/FDs; overload remains in the kernel backlog.
-        let permit = tokio::select! {
-            permit = permits.clone().acquire_owned() => permit?,
-            _ = &mut shutdown => break,
-        };
-        let (socket, _) = tokio::select! {
-            accepted = listener.accept() => accepted?,
-            _ = &mut shutdown => break,
-        };
-        let state = state.clone();
-        tasks.spawn(async move {
-            let _permit = permit;
-            // Deliberately do not log client addresses, secrets or payload bytes.
-            let _ = connection(socket, state).await;
-        });
-    }
-    // Stop admission immediately. Drain has its own deadline, independent of a stalled handshake.
-    drop(listener);
-    telemetry::event(
-        "drain_started",
-        0,
-        json!({"active":state.counters.active.load(std::sync::atomic::Ordering::Relaxed)}),
-    );
-    if timeout(state.drain, async {
-        while tasks.join_next().await.is_some() {}
-    })
-    .await
-    .is_err()
-    {
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
-    }
-    telemetry::event(
-        "shutdown",
-        0,
-        json!({"active":state.counters.active.load(std::sync::atomic::Ordering::Relaxed)}),
-    );
-    Ok(())
-}
-
-async fn saved_read<R: AsyncRead + Unpin>(r: &mut R, raw: &mut Vec<u8>, end: usize) -> Result<()> {
-    while raw.len() < end {
-        let mut buf = [0u8; 4096];
-        let n = (end - raw.len()).min(buf.len());
-        let got = r.read(&mut buf[..n]).await?;
-        ensure!(got != 0, "EOF during ClientHello");
-        raw.extend_from_slice(&buf[..got]);
-    }
-    Ok(())
-}
-
-async fn read_hello<R: AsyncRead + Unpin>(r: &mut R, raw: &mut Vec<u8>) -> Result<Vec<u8>> {
-    let mut handshake = Vec::new();
-    let mut offset = 0;
-    for _ in 0..16 {
-        saved_read(r, raw, offset + 1).await?;
-        ensure!(raw[offset] == 0x16, "not a handshake record");
-        saved_read(r, raw, offset + 5).await?;
-        ensure!(
-            raw[offset + 1] == 3 && (1..=3).contains(&raw[offset + 2]),
-            "TLS version"
-        );
-        let n = usize::from(u16::from_be_bytes([raw[offset + 3], raw[offset + 4]]));
-        ensure!(
-            n > 0 && handshake.len() + n <= wire::MAX_HELLO + 4,
-            "hello bound"
-        );
-        let start = offset + 5;
-        offset = start + n;
-        saved_read(r, raw, offset).await?;
-        handshake.extend_from_slice(&raw[start..offset]);
-        if handshake.len() >= 4 {
-            let expected = wire::handshake_length(&handshake)?;
-            ensure!(
-                handshake.len() <= expected,
-                "coalesced trailing handshake unsupported"
-            );
-            if handshake.len() == expected {
-                return Ok(handshake);
-            }
-        }
-    }
-    bail!("too many ClientHello fragments")
-}
-
-/// Number of TLS records the ClientHello occupied on the wire.
-fn hello_record_count(raw: &[u8]) -> usize {
-    let mut offset = 0;
-    let mut count = 0;
-    while offset + 5 <= raw.len() && raw[offset] == 0x16 {
-        let n = usize::from(u16::from_be_bytes([raw[offset + 3], raw[offset + 4]]));
-        let next = offset + 5 + n;
-        if next > raw.len() {
-            break;
-        }
-        offset = next;
-        count += 1;
-    }
-    count
-}
-
-async fn connection(mut client: TcpStream, state: Arc<State>) -> Result<()> {
-    let mut session = telemetry::Session::new(&state.counters);
-    let result = connection_inner(&mut client, &state, session.id).await;
-    session.finish(&result);
-    result
-}
-
-fn bind_listener(addr: SocketAddr, client_mss: Option<u16>) -> Result<TcpListener> {
-    let domain = socket2::Domain::for_address(addr);
-    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    socket.set_reuse_address(true)?;
-    socket.set_nonblocking(true)?;
-    #[cfg(target_os = "linux")]
-    if let Some(mss) = client_mss {
-        socket
-            .set_tcp_mss(u32::from(mss))
-            .context("set listener TCP_MAXSEG")?;
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = client_mss;
-    socket.bind(&addr.into())?;
-    socket.listen(1024)?;
-    let std_listener: std::net::TcpListener = socket.into();
-    Ok(TcpListener::from_std(std_listener)?)
-}
-
-fn apply_bulk_mss(stream: &TcpStream, bulk_mss: Option<u16>) {
-    #[cfg(target_os = "linux")]
-    if let Some(mss) = bulk_mss {
-        let _ = socket2::SockRef::from(stream).set_tcp_mss(u32::from(mss));
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = (stream, bulk_mss);
-}
-
-fn configure_tcp_socket(stream: &TcpStream) -> Result<()> {
-    stream.set_nodelay(true)?;
-    let keepalive = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(60))
-        .with_interval(Duration::from_secs(15));
-    #[cfg(unix)]
-    let keepalive = keepalive.with_retries(3);
-    socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive)?;
-    Ok(())
-}
-
-enum ProxyV2Outcome {
-    Header,
-    EmptyEof,
-}
-
-async fn read_proxy_v2<R: AsyncRead + Unpin>(
-    r: &mut R,
-    limit: Duration,
-) -> Result<ProxyV2Outcome> {
-    timeout(limit, async {
-        let mut hdr = [0u8; wire::PROXY_V2_HEADER_LEN];
-        let n = r.read(&mut hdr[..1]).await.context("proxy_v2_eof")?;
-        if n == 0 {
-            return Ok(ProxyV2Outcome::EmptyEof);
-        }
-        r.read_exact(&mut hdr[1..]).await.context("proxy_v2_eof")?;
-        let parsed = wire::parse_proxy_v2_header(&hdr)?;
-        let mut payload = vec![0u8; parsed.payload_len];
-        if !payload.is_empty() {
-            r.read_exact(&mut payload)
-                .await
-                .context("proxy_v2_payload_eof")?;
-        }
-        wire::parse_proxy_v2_payload(&parsed, &payload)?;
-        Ok(ProxyV2Outcome::Header)
-    })
-    .await
-    .context("proxy_v2_timeout")?
-}
-
-async fn connection_inner(client: &mut TcpStream, state: &State, session_id: u64) -> Result<()> {
-    configure_tcp_socket(client)?;
-    let t0 = Instant::now();
-    let us = || t0.elapsed().as_micros() as u64;
-    if state.proxy_protocol {
-        match read_proxy_v2(client, state.client_hello).await {
-            Ok(ProxyV2Outcome::Header) => {}
-            Ok(ProxyV2Outcome::EmptyEof) => {
-                telemetry::event(
-                    "empty_connection_closed",
-                    session_id,
-                    json!({"timeout":false,"proxy_protocol":true}),
-                );
-                return Ok(());
-            }
-            Err(error) => {
-                telemetry::event(
-                    "proxy_protocol_failed",
-                    session_id,
-                    json!({"error": format!("{error:#}")}),
-                );
-                return Err(error);
-            }
-        }
-    }
-    let mut raw = Vec::with_capacity(wire::MAX_HELLO + 84);
-    let received = timeout(state.client_hello, async {
-        if state.enable_dd {
-            saved_read(client, &mut raw, 3).await?;
-            if !matches!(raw.as_slice(), [0x16, 3, 1..=3]) {
-                saved_read(client, &mut raw, 64).await?;
-                return Ok(None);
-            }
-        }
-        read_hello(client, &mut raw).await.map(Some)
-    })
-    .await;
-    if !raw.is_empty() {
-        state
-            .counters
-            .downstream_rx_bytes
-            .fetch_add(raw.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    }
-    if raw.is_empty() {
-        telemetry::event(
-            "empty_connection_closed",
-            session_id,
-            json!({"timeout":received.is_err()}),
-        );
-        return Ok(());
-    }
-    let hello_read_us = us();
-    let hello_records = hello_record_count(&raw);
-    let record_version = raw.get(2).copied();
-    let indicated_record_bytes = match raw.get(..5) {
-        Some([0x16, 3, 1..=3, high, low]) => {
-            Some(5 + usize::from(u16::from_be_bytes([*high, *low])))
-        }
-        _ => None,
-    };
-    if received.is_err() && indicated_record_bytes.is_some_and(|size| raw.len() < size) {
-        // The input deadline has expired with an incomplete first record.
-        // Starting another upstream exchange would consume another full budget.
-        telemetry::event(
-            "client_hello_incomplete",
-            session_id,
-            json!({
-                "received_bytes":raw.len(),
-                "first_tls_record_bytes":indicated_record_bytes,
-            }),
-        );
-        let _ = timeout(DC_EOF_SHUTDOWN_TIMEOUT, async {
-            client.shutdown().await?;
-            tokio::io::copy(client, &mut tokio::io::sink()).await
-        })
-        .await;
-        return Ok(());
-    }
-    if matches!(received, Ok(Ok(None))) {
-        let secrets = state.current_secrets();
-        let frame: &[u8; 64] = raw.as_slice().try_into()?;
-        if let Some((user, transport)) = secrets.iter().find_map(|s| {
-            wire::client_transport(frame, &s.key)
-                .ok()
-                .map(|t| (s.name.clone(), t))
-        }) {
-            // The first eight bytes do not affect the cipher. Key replays on the
-            // wire key/IV so that changing those bytes does not reset the cache.
-            let key = Sha256::digest(&frame[8..56]).into();
-            if state
-                .replay
-                .lock()
-                .await
-                .check_and_insert(key, Instant::now())
-                != Decision::Fresh
-            {
-                telemetry::event(
-                    "dd_rejected",
-                    session_id,
-                    json!({"reason":"replay_or_cache_full"}),
-                );
-                return Ok(());
-            }
-            return relay_client(
-                client,
-                state,
-                session_id,
-                t0,
-                ClientSession {
-                    user,
-                    transport,
-                    tls: None,
-                    hello_read_us,
-                    flight_written_us: None,
-                    diag: HelloDiag {
-                        client_hello_bytes: raw.len(),
-                        client_hello_records: hello_records,
-                        record_version,
-                        ..HelloDiag::default()
-                    },
-                },
-            )
-            .await;
-        }
-    }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let record_minor = if let Ok(Ok(Some(ref bytes))) = received {
-        if raw.len() == bytes.len() + 5 {
-            raw[2]
-        } else {
-            1
-        }
-    } else {
-        1
-    };
-    let secrets = state.current_secrets();
-    let allowed_snis = state.current_allowed_snis();
-    let (auth, failure) = match received {
-        Ok(Ok(Some(bytes))) => {
-            let mut matched = None;
-            let mut last_err = String::new();
-            for s in secrets.iter() {
-                match wire::authenticate_with_record_version(
-                    &bytes,
-                    record_minor,
-                    &s.key,
-                    &allowed_snis,
-                    now,
-                ) {
-                    Ok(hello) => {
-                        matched = Some((s, hello));
-                        break;
-                    }
-                    Err(error) => last_err = error.to_string(),
-                }
-            }
-            match matched {
-                Some((s, hello)) => (Some((s, hello)), String::new()),
-                None => (None, last_err),
-            }
-        }
-        Ok(Ok(None)) => (None, "dd_authentication_failed".to_string()),
-        Ok(Err(error)) => (None, error.to_string()),
-        Err(_) => (None, "client_hello_timeout".to_string()),
-    };
-    let Some((matched_secret, hello)) = auth else {
-        telemetry::event(
-            "cover_selected",
-            session_id,
-            json!({
-                "reason":"unverified_hello",
-                "stage_error":failure,
-                "received_bytes":raw.len(),
-                "first_tls_record_bytes":indicated_record_bytes,
-                "client_hello_records":hello_records,
-                "record_version":record_version,
-            }),
-        );
-        return bounded_cover(client, raw, state, session_id).await;
-    };
-    let accepted = {
-        let mut cache = state.replay.lock().await;
-        cache.check_and_insert(hello.replay_key, Instant::now()) == Decision::Fresh
-    };
-    if !accepted {
-        telemetry::event(
-            "cover_selected",
-            session_id,
-            json!({"reason":"replay_or_cache_full"}),
-        );
-        return bounded_cover(client, raw, state, session_id).await;
-    }
-    let flight =
-        wire::server_flight(&matched_secret.key, &hello, &state.flight, &mut rand::rngs::OsRng)?;
-    // INV-01: from the first write onwards every error only closes this path.
-    // No cover call exists below this boundary, including partial-write failures.
-    write_server_flight(client, &flight, state.flight_shaping, state.handshake).await?;
-    state
-        .counters
-        .downstream_tx_bytes
-        .fetch_add(flight.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    let flight_written_us = us();
-    let mut tls = TlsReader::default();
-    let mut frame = [0u8; 64];
-    let inner = timeout(state.handshake, async {
-        let mut off = 0;
-        while off < frame.len() {
-            let n = tls.read_into(client, &mut frame[off..]).await?;
-            ensure!(n > 0, "EOF before inner header");
-            off += n;
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await;
-    state
-        .counters
-        .downstream_rx_bytes
-        .fetch_add(tls.consumed, std::sync::atomic::Ordering::Relaxed);
-    let failure = match &inner {
-        Ok(Ok(())) => None,
-        Ok(Err(error)) => Some(format!("{error:#}")),
-        Err(_) => Some("deadline".to_string()),
-    };
-    if let Some(reason) = failure {
-        telemetry::event(
-            "inner_header_incomplete",
-            session_id,
-            json!({
-                "reason":reason,
-                "flight_bytes":flight.len(),
-                "fake_tls_cert_bytes":state.flight.cert_bytes,
-                "client_bytes_after_flight":tls.consumed,
-                "client_hello_bytes":raw.len(),
-                "client_hello_records":hello_records,
-                "record_version":record_version,
-                "client_template":hello.template,
-                "cipher_suite":hello.cipher_suite,
-                "flight_written_us":flight_written_us,
-            }),
-        );
-    }
-    inner
-        .context("inner_header_timeout")?
-        .context("inner_header_invalid")?;
-    let transport = wire::client_transport(&frame, &matched_secret.key)
-        .context("inner_transport_invalid")?;
-    relay_client(
-        client,
-        state,
-        session_id,
-        t0,
-        ClientSession {
-            user: matched_secret.name.clone(),
-            transport,
-            tls: Some(tls),
-            hello_read_us,
-            flight_written_us: Some(flight_written_us),
-            diag: HelloDiag {
-                client_hello_bytes: raw.len(),
-                client_hello_records: hello_records,
-                record_version,
-                client_template: hello.template.clone(),
-                cipher_suite: hello.cipher_suite,
-                flight_bytes: flight.len(),
-                fake_tls_cert_bytes: state.flight.cert_bytes,
-            },
-        },
-    )
-    .await
-}
-
-struct ClientSession {
-    user: String,
-    transport: wire::ClientTransport,
-    tls: Option<TlsReader>,
-    hello_read_us: u64,
-    flight_written_us: Option<u64>,
-    diag: HelloDiag,
-}
-
-/// Shape of the accepted ClientHello and of the flight we answered with.
-/// It identifies the client template without exposing key material.
-#[derive(Default, Clone)]
-struct HelloDiag {
-    client_hello_bytes: usize,
-    client_hello_records: usize,
-    record_version: Option<u8>,
-    client_template: String,
-    cipher_suite: u16,
-    flight_bytes: usize,
-    fake_tls_cert_bytes: usize,
-}
-
-async fn relay_client(
-    client: &mut TcpStream,
-    state: &State,
-    session_id: u64,
-    t0: Instant,
-    session: ClientSession,
-) -> Result<()> {
-    let ClientSession {
-        user,
-        transport,
-        tls,
-        hello_read_us,
-        flight_written_us,
-        diag,
-    } = session;
-    apply_bulk_mss(client, state.client_mss_bulk);
-    let us = || t0.elapsed().as_micros() as u64;
-    let framed = tls.is_some();
-    let inner_header_us = us();
-    let dc = wire::dc_transport()?;
-    let (upstream, route) = connect_upstream(state, transport.dc, &dc.header).await?;
-    let dc_connected_us = us();
-    telemetry::event(
-        "authenticated",
-        session_id,
-        json!({
-            "user":user,
-            "dc":transport.dc,
-            "route":route,
-            "transport":"padded-intermediate",
-            "mode": if framed { "ee" } else { "dd" },
-            "hello_read_us":hello_read_us,
-            "flight_written_us":flight_written_us,
-            "inner_header_us":inner_header_us,
-            "dc_connected_us":dc_connected_us,
-            "dc_header_written_us":us(),
-            "client_hello_bytes":diag.client_hello_bytes,
-            "client_hello_records":diag.client_hello_records,
-            "record_version":diag.record_version,
-            "client_template":diag.client_template,
-            "cipher_suite":diag.cipher_suite,
-            "flight_bytes":diag.flight_bytes,
-            "fake_tls_cert_bytes":diag.fake_tls_cert_bytes,
-        }),
-    );
-    let client_fd = stream_raw_fd(client);
-    let upstream_fd = stream_raw_fd(&upstream);
-    let (cr, cw) = client.split();
-    let (ur, uw) = upstream.into_split();
-    let relay = RelayStats {
-        counters: Some(state.counters.clone()),
-        client_fd,
-        upstream_fd,
-        ..RelayStats::default()
-    };
-    let relay_start_us = us();
-    let result = relay_until_end(
-        &relay,
-        state.idle,
-        async {
-            upload(
-                cr,
-                uw,
-                tls,
-                transport.decrypt,
-                dc.encrypt,
-                RELAY_WRITE_TIMEOUT,
-                &relay,
-            )
-            .await
-            .context("client_to_dc_relay_failed")
-        },
-        async {
-            download(
-                ur,
-                cw,
-                dc.decrypt,
-                transport.encrypt,
-                framed,
-                RELAY_WRITE_TIMEOUT,
-                &relay,
-            )
-            .await
-            .context("dc_to_client_relay_failed")
-        },
-    )
-    .await;
-    let dc_close_reason = if result.is_ok() {
-        // Download already sent FIN. Give the peer a short window to close
-        // its write half and consume late bytes without forwarding them.
-        Some(
-            match timeout(
-                DC_EOF_SHUTDOWN_TIMEOUT,
-                tokio::io::copy(client, &mut tokio::io::sink()),
-            )
-            .await
-            {
-                Ok(Ok(_)) => "dc_eof",
-                Ok(Err(_)) => "client_drain_read_error",
-                Err(_) => "client_drain_timeout",
-            },
-        )
-    } else {
-        None
-    };
-    let mut summary = relay.summary();
-    if let Some(reason) = dc_close_reason {
-        summary["final_reason"] = json!(reason);
-    }
-    summary["relay_start_us"] = json!(relay_start_us);
-    telemetry::event("relay_summary", session_id, summary);
-    result?;
-    Ok(())
-}
-
-const NONE_US: u64 = u64::MAX;
-const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-const DC_EOF_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
-const CLIENT_EOF_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
-
-async fn relay_until_end(
-    stats: &RelayStats,
-    idle: Duration,
-    upload: impl std::future::Future<Output = Result<()>>,
-    download: impl std::future::Future<Output = Result<()>>,
-) -> Result<()> {
-    tokio::pin!(upload, download);
-    let transfer = async {
-        tokio::select! {
-            // Download completes only after the last reply has been written
-            // and the client's write half has been shut down.
-            biased;
-            result = &mut download => result,
-            result = &mut upload => {
-                result?;
-                // A client FIN still allows the DC to finish its reply.
-                match timeout(CLIENT_EOF_REPLY_TIMEOUT, download).await {
-                    Ok(result) => result,
-                    Err(error) => stats.failed("dc_reply_drain_timeout", error.into()),
-                }
-            }
-        }
-    };
-    tokio::select! {
-        biased;
-        result = transfer => result,
-        () = stats.wait_for_idle(idle) => {
-            stats.timeline.close("session_idle", "timed_out");
-            bail!("session idle timeout")
-        }
-    }
-}
-
-/// Counters here measure bytes handed to a socket or read from it. A
-/// successful write does not prove the peer received the data.
-struct RelayStats {
-    uploaded: std::sync::atomic::AtomicU64,
-    downloaded: std::sync::atomic::AtomicU64,
-    first_eof: std::sync::atomic::AtomicU64,
-    transport_error: std::sync::atomic::AtomicI32,
-    client_reads: std::sync::atomic::AtomicU64,
-    dc_writes: std::sync::atomic::AtomicU64,
-    dc_reads: std::sync::atomic::AtomicU64,
-    client_writes: std::sync::atomic::AtomicU64,
-    first_up_us: std::sync::atomic::AtomicU64,
-    last_up_us: std::sync::atomic::AtomicU64,
-    first_dn_us: std::sync::atomic::AtomicU64,
-    last_dn_us: std::sync::atomic::AtomicU64,
-    last_activity_us: std::sync::atomic::AtomicU64,
-    timeline: telemetry::Timeline,
-    first_up_kind: std::sync::atomic::AtomicU64,
-    first_dn_kind: std::sync::atomic::AtomicU64,
-    first_up_frame_len: std::sync::atomic::AtomicU64,
-    first_dn_frame_len: std::sync::atomic::AtomicU64,
-    counters: Option<Arc<telemetry::Counters>>,
-    client_fd: Option<i32>,
-    upstream_fd: Option<i32>,
-}
-
-impl Default for RelayStats {
-    fn default() -> Self {
-        use std::sync::atomic::{AtomicI32, AtomicU64};
-        Self {
-            uploaded: AtomicU64::new(0),
-            downloaded: AtomicU64::new(0),
-            first_eof: AtomicU64::new(0),
-            transport_error: AtomicI32::new(0),
-            client_reads: AtomicU64::new(0),
-            dc_writes: AtomicU64::new(0),
-            dc_reads: AtomicU64::new(0),
-            client_writes: AtomicU64::new(0),
-            first_up_us: AtomicU64::new(NONE_US),
-            last_up_us: AtomicU64::new(NONE_US),
-            first_dn_us: AtomicU64::new(NONE_US),
-            last_dn_us: AtomicU64::new(NONE_US),
-            last_activity_us: AtomicU64::new(0),
-            timeline: telemetry::Timeline::new(),
-            first_up_kind: AtomicU64::new(0),
-            first_dn_kind: AtomicU64::new(0),
-            first_up_frame_len: AtomicU64::new(0),
-            first_dn_frame_len: AtomicU64::new(0),
-            counters: None,
-            client_fd: None,
-            upstream_fd: None,
-        }
-    }
-}
-
-fn io_kind(error: &anyhow::Error) -> &'static str {
-    use std::io::ErrorKind::*;
-    match error.downcast_ref::<std::io::Error>().map(|e| e.kind()) {
-        None => "protocol",
-        Some(ConnectionReset) => "reset",
-        Some(BrokenPipe) => "broken_pipe",
-        Some(UnexpectedEof) => "unexpected_eof",
-        Some(TimedOut) => "timed_out",
-        Some(ConnectionAborted) => "aborted",
-        Some(_) => "other",
-    }
-}
-
-impl RelayStats {
-    async fn wait_for_idle(&self, idle: Duration) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let mut wait = idle;
-        loop {
-            tokio::time::sleep(wait).await;
-            let last_activity = self.last_activity_us.load(Relaxed);
-            let elapsed =
-                Duration::from_micros(self.timeline.now_us().saturating_sub(last_activity));
-            wait = idle.saturating_sub(elapsed);
-            if wait.is_zero() {
-                return;
-            }
-        }
-    }
-
-    fn record_activity(&self) {
-        self.last_activity_us
-            .store(self.timeline.now_us(), std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn observe_prefix(&self, prefix: &[u8], upload: bool) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let (kind, length) = if upload {
-            (&self.first_up_kind, &self.first_up_frame_len)
-        } else {
-            (&self.first_dn_kind, &self.first_dn_frame_len)
-        };
-        if prefix.len() < 4 {
-            return;
-        }
-        let frame_length =
-            u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) & 0x7fff_ffff;
-        if !(8..=16 * 1024 * 1024).contains(&frame_length) {
-            return;
-        }
-        length.store(u64::from(frame_length), Relaxed);
-        if prefix.len() < 12 {
-            return;
-        }
-        if prefix[4..12] != [0; 8] {
-            kind.store(1, Relaxed);
-            return;
-        }
-        kind.store(2, Relaxed);
-        if prefix.len() >= 28 {
-            let expected = if upload {
-                [0xf1, 0x8e, 0x7e, 0xbe]
-            } else {
-                [0x63, 0x24, 0x16, 0x05]
-            };
-            if prefix[24..28] == expected {
-                kind.store(3, Relaxed);
-            }
-        }
-    }
-
-    fn stamp(&self, first: &std::sync::atomic::AtomicU64, last: &std::sync::atomic::AtomicU64) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let now = self.timeline.now_us();
-        let _ = first.compare_exchange(NONE_US, now, Relaxed, Relaxed);
-        last.store(now, Relaxed);
-        self.last_activity_us.store(now, Relaxed);
-    }
-
-    fn failed<T>(&self, tag: &'static str, error: anyhow::Error) -> Result<T> {
-        let detail = if error.is::<tokio::time::error::Elapsed>() {
-            "timed_out"
-        } else {
-            io_kind(&error)
-        };
-        self.timeline.close(tag, detail);
-        Err(error)
-    }
-
-    fn summary(&self) -> serde_json::Value {
-        use std::sync::atomic::Ordering::Relaxed;
-        let end = self.timeline.now_us();
-        let opt = |v: u64| if v == NONE_US { None } else { Some(v) };
-        let (first_up, last_up) = (
-            opt(self.first_up_us.load(Relaxed)),
-            opt(self.last_up_us.load(Relaxed)),
-        );
-        let (first_dn, last_dn) = (
-            opt(self.first_dn_us.load(Relaxed)),
-            opt(self.last_dn_us.load(Relaxed)),
-        );
-        let reply_seen = self.downloaded.load(Relaxed) > 0;
-        let closer = self.timeline.closer();
-        let class = match closer.map(|c| c.1) {
-            Some("client_eof") | Some("client_eof_mid_record") if reply_seen => {
-                "client_closed_after_dc_reply"
-            }
-            Some("client_eof") | Some("client_eof_mid_record") => {
-                "client_closed_before_any_dc_reply"
-            }
-            Some("dc_eof") if reply_seen => "dc_closed_after_reply",
-            Some("dc_eof") => "dc_closed_without_reply",
-            Some(t) if t.ends_with("_idle") => "idle_timeout",
-            Some(t) if t.starts_with("client_") => "client_socket_error",
-            Some(t) if t.starts_with("dc_") => "dc_socket_error",
-            Some(_) => "other",
-            None => "none",
-        };
-        let error_code = self.transport_error.load(Relaxed);
-        json!({
-            "uploaded_bytes":self.uploaded.load(Relaxed),
-            "downloaded_bytes":self.downloaded.load(Relaxed),
-            "client_reads":self.client_reads.load(Relaxed),
-            "dc_writes":self.dc_writes.load(Relaxed),
-            "dc_reads":self.dc_reads.load(Relaxed),
-            "client_writes":self.client_writes.load(Relaxed),
-            "first_up_us":first_up,
-            "last_up_us":last_up,
-            "first_dn_us":first_dn,
-            "last_dn_us":last_dn,
-            "end_us":end,
-            "final_reason":self.timeline.final_reason(),
-            "final_at_us":end,
-            "idle_since_last_up_us":last_up.map(|t| end.saturating_sub(t)),
-            "idle_since_last_dn_us":last_dn.map(|t| end.saturating_sub(t)),
-            "first_eof":match self.first_eof.load(Relaxed) {1=>"client",2=>"dc",_=>"none"},
-            "initiator":closer.map(|c| c.1),
-            "initiator_detail":closer.map(|c| c.2),
-            "initiator_at_us":closer.map(|c| c.0),
-            "class":class,
-            "dc_transport_error":if error_code==0 {None}else{Some(error_code)},
-            "first_up_frame_len":self.first_up_frame_len.load(Relaxed),
-            "first_dn_frame_len":self.first_dn_frame_len.load(Relaxed),
-            "first_up_kind":match self.first_up_kind.load(Relaxed) {1=>"encrypted",2=>"unencrypted_other",3=>"unencrypted_req_pq_multi",_=>"unknown"},
-            "first_dn_kind":match self.first_dn_kind.load(Relaxed) {1=>"encrypted",2=>"unencrypted_other",3=>"unencrypted_res_pq",_=>"unknown"},
-            "timeline":self.timeline.snapshot(),
-        })
-    }
-}
-
-// Telegram iOS emits FakeTLS application records with up to 16,408 payload bytes.
-const MAX_CLIENT_RECORD: usize = 16_408;
-const TLS_READER_CHUNK: usize = 5 + MAX_CLIENT_RECORD;
-
-#[derive(Default)]
-struct TlsReader {
-    pending: Vec<u8>,
-    offset: usize,
-    raw: Vec<u8>,
-    raw_offset: usize,
-    /// Wire bytes read from the socket, including TLS headers and partial records.
-    consumed: u64,
-}
-impl TlsReader {
-    async fn read_wire_some<R: AsyncRead + Unpin>(
-        &mut self,
-        r: &mut R,
-        dst: &mut [u8],
-    ) -> std::io::Result<usize> {
-        if self.raw_offset < self.raw.len() {
-            let avail = self.raw.len() - self.raw_offset;
-            let n = dst.len().min(avail);
-            dst[..n].copy_from_slice(&self.raw[self.raw_offset..self.raw_offset + n]);
-            self.raw_offset += n;
-            if self.raw_offset == self.raw.len() {
-                self.raw.clear();
-                self.raw_offset = 0;
-            }
-            return Ok(n);
-        }
-        if self.raw.capacity() == 0 {
-            self.raw.reserve_exact(TLS_READER_CHUNK);
-        }
-        self.raw.resize(TLS_READER_CHUNK, 0);
-        let got = r.read(&mut self.raw).await?;
-        self.raw.truncate(got);
-        self.raw_offset = 0;
-        if got == 0 {
-            return Ok(0);
-        }
-        self.consumed += got as u64;
-        let n = dst.len().min(got);
-        dst[..n].copy_from_slice(&self.raw[..n]);
-        self.raw_offset = n;
-        if self.raw_offset == self.raw.len() {
-            self.raw.clear();
-            self.raw_offset = 0;
-        }
-        Ok(n)
-    }
-
-    async fn read_wire_exact<R: AsyncRead + Unpin>(
-        &mut self,
-        r: &mut R,
-        mut bytes: &mut [u8],
-    ) -> std::io::Result<()> {
-        while !bytes.is_empty() {
-            let n = self.read_wire_some(r, bytes).await?;
-            if n == 0 {
-                return Err(std::io::ErrorKind::UnexpectedEof.into());
-            }
-            bytes = &mut bytes[n..];
-        }
-        Ok(())
-    }
-
-    async fn read_into<R: AsyncRead + Unpin>(
-        &mut self,
-        r: &mut R,
-        out: &mut [u8],
-    ) -> Result<usize> {
-        if self.offset == self.pending.len() {
-            self.pending.clear();
-            self.offset = 0;
-            // Permit only one CCS before an application record. No unbounded empty-record loop.
-            for _ in 0..2 {
-                let mut h = [0u8; 5];
-                let first = self.read_wire_some(r, &mut h).await?;
-                if first == 0 {
-                    return Ok(0);
-                }
-                if first < 5 {
-                    self.read_wire_exact(r, &mut h[first..]).await?;
-                }
-                ensure!(h[1..3] == [3, 3], "TLS record version");
-                let n = usize::from(u16::from_be_bytes([h[3], h[4]]));
-                let limit = if h[0] == 0x17 {
-                    MAX_CLIENT_RECORD
-                } else {
-                    wire::MAX_RECORD
-                };
-                ensure!(n > 0 && n <= limit, "TLS record limit");
-                let mut pending = std::mem::take(&mut self.pending);
-                pending.resize(n, 0);
-                let read_res = self.read_wire_exact(r, &mut pending).await;
-                self.pending = pending;
-                read_res?;
-                if h[0] == 0x14 {
-                    ensure!(self.pending == [1], "invalid CCS");
-                    self.pending.clear();
-                    continue;
-                }
-                ensure!(h[0] == 0x17, "unexpected post-commit record");
-                break;
-            }
-            ensure!(!self.pending.is_empty(), "repeated CCS");
-        }
-        let n = out.len().min(self.pending.len() - self.offset);
-        out[..n].copy_from_slice(&self.pending[self.offset..self.offset + n]);
-        self.offset += n;
-        Ok(n)
-    }
-}
-
-async fn upload<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    mut r: R,
-    mut w: W,
-    mut tls: Option<TlsReader>,
-    mut decrypt: AesCtr,
-    mut encrypt: AesCtr,
-    write_timeout: Duration,
-    stats: &RelayStats,
-) -> Result<()> {
-    use std::sync::atomic::Ordering::Relaxed;
-    let mut buf = [0u8; wire::MAX_RECORD];
-    let mut prefix = [0u8; 28];
-    let mut prefix_len = 0;
-    let mut prev_retrans = 0u32;
-    loop {
-        let prev_consumed = tls.as_ref().map(|t| t.consumed).unwrap_or(0);
-        let read = match &mut tls {
-            Some(reader) => reader.read_into(&mut r, &mut buf).await,
-            None => r.read(&mut buf).await.map_err(Into::into),
-        };
-        if let (Some(reader), Some(counters)) = (&tls, &stats.counters) {
-            let delta = reader.consumed.saturating_sub(prev_consumed);
-            if delta > 0 {
-                counters.downstream_rx_bytes.fetch_add(delta, Relaxed);
-            }
-        }
-        let n = match read {
-            Ok(n) => n,
-            Err(error) => {
-                let tag = if io_kind(&error) == "unexpected_eof" {
-                    "client_eof_mid_record"
-                } else {
-                    "client_read_error"
-                };
-                return stats.failed(tag, error);
-            }
-        };
-        if tls.is_none() && n > 0 {
-            if let Some(counters) = &stats.counters {
-                counters.downstream_rx_bytes.fetch_add(n as u64, Relaxed);
-            }
-        }
-        if n == 0 {
-            let _ = stats.first_eof.compare_exchange(0, 1, Relaxed, Relaxed);
-            stats.timeline.close("client_eof", "fin");
-            let res = match timeout(write_timeout, w.shutdown()).await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => stats.failed("dc_write_error", error.into()),
-                Err(error) => stats.failed("dc_write_idle", error.into()),
-            };
-            if let Some(counters) = &stats.counters {
-                sample_fd_retrans(stats.upstream_fd, &mut prev_retrans, &counters.upstream_retrans_segs);
-            }
-            return res;
-        }
-        stats.client_reads.fetch_add(1, Relaxed);
-        stats.record_activity();
-        stats.timeline.mark("client_read", n as u64);
-        wire::crypt(&mut decrypt, &mut buf[..n]);
-        let take = n.min(prefix.len() - prefix_len);
-        prefix[prefix_len..prefix_len + take].copy_from_slice(&buf[..take]);
-        prefix_len += take;
-        stats.observe_prefix(&prefix[..prefix_len], true);
-        wire::crypt(&mut encrypt, &mut buf[..n]);
-        match timeout(write_timeout, w.write_all(&buf[..n])).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                if let Some(counters) = &stats.counters {
-                    sample_fd_retrans(stats.upstream_fd, &mut prev_retrans, &counters.upstream_retrans_segs);
-                }
-                return stats.failed("dc_write_error", error.into());
-            }
-            Err(error) => {
-                if let Some(counters) = &stats.counters {
-                    sample_fd_retrans(stats.upstream_fd, &mut prev_retrans, &counters.upstream_retrans_segs);
-                }
-                return stats.failed("dc_write_idle", error.into());
-            }
-        }
-        if let Some(counters) = &stats.counters {
-            counters.upstream_tx_bytes.fetch_add(n as u64, Relaxed);
-            sample_fd_retrans(stats.upstream_fd, &mut prev_retrans, &counters.upstream_retrans_segs);
-        }
-        stats.uploaded.fetch_add(n as u64, Relaxed);
-        stats.dc_writes.fetch_add(1, Relaxed);
-        stats.timeline.mark("dc_write", n as u64);
-        stats.stamp(&stats.first_up_us, &stats.last_up_us);
-    }
-}
-async fn download<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    mut r: R,
-    mut w: W,
-    mut decrypt: AesCtr,
-    mut encrypt: AesCtr,
-    framed: bool,
-    write_timeout: Duration,
-    stats: &RelayStats,
-) -> Result<()> {
-    use std::sync::atomic::Ordering::Relaxed;
-    let mut frame_buf = vec![0u8; 5 + wire::MAX_RECORD];
-    frame_buf[0] = 0x17;
-    frame_buf[1] = 3;
-    frame_buf[2] = 3;
-    let mut prefix = [0u8; 28];
-    let mut prefix_len = 0;
-    let mut prev_retrans = 0u32;
-    loop {
-        let n = match r.read(&mut frame_buf[5..]).await {
-            Ok(n) => n,
-            Err(error) => return stats.failed("dc_read_error", error.into()),
-        };
-        if n == 0 {
-            let _ = stats.first_eof.compare_exchange(0, 2, Relaxed, Relaxed);
-            stats.timeline.close("dc_eof", "fin");
-            let res = match timeout(write_timeout.min(DC_EOF_SHUTDOWN_TIMEOUT), w.shutdown()).await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => stats.failed("client_write_error", error.into()),
-                Err(error) => stats.failed("client_write_idle", error.into()),
-            };
-            if let Some(counters) = &stats.counters {
-                sample_fd_retrans(stats.client_fd, &mut prev_retrans, &counters.downstream_retrans_segs);
-            }
-            return res;
-        }
-        if let Some(counters) = &stats.counters {
-            counters.upstream_rx_bytes.fetch_add(n as u64, Relaxed);
-        }
-        stats.dc_reads.fetch_add(1, Relaxed);
-        stats.record_activity();
-        stats.timeline.mark("dc_read", n as u64);
-        {
-            let buf = &mut frame_buf[5..5 + n];
-            wire::crypt(&mut decrypt, buf);
-            // Transient prefix only: recognize public unencrypted handshake types
-            // and transport errors; never emit prefix bytes, key IDs or payload.
-            let take = n.min(prefix.len() - prefix_len);
-            prefix[prefix_len..prefix_len + take].copy_from_slice(&buf[..take]);
-            prefix_len += take;
-            stats.observe_prefix(&prefix[..prefix_len], false);
-            if prefix_len >= 4 {
-                let word = i32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]);
-                let code = if word == 4 && prefix_len >= 8 {
-                    i32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]])
-                } else {
-                    word
-                };
-                if [-404, -429, -444, -500].contains(&code) {
-                    stats.transport_error.store(code, Relaxed);
-                }
-            }
-            wire::crypt(&mut encrypt, buf);
-        }
-        let bytes = if framed {
-            let len_bytes = (n as u16).to_be_bytes();
-            frame_buf[3] = len_bytes[0];
-            frame_buf[4] = len_bytes[1];
-            &frame_buf[..5 + n]
-        } else {
-            &frame_buf[5..5 + n]
-        };
-        match timeout(write_timeout, w.write_all(bytes)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                if let Some(counters) = &stats.counters {
-                    sample_fd_retrans(stats.client_fd, &mut prev_retrans, &counters.downstream_retrans_segs);
-                }
-                return stats.failed("client_write_error", error.into());
-            }
-            Err(error) => {
-                if let Some(counters) = &stats.counters {
-                    sample_fd_retrans(stats.client_fd, &mut prev_retrans, &counters.downstream_retrans_segs);
-                }
-                return stats.failed("client_write_idle", error.into());
-            }
-        }
-        if let Some(counters) = &stats.counters {
-            counters.downstream_tx_bytes.fetch_add(bytes.len() as u64, Relaxed);
-            sample_fd_retrans(stats.client_fd, &mut prev_retrans, &counters.downstream_retrans_segs);
-        }
-        stats.downloaded.fetch_add(n as u64, Relaxed);
-        stats.client_writes.fetch_add(1, Relaxed);
-        stats.timeline.mark("client_write", n as u64);
-        stats.stamp(&stats.first_dn_us, &stats.last_dn_us);
-    }
-}
-async fn plain_copy<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    mut r: R,
-    mut w: W,
-    idle: Duration,
-) -> Result<()> {
-    let mut buf = [0; wire::MAX_RECORD];
-    loop {
-        let n = timeout(idle, r.read(&mut buf)).await??;
-        if n == 0 {
-            timeout(idle, w.shutdown()).await??;
-            return Ok(());
-        }
-        timeout(idle, w.write_all(&buf[..n])).await??;
-    }
-}
-async fn counted_copy<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    mut r: R,
-    mut w: W,
-    idle: Duration,
-    rx_counter: &std::sync::atomic::AtomicU64,
-    tx_counter: &std::sync::atomic::AtomicU64,
-    write_fd: Option<i32>,
-    retrans_counter: &std::sync::atomic::AtomicU64,
-) -> Result<()> {
-    use std::sync::atomic::Ordering::Relaxed;
-    let mut buf = [0; wire::MAX_RECORD];
-    let mut prev_retrans = 0u32;
-    loop {
-        let n = timeout(idle, r.read(&mut buf)).await??;
-        if n == 0 {
-            let res = timeout(idle, w.shutdown()).await;
-            sample_fd_retrans(write_fd, &mut prev_retrans, retrans_counter);
-            res??;
-            return Ok(());
-        }
-        rx_counter.fetch_add(n as u64, Relaxed);
-        let res = timeout(idle, w.write_all(&buf[..n])).await;
-        sample_fd_retrans(write_fd, &mut prev_retrans, retrans_counter);
-        res??;
-        tx_counter.fetch_add(n as u64, Relaxed);
-    }
-}
-async fn bounded_cover(
-    client: &mut TcpStream,
-    raw: Vec<u8>,
-    state: &State,
-    session_id: u64,
-) -> Result<()> {
-    // An HTTPS fallback must not queue while holding a slot from the shared listener.
-    let Ok(_permit) = state.cover_permits.try_acquire() else {
-        telemetry::event("cover_rejected", session_id, json!({"reason":"capacity"}));
-        return Ok(());
-    };
-    // Unauthenticated fallback must not reserve admission slots for the full
-    // authenticated-session idle timeout, especially after a partial hello.
-    timeout(state.handshake.saturating_mul(2), cover(client, raw, state))
-        .await
-        .context("cover_budget_expired")?
-}
-
-async fn cover(client: &mut TcpStream, raw: Vec<u8>, state: &State) -> Result<()> {
-    let mut upstream = timeout(state.handshake, TcpStream::connect(&state.cover)).await??;
-    // INV-01: first backend write commits cover; never reconsider the protocol.
-    timeout(state.handshake, upstream.write_all(&raw)).await??;
-    let (cr, cw) = client.split();
-    let (ur, uw) = upstream.split();
-    tokio::try_join!(
-        plain_copy(cr, uw, state.idle),
-        plain_copy(ur, cw, state.idle)
-    )?;
-    Ok(())
-}
-
-const EGRESS_MAGIC: [u8; 4] = *b"MTV2";
-const EGRESS_ACK_OK: u8 = 0x00;
-const EGRESS_ACK_ERR: u8 = 0x01;
-
-fn ct_eq_16(a: &[u8; 16], b: &[u8; 16]) -> bool {
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-async fn write_server_flight(
-    client: &mut TcpStream,
-    flight: &[u8],
-    shaping: bool,
-    handshake: Duration,
-) -> Result<()> {
-    timeout(handshake, async {
-        if !shaping || flight.len() <= 256 {
-            client.write_all(flight).await?;
-            return Ok::<_, std::io::Error>(());
-        }
-        use rand::Rng;
-        let first_chunk = rand::rngs::OsRng.gen_range(95..=165).min(flight.len());
-        client.write_all(&flight[..first_chunk]).await?;
-        client.flush().await?;
-        if first_chunk < flight.len() {
-            let delay_us = rand::rngs::OsRng.gen_range(300..=1000);
-            tokio::time::sleep(Duration::from_micros(delay_us)).await;
-            client.write_all(&flight[first_chunk..]).await?;
-            client.flush().await?;
-        }
-        Ok(())
-    })
-    .await
-    .context("server_hello_write_timeout")?
-    .context("server_hello_write_failed")?;
-    Ok(())
-}
-
-struct EgressProbe {
-    tcp_reachable: bool,
-    token_status: &'static str,
-    dc_reachable: bool,
-    detail: String,
-}
-
-async fn probe_egress_endpoint(
-    addr: SocketAddr,
-    dc_id: i16,
-    token: &[u8; 16],
-    limit: Duration,
-) -> EgressProbe {
-    let mut stream = match timeout(limit, TcpStream::connect(addr)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(err)) => {
-            return EgressProbe {
-                tcp_reachable: false,
-                token_status: "unknown",
-                dc_reachable: false,
-                detail: format!("tcp_connect_failed: {err}"),
-            };
-        }
-        Err(_) => {
-            return EgressProbe {
-                tcp_reachable: false,
-                token_status: "unknown",
-                dc_reachable: false,
-                detail: "tcp_connect_timeout".to_string(),
-            };
-        }
-    };
-    let dc = match wire::dc_transport() {
-        Ok(dc) => dc,
-        Err(err) => {
-            return EgressProbe {
-                tcp_reachable: true,
-                token_status: "unknown",
-                dc_reachable: false,
-                detail: format!("dc_transport_error: {err:#}"),
-            };
-        }
-    };
-    let mut preface = [0u8; 88];
-    preface[..4].copy_from_slice(&EGRESS_MAGIC);
-    preface[4..6].copy_from_slice(&dc_id.to_le_bytes());
-    preface[8..24].copy_from_slice(token);
-    preface[24..88].copy_from_slice(&dc.header);
-    if let Err(err) = timeout(limit, stream.write_all(&preface)).await {
-        return EgressProbe {
-            tcp_reachable: true,
-            token_status: "unknown",
-            dc_reachable: false,
-            detail: format!("preface_write_timeout: {err}"),
-        };
-    }
-    let mut ack = [0u8; 1];
-    match timeout(limit, stream.read_exact(&mut ack)).await {
-        Ok(Ok(_)) if ack[0] == EGRESS_ACK_OK => EgressProbe {
-            tcp_reachable: true,
-            token_status: "accepted",
-            dc_reachable: true,
-            detail: format!("dc {dc_id} reachable via egress"),
-        },
-        Ok(Ok(_)) => EgressProbe {
-            tcp_reachable: true,
-            token_status: "accepted",
-            dc_reachable: false,
-            detail: format!("dc {dc_id} unreachable from egress (negative ack)"),
-        },
-        Ok(Err(err))
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-            ) =>
-        {
-            EgressProbe {
-                tcp_reachable: true,
-                token_status: "unknown",
-                dc_reachable: false,
-                detail: "connection closed before ACK (token rejected, protocol mismatch, or peer reset)".to_string(),
-            }
-        }
-        Ok(Err(err)) => EgressProbe {
-            tcp_reachable: true,
-            token_status: "unknown",
-            dc_reachable: false,
-            detail: format!("ack_read_failed: {err}"),
-        },
-        Err(_) => EgressProbe {
-            tcp_reachable: true,
-            token_status: "unknown",
-            dc_reachable: false,
-            detail: "ack_read_timeout".to_string(),
-        },
-    }
-}
-
-fn build_req_pq_multi_frame(nonce: &[u8; 16]) -> Vec<u8> {
-    // MTProto unencrypted message: auth_key_id(8=0) + msg_id(8, unix<<32) + msg_len(4=20) +
-    // req_pq_multi#be7e8ef1 (4) + nonce(16) = 40 bytes payload.
-    // Wrapped in padded-intermediate frame: len(4 LE = 40) + payload(40) = 44 bytes.
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(1_700_000_000);
-    let msg_id = (now_secs << 32) & !3u64;
-    let mut frame = Vec::with_capacity(44);
-    frame.extend_from_slice(&40u32.to_le_bytes());
-    frame.extend_from_slice(&0u64.to_le_bytes());
-    frame.extend_from_slice(&msg_id.to_le_bytes());
-    frame.extend_from_slice(&20u32.to_le_bytes());
-    frame.extend_from_slice(&[0xf1, 0x8e, 0x7e, 0xbe]); // req_pq_multi#be7e8ef1
-    frame.extend_from_slice(nonce);
-    frame
-}
-
-fn validate_res_pq_payload(payload: &[u8], expected_nonce: &[u8; 16]) -> Result<()> {
-    // Unencrypted MTProto response: auth_key_id(8=0) + msg_id(8) + msg_len(4) + resPQ#05162463(4) + nonce(16) + ...
-    ensure!(
-        payload.len() >= 40,
-        "Telegram DC reply too short ({} bytes)",
-        payload.len()
-    );
-    ensure!(payload[0..8] == [0u8; 8], "unexpected non-zero auth_key_id in resPQ");
-    ensure!(
-        payload[20..24] == [0x63, 0x24, 0x16, 0x05],
-        "unexpected MTProto constructor (expected resPQ#05162463)"
-    );
-    ensure!(
-        &payload[24..40] == expected_nonce,
-        "resPQ nonce mismatch"
-    );
-    Ok(())
-}
-
-async fn read_tls_record_raw(stream: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
-    let mut hdr = [0u8; 5];
-    stream.read_exact(&mut hdr).await.context("reading TLS record header")?;
-    let n = usize::from(u16::from_be_bytes([hdr[3], hdr[4]]));
-    ensure!(n <= wire::MAX_RECORD, "TLS record exceeds bound");
-    let mut body = vec![0u8; n];
-    stream.read_exact(&mut body).await.context("reading TLS record body")?;
-    let mut raw = Vec::with_capacity(5 + n);
-    raw.extend_from_slice(&hdr);
-    raw.extend_from_slice(&body);
-    Ok((hdr[0], raw))
-}
-
-async fn probe_telegram_e2e(
-    cfg: &Config,
-    addr: SocketAddr,
-    dc_id: i16,
-    limit: Duration,
-) -> Result<u64> {
-    use rand::RngCore;
-    let started = Instant::now();
-    timeout(limit, async {
-        let mut nonce = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
-        let mut req_frame = build_req_pq_multi_frame(&nonce);
-
-        if cfg.role == Role::Egress {
-            let token = cfg.egress_token()?;
-            let mut dc = wire::dc_transport()?;
-            let mut stream = TcpStream::connect(addr)
-                .await
-                .with_context(|| format!("connecting to egress {addr}"))?;
-            let mut preface = [0u8; 88];
-            preface[..4].copy_from_slice(&EGRESS_MAGIC);
-            preface[4..6].copy_from_slice(&dc_id.to_le_bytes());
-            preface[8..24].copy_from_slice(&token);
-            preface[24..88].copy_from_slice(&dc.header);
-            stream.write_all(&preface).await.context("writing MTV2 preface")?;
-            let mut ack = [0u8; 1];
-            stream.read_exact(&mut ack).await.context("reading MTV2 ACK")?;
-            ensure!(ack[0] == EGRESS_ACK_OK, "egress returned negative ACK for DC {dc_id}");
-            wire::crypt(&mut dc.encrypt, &mut req_frame);
-            stream.write_all(&req_frame).await.context("sending req_pq_multi")?;
-
-            let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).await.context("reading DC frame length")?;
-            wire::crypt(&mut dc.decrypt, &mut len_buf);
-            let frame_len = (u32::from_le_bytes(len_buf) & 0x7fff_ffff) as usize;
-            ensure!((40..=4096).contains(&frame_len), "unexpected DC frame length {frame_len}");
-            let mut payload = vec![0u8; frame_len];
-            stream.read_exact(&mut payload).await.context("reading DC resPQ payload")?;
-            wire::crypt(&mut dc.decrypt, &mut payload);
-            validate_res_pq_payload(&payload, &nonce)?;
-            return Ok(started.elapsed().as_millis() as u64);
-        }
-
-        let secrets = cfg.secrets()?;
-        let secret = &secrets[0].key;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let (hello_rec, client_random, client_session) =
-            wire::build_client_hello(secret, &cfg.sni, now, &mut rand::rngs::OsRng)?;
-
-        let mut stream = TcpStream::connect(addr)
-            .await
-            .with_context(|| format!("connecting to proxy {addr}"))?;
-        stream.write_all(&hello_rec).await.context("writing FakeTLS ClientHello")?;
-
-        let mut flight = Vec::new();
-        for expected_kind in [0x16u8, 0x14u8, 0x17u8] {
-            let (kind, raw) = read_tls_record_raw(&mut stream).await?;
-            ensure!(
-                kind == expected_kind,
-                "unexpected ServerHello flight record kind 0x{kind:02x} (expected 0x{expected_kind:02x})"
-            );
-            flight.extend_from_slice(&raw);
-        }
-        wire::verify_server_flight(secret, &client_random, &client_session, &flight)?;
-
-        let (init_hdr, mut encrypt, mut decrypt) = wire::build_client_init(secret, dc_id)?;
-        wire::crypt(&mut encrypt, &mut req_frame);
-        let mut combined = Vec::with_capacity(init_hdr.len() + req_frame.len());
-        combined.extend_from_slice(&init_hdr);
-        combined.extend_from_slice(&req_frame);
-        let app_rec = wire::record(0x17, &combined)?;
-        stream.write_all(&app_rec).await.context("writing obfuscated2 init + req_pq_multi")?;
-
-        let mut tls_reader = TlsReader::default();
-        let mut len_buf = [0u8; 4];
-        let mut off = 0;
-        while off < 4 {
-            let n = tls_reader.read_into(&mut stream, &mut len_buf[off..]).await?;
-            ensure!(n > 0, "EOF before Telegram DC reply length");
-            off += n;
-        }
-        wire::crypt(&mut decrypt, &mut len_buf);
-        let frame_len = (u32::from_le_bytes(len_buf) & 0x7fff_ffff) as usize;
-        ensure!((40..=4096).contains(&frame_len), "unexpected Telegram reply frame length {frame_len}");
-        let mut payload = vec![0u8; frame_len];
-        let mut p_off = 0;
-        while p_off < frame_len {
-            let n = tls_reader.read_into(&mut stream, &mut payload[p_off..]).await?;
-            ensure!(n > 0, "EOF before Telegram resPQ payload");
-            p_off += n;
-        }
-        wire::crypt(&mut decrypt, &mut payload);
-        validate_res_pq_payload(&payload, &nonce)?;
-        Ok(started.elapsed().as_millis() as u64)
-    })
-    .await
-    .context("probe_telegram_timeout")?
-}
-
-#[cfg(test)]
-fn lookup_dc_addr(dcs: &HashMap<i16, SocketAddr>, dc_id: i16) -> Option<SocketAddr> {
-    lookup_dc_candidates(dcs, dc_id, 0).into_iter().next()
-}
-
-fn lookup_dc_candidates(dcs: &HashMap<i16, SocketAddr>, dc_id: i16, seq: usize) -> Vec<SocketAddr> {
-    let std_dc2 = SocketAddr::from(([149, 154, 167, 51], 443));
-    let std_dc2_media = SocketAddr::from(([149, 154, 167, 151], 443));
-    let std_dc2_alt = SocketAddr::from(([149, 154, 167, 220], 443));
-    let std_dc4 = SocketAddr::from(([149, 154, 167, 91], 443));
-    let std_dc4_media = SocketAddr::from(([149, 154, 166, 120], 443));
-    let std_dc4_alt = SocketAddr::from(([149, 154, 167, 92], 443));
-
-    if let Some(&addr) = dcs.get(&dc_id) {
-        let mut out = vec![addr];
-        if dc_id == 2 && addr == std_dc2 {
-            out.push(std_dc2_alt);
-        } else if dc_id == -2 && addr == std_dc2_media {
-            if seq % 2 == 1 {
-                out = vec![std_dc2_alt, std_dc2_media, std_dc2];
-            } else {
-                out.push(std_dc2_alt);
-                out.push(std_dc2);
-            }
-        } else if dc_id == 4 && addr == std_dc4 {
-            out.push(std_dc4_alt);
-        } else if dc_id == -4 && addr == std_dc4_media {
-            if seq % 2 == 1 {
-                out = vec![std_dc4_alt, std_dc4_media, std_dc4];
-            } else {
-                out.push(std_dc4_alt);
-                out.push(std_dc4);
-            }
-        }
-        return out;
-    }
-    let Some(&base) = dcs.get(&dc_id.abs()) else {
-        return Vec::new();
-    };
-    // When using the default production signaling DCs, route negative media DC requests (-2, -4)
-    // across Telegram's dedicated media DC endpoints with automatic failover unless overridden.
-    if dc_id == -2 && base == std_dc2 {
-        return if seq % 2 == 1 {
-            vec![std_dc2_alt, std_dc2_media, std_dc2]
-        } else {
-            vec![std_dc2_media, std_dc2_alt, std_dc2]
-        };
-    }
-    if dc_id == -4 && base == std_dc4 {
-        return if seq % 2 == 1 {
-            vec![std_dc4_alt, std_dc4_media, std_dc4]
-        } else {
-            vec![std_dc4_media, std_dc4_alt, std_dc4]
-        };
-    }
-    vec![base]
-}
-
-async fn connect_dc_candidates(
-    candidates: &[SocketAddr],
-    handshake: Duration,
-) -> Result<TcpStream> {
-    ensure!(!candidates.is_empty(), "DC not configured");
-    if candidates.len() == 1 {
-        let stream = timeout(handshake, TcpStream::connect(candidates[0]))
-            .await
-            .context("dc_connect_timeout")?
-            .context("dc_connect_failed")?;
-        configure_tcp_socket(&stream)?;
-        return Ok(stream);
-    }
-    let per_try = (handshake / (candidates.len() as u32))
-        .max(Duration::from_millis(200))
-        .min(Duration::from_millis(1500));
-    timeout(handshake, async {
-        let mut last_err = None;
-        for &addr in candidates {
-            match timeout(per_try, TcpStream::connect(addr)).await {
-                Ok(Ok(stream)) => {
-                    configure_tcp_socket(&stream)?;
-                    return Ok(stream);
-                }
-                Ok(Err(err)) => last_err = Some(anyhow::Error::from(err)),
-                Err(_) => last_err = Some(anyhow::anyhow!("dc_connect_timeout")),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("dc_connect_failed")))
-            .context("dc_connect_failed")
-    })
-    .await
-    .context("dc_connect_timeout")?
-}
-
-async fn connect_upstream(
-    state: &State,
-    dc_id: i16,
-    dc_header: &[u8; 64],
-) -> Result<(TcpStream, &'static str)> {
-    use std::sync::atomic::Ordering::Relaxed;
-    if state.egress_upstreams.is_empty() {
-        let seq = state.egress_rr.fetch_add(1, Relaxed);
-        let candidates = lookup_dc_candidates(&state.dcs, dc_id, seq);
-        let mut upstream = connect_dc_candidates(&candidates, state.handshake).await?;
-        timeout(state.handshake, upstream.write_all(dc_header)).await??;
-        state
-            .counters
-            .upstream_tx_bytes
-            .fetch_add(dc_header.len() as u64, Relaxed);
-        return Ok((upstream, "direct"));
-    }
-    let count = state.egress_upstreams.len();
-    let start = match state.egress_strategy {
-        EgressStrategy::Ordered => 0,
-        EgressStrategy::RoundRobin => state.egress_rr.fetch_add(1, Relaxed),
-    };
-    let per_try = (state.handshake / (count as u32).max(1))
-        .max(Duration::from_millis(150))
-        .min(Duration::from_secs(2));
-    let dc_abs = dc_id.abs();
-    let ordered = state.egress_strategy == EgressStrategy::Ordered;
-    timeout(state.handshake, async {
-        let mut last_err = None;
-        for offset in 0..count {
-            let idx = (start + offset) % count;
-            let claim = if ordered {
-                let Some(c) = EgressHealth::try_claim(&state.egress_health, idx, dc_abs, Instant::now()) else {
-                    continue;
-                };
-                Some(c)
-            } else {
-                None
-            };
-            let addr = state.egress_upstreams[idx];
-            enum AttemptErr {
-                Node(anyhow::Error),
-                Dc(anyhow::Error),
-            }
-            let attempt = timeout(per_try, async {
-                let mut upstream = TcpStream::connect(addr)
-                    .await
-                    .map_err(|e| AttemptErr::Node(e.into()))?;
-                configure_tcp_socket(&upstream).map_err(AttemptErr::Node)?;
-                let mut preface = [0u8; 88];
-                preface[..4].copy_from_slice(&EGRESS_MAGIC);
-                preface[4..6].copy_from_slice(&dc_id.to_le_bytes());
-                preface[8..24].copy_from_slice(&state.egress_token);
-                preface[24..88].copy_from_slice(dc_header);
-                upstream
-                    .write_all(&preface)
-                    .await
-                    .map_err(|e| AttemptErr::Node(e.into()))?;
-                state
-                    .counters
-                    .upstream_tx_bytes
-                    .fetch_add(preface.len() as u64, Relaxed);
-                let mut ack = [0u8; 1];
-                upstream
-                    .read_exact(&mut ack)
-                    .await
-                    .map_err(|e| AttemptErr::Node(e.into()))?;
-                state
-                    .counters
-                    .upstream_rx_bytes
-                    .fetch_add(ack.len() as u64, Relaxed);
-                if ack[0] == EGRESS_ACK_OK {
-                    Ok(upstream)
-                } else if ack[0] == EGRESS_ACK_ERR {
-                    Err(AttemptErr::Dc(anyhow::anyhow!(
-                        "egress DC {dc_abs} unreachable (negative ACK)"
-                    )))
-                } else {
-                    Err(AttemptErr::Node(anyhow::anyhow!(
-                        "egress upstream invalid ACK byte"
-                    )))
-                }
-            })
-            .await;
-            match attempt {
-                Ok(Ok(upstream)) => {
-                    if let Some(c) = claim {
-                        c.record_success();
-                    }
-                    let (healthy, total) =
-                        EgressHealth::set_node_availability(&state.egress_health, idx, true);
-                    let (next_state, reason, active_override) = if ordered {
-                        if idx == 0 {
-                            (
-                                EdgeRouteState::PrimaryOk,
-                                "primary_recovered".to_string(),
-                                Some(addr),
-                            )
-                        } else {
-                            (
-                                EdgeRouteState::FailoverBackup(idx),
-                                last_err
-                                    .as_ref()
-                                    .map(|e| format!("{e:#}"))
-                                    .unwrap_or_else(|| "primary_in_cooldown".to_string()),
-                                Some(addr),
-                            )
-                        }
-                    } else if healthy == total {
-                        (
-                            EdgeRouteState::PrimaryOk,
-                            "all_egress_recovered".to_string(),
-                            Some(addr),
-                        )
-                    } else {
-                        (
-                            EdgeRouteState::Degraded { healthy, total },
-                            last_err
-                                .as_ref()
-                                .map(|e| format!("{e:#}"))
-                                .unwrap_or_else(|| "egress_node_unavailable".to_string()),
-                            Some(addr),
-                        )
-                    };
-                    if let Some(ev) = EgressHealth::transition_route_state(
-                        &state.egress_health,
-                        next_state,
-                        &state.egress_upstreams,
-                        reason,
-                        state.egress_strategy,
-                        active_override,
-                    ) {
-                        emit_edge_route_alert(state, ev);
-                    }
-                    return Ok((upstream, "egress"));
-                }
-                Ok(Err(AttemptErr::Dc(err))) => {
-                    if let Some(c) = claim {
-                        c.record_dc_failure(state.egress_cooldown);
-                    }
-                    EgressHealth::set_node_availability(&state.egress_health, idx, false);
-                    last_err = Some(err);
-                }
-                Ok(Err(AttemptErr::Node(err))) => {
-                    if let Some(c) = claim {
-                        c.record_node_failure(state.egress_cooldown);
-                    }
-                    EgressHealth::set_node_availability(&state.egress_health, idx, false);
-                    last_err = Some(err);
-                }
-                Err(_) => {
-                    if let Some(c) = claim {
-                        c.record_node_failure(state.egress_cooldown);
-                    }
-                    EgressHealth::set_node_availability(&state.egress_health, idx, false);
-                    last_err = Some(anyhow::anyhow!("egress_connect_timeout"));
-                }
-            }
-        }
-        let err = last_err
-            .unwrap_or_else(|| anyhow::anyhow!("all egress upstreams in cooldown or unavailable"));
-        if let Some(ev) = EgressHealth::transition_route_state(
-            &state.egress_health,
-            EdgeRouteState::AllDown,
-            &state.egress_upstreams,
-            format!("{err:#}"),
-            state.egress_strategy,
-            None,
-        ) {
-            emit_edge_route_alert(state, ev);
-        }
-        Err(err).context("egress_connect_failed")
-    })
-    .await
-    .context("egress_budget_timeout")?
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn serve_egress(
-    listener: TcpListener,
-    dcs: Arc<HashMap<i16, SocketAddr>>,
-    egress_token: [u8; 16],
-    max_connections: usize,
-    handshake: Duration,
-    idle: Duration,
-    drain: Duration,
-    counters: Arc<telemetry::Counters>,
-    shutdown: impl std::future::Future<Output = ()>,
-) -> Result<()> {
-    let permits = Arc::new(Semaphore::new(max_connections));
-    let mut tasks = tokio::task::JoinSet::new();
-    tokio::pin!(shutdown);
-    loop {
-        while tasks.try_join_next().is_some() {}
-        let permit = tokio::select! {
-            permit = permits.clone().acquire_owned() => permit?,
-            _ = &mut shutdown => break,
-        };
-        let (mut edge, _) = tokio::select! {
-            accepted = listener.accept() => accepted?,
-            _ = &mut shutdown => break,
-        };
-        let dcs = dcs.clone();
-        let counters = counters.clone();
-        tasks.spawn(async move {
-            let _permit = permit;
-            let mut session = telemetry::Session::new(&counters);
-            let res = egress_connection(&mut edge, &dcs, &egress_token, handshake, idle, &counters).await;
-            session.finish(&res);
-        });
-    }
-    drop(listener);
-    if timeout(drain, async {
-        while tasks.join_next().await.is_some() {}
-    })
-    .await
-    .is_err()
-    {
-        tasks.shutdown().await;
-    }
-    Ok(())
-}
-
-async fn egress_connection(
-    edge: &mut TcpStream,
-    dcs: &HashMap<i16, SocketAddr>,
-    expected_token: &[u8; 16],
-    handshake: Duration,
-    idle: Duration,
-    counters: &telemetry::Counters,
-) -> Result<()> {
-    use std::sync::atomic::Ordering::Relaxed;
-    configure_tcp_socket(edge)?;
-    let mut hdr = [0u8; 24];
-    timeout(handshake, edge.read_exact(&mut hdr))
-        .await
-        .context("egress_header_timeout")?
-        .context("egress_header_eof")?;
-    counters
-        .downstream_rx_bytes
-        .fetch_add(hdr.len() as u64, Relaxed);
-    ensure!(hdr[..4] == EGRESS_MAGIC, "invalid egress magic");
-    let token: [u8; 16] = hdr[8..24].try_into()?;
-    ensure!(ct_eq_16(&token, expected_token), "egress token mismatch");
-    let raw_dc_id = i16::from_le_bytes([hdr[4], hdr[5]]);
-    if raw_dc_id == 0 {
-        let mut tail = [0u8; 64];
-        timeout(handshake, edge.read_exact(&mut tail))
-            .await
-            .context("egress_ping_tail_timeout")?
-            .context("egress_ping_tail_eof")?;
-        counters
-            .downstream_rx_bytes
-            .fetch_add(tail.len() as u64, Relaxed);
-        timeout(handshake, edge.write_all(&[EGRESS_ACK_OK])).await??;
-        counters.downstream_tx_bytes.fetch_add(1, Relaxed);
-        let _ = edge.shutdown().await;
-        return Ok(());
-    }
-    let seq = counters.active.load(Relaxed) as usize;
-    let candidates = lookup_dc_candidates(dcs, raw_dc_id, seq);
-    if candidates.is_empty() {
-        if edge.write_all(&[EGRESS_ACK_ERR]).await.is_ok() {
-            counters.downstream_tx_bytes.fetch_add(1, Relaxed);
-        }
-        let _ = edge.shutdown().await;
-        bail!("DC not configured on egress");
-    }
-    let mut dc = match connect_dc_candidates(&candidates, handshake).await {
-        Ok(stream) => stream,
-        Err(_) => {
-            if edge.write_all(&[EGRESS_ACK_ERR]).await.is_ok() {
-                counters.downstream_tx_bytes.fetch_add(1, Relaxed);
-            }
-            let _ = edge.shutdown().await;
-            bail!("dc_connect_failed");
-        }
-    };
-    timeout(handshake, edge.write_all(&[EGRESS_ACK_OK])).await??;
-    counters.downstream_tx_bytes.fetch_add(1, Relaxed);
-    let edge_fd = stream_raw_fd(edge);
-    let dc_fd = stream_raw_fd(&dc);
-    let (er, ew) = edge.split();
-    let (dr, dw) = dc.split();
-    tokio::try_join!(
-        counted_copy(
-            er,
-            dw,
-            idle,
-            &counters.downstream_rx_bytes,
-            &counters.upstream_tx_bytes,
-            dc_fd,
-            &counters.upstream_retrans_segs,
-        ),
-        counted_copy(
-            dr,
-            ew,
-            idle,
-            &counters.upstream_rx_bytes,
-            &counters.downstream_tx_bytes,
-            edge_fd,
-            &counters.downstream_retrans_segs,
-        ),
-    )?;
-    Ok(())
 }
 
 #[cfg(test)]

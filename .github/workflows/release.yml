@@ -2,8 +2,6 @@ name: Release
 
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -23,7 +21,7 @@ concurrency:
 
 jobs:
   release:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.announce_tag == '' }}
+    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.publish_img.outputs.tag }}
@@ -35,8 +33,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.100.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy
 
@@ -45,32 +43,23 @@ jobs:
           cargo test --workspace --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Resolve candidate release version
+      - name: Resolve release version from pushed tag
         id: ver
         run: |
           git fetch origin main --tags --force
           repo_lower=$(printf '%s' "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
           echo "repo_lower=${repo_lower}" >> "$GITHUB_OUTPUT"
 
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            tag="${GITHUB_REF_NAME}"
-            is_new="false"
-          else
-            read -r tag is_new < <(python3 - "$GITHUB_SHA" <<'PY'
-          import subprocess, sys
+          tag="${GITHUB_REF_NAME}"
+          python3 - "${tag}" <<'PY'
+          import sys
           sys.path.insert(0, "deploy")
           import setup
-          sha = sys.argv[1]
-          sha_tags = subprocess.check_output(["git", "tag", "--points-at", sha], text=True).splitlines()
-          all_tags = subprocess.check_output(["git", "tag"], text=True).splitlines()
-          tag, is_new = setup.resolve_commit_release_tag(sha_tags, all_tags, min_alpha=5)
-          print(tag, "true" if is_new else "false")
+          if setup.parse_semver_tag(sys.argv[1]) is None:
+              raise SystemExit(f"Unsupported release tag: {sys.argv[1]}")
           PY
-            )
-          fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "is_new=${is_new}" >> "$GITHUB_OUTPUT"
-          echo "Resolved tag=${tag} (is_new=${is_new}) for commit ${GITHUB_SHA}"
+          echo "Resolved tag=${tag} for commit ${GITHUB_SHA}"
 
       - name: Build and test release Docker image
         id: build
@@ -94,7 +83,7 @@ jobs:
           test "${oci_ver}" = "${tag}"
           test "${oci_rev}" = "${GITHUB_SHA}"
 
-          MTEVIL_TEST_IMAGE="${local_img}" MTEVIL_REQUIRE_ALL_TESTS=1 python3 deploy/test_setup.py
+          MTEVIL_TEST_IMAGE="${local_img}" MTEVIL_REQUIRE_ALL_TESTS=1 python3 deploy/run_tests.py
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -103,59 +92,34 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Allocate tag and push GHCR images
+      - name: Push GHCR images
         id: publish_img
         run: |
           repo_lower="${{ steps.ver.outputs.repo_lower }}"
           tag="${{ steps.ver.outputs.tag }}"
-          is_new="${{ steps.ver.outputs.is_new }}"
-          built_img="ghcr.io/${repo_lower}:${tag}"
-
-          if [ "${is_new}" = "true" ]; then
-            while true; do
-              if git tag "${tag}" "${GITHUB_SHA}" 2>/dev/null && git push origin "refs/tags/${tag}"; then
-                break
-              fi
-              git tag -d "${tag}" 2>/dev/null || true
-              git fetch origin --tags --force
-              read -r tag is_new < <(python3 - "$GITHUB_SHA" <<'PY'
-          import subprocess, sys
-          sys.path.insert(0, "deploy")
-          import setup
-          sha = sys.argv[1]
-          sha_tags = subprocess.check_output(["git", "tag", "--points-at", sha], text=True).splitlines()
-          all_tags = subprocess.check_output(["git", "tag"], text=True).splitlines()
-          tag, is_new = setup.resolve_commit_release_tag(sha_tags, all_tags, min_alpha=5)
-          print(tag, "true" if is_new else "false")
-          PY
-              )
-              if [ "${is_new}" = "false" ]; then
-                break
-              fi
-            done
-          fi
-
           final_img="ghcr.io/${repo_lower}:${tag}"
-          if [ "${final_img}" != "${built_img}" ]; then
-            docker build \
-              --build-arg MTEVIL_VERSION="${tag}" \
-              --build-arg MTEVIL_REVISION="${GITHUB_SHA}" \
-              -t "${final_img}" \
-              .
-          fi
 
           sha_img="ghcr.io/${repo_lower}:sha-${GITHUB_SHA}"
           docker tag "${final_img}" "${sha_img}"
           docker push "${final_img}"
           docker push "${sha_img}"
 
-          # Update :main only if GITHUB_SHA is not behind origin/main.
-          git fetch origin main
-          origin_main_sha="$(git rev-parse origin/main)"
-          if git merge-base --is-ancestor "${origin_main_sha}" "${GITHUB_SHA}"; then
-            main_img="ghcr.io/${repo_lower}:main"
-            docker tag "${final_img}" "${main_img}"
-            docker push "${main_img}"
+          # Update :main only if GITHUB_SHA is not behind origin/main and tag is stable.
+          is_pre="$(python3 - "${tag}" <<'PY'
+          import sys
+          sys.path.insert(0, "deploy")
+          import setup
+          print("true" if setup.is_prerelease_tag(sys.argv[1]) else "false")
+          PY
+          )"
+          if [ "${is_pre}" = "false" ]; then
+            git fetch origin main
+            origin_main_sha="$(git rev-parse origin/main)"
+            if git merge-base --is-ancestor "${origin_main_sha}" "${GITHUB_SHA}"; then
+              main_img="ghcr.io/${repo_lower}:main"
+              docker tag "${final_img}" "${main_img}"
+              docker push "${main_img}"
+            fi
           fi
 
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
@@ -177,29 +141,20 @@ jobs:
           cp deploy/mtevilctl dist/mtevilctl
           (cd dist && sha256sum install.sh setup.py mtevilctl > SHA256SUMS)
 
-          latest_flag="$(python3 - "${tag}" <<'PY'
+          read -r prerelease_flag latest_flag < <(python3 - "${tag}" <<'PY'
           import json, subprocess, sys
           sys.path.insert(0, "deploy")
           import setup
           tag = sys.argv[1]
-          target_key = setup.parse_semver_tag(tag)
           raw = subprocess.check_output(
-              ["gh", "release", "list", "--limit", "100", "--json", "tagName,isDraft"],
+              ["gh", "release", "list", "--limit", "100", "--json", "tagName,isDraft,isPrerelease"],
               text=True,
           )
           published = json.loads(raw)
-          is_newest = True
-          if target_key is not None:
-              for rel in published:
-                  if rel.get("isDraft"):
-                      continue
-                  other_key = setup.parse_semver_tag(str(rel.get("tagName") or ""))
-                  if other_key is not None and other_key > target_key:
-                      is_newest = False
-                      break
-          print("--latest" if is_newest else "")
+          pre_flag, lat_flag = setup.compute_release_publish_flags(tag, published)
+          print(pre_flag, lat_flag)
           PY
-          )"
+          )
 
           if gh release view "${tag}" >/dev/null 2>&1; then
             is_draft="$(gh release view "${tag}" --json isDraft -q .isDraft)"
@@ -217,15 +172,19 @@ jobs:
               fi
             done
             if [ "${is_draft}" = "true" ]; then
-              gh release edit "${tag}" --draft=false --prerelease=false ${latest_flag}
+              gh release edit "${tag}" --draft=false "${prerelease_flag}" "${latest_flag}"
             fi
           else
+            notes_args=(--generate-notes)
+            if [ -f "docs/releases/${tag}.md" ]; then
+              notes_args=(--notes-file "docs/releases/${tag}.md")
+            fi
             gh release create "${tag}" dist/install.sh dist/setup.py dist/mtevilctl dist/SHA256SUMS \
               --target "${GITHUB_SHA}" \
               --title "${tag}" \
-              --generate-notes \
+              "${notes_args[@]}" \
               --draft
-            gh release edit "${tag}" --draft=false --prerelease=false ${latest_flag}
+            gh release edit "${tag}" --draft=false "${prerelease_flag}" "${latest_flag}"
           fi
 
           dl_dir="$(mktemp -d)"

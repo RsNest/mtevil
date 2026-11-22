@@ -282,10 +282,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mtevil-control"
-version = "0.0.0"
-
-[[package]]
 name = "mtevil-data-plane"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -294,6 +290,8 @@ dependencies = [
  "clap",
  "hex",
  "hmac",
+ "mtevil-egress",
+ "mtevil-guard",
  "mtevil-proto",
  "rand",
  "serde",
@@ -306,11 +304,18 @@ dependencies = [
 
 [[package]]
 name = "mtevil-egress"
-version = "0.0.0"
+version = "0.1.0"
+dependencies = [
+ "rand",
+]
 
 [[package]]
 name = "mtevil-guard"
-version = "0.0.0"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tokio",
+]
 
 [[package]]
 name = "mtevil-harness"
@@ -323,10 +328,6 @@ dependencies = [
  "serde_json",
  "sha2",
 ]
-
-[[package]]
-name = "mtevil-me-pool"
-version = "0.0.0"
 
 [[package]]
 name = "mtevil-proto"

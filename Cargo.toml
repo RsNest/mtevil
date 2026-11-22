@@ -1,21 +1,20 @@
 [workspace]
 resolver = "2"
+exclude = ["fuzz"]
 members = [
     "crates/harness",
     "crates/proto",
     "crates/data-plane",
-    "crates/me-pool",
     "crates/egress",
-    "crates/control",
     "crates/guard",
 ]
 
-# Порядок в members отражает структуру ADR-000 §14.1.
-# ADR-001 authorizes a test-only own-core prototype in proto/data-plane.
-# Full Phase 0 and production gates remain open; see docs/specs/prototype.md.
+# Рабочие крейты: proto (wire-кодеки), guard (replay-кэш), egress (failover backoff/jitter),
+# data-plane (бинарник mtevil: direct/edge/egress), harness (тестовый стенд и валидатор отчётов).
 
 [workspace.package]
 edition = "2021"
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

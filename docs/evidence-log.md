@@ -945,3 +945,175 @@ wire-точность. Перебор высоких портов сгорает
 | Публикация стабильного `v0.1.0` | PASS | Тег `v0.1.0` на проверенном коммите `ffa5773`, workflow `#44706563797` — `success`, GitHub Latest = `v0.1.0`, ассеты `install.sh`, `setup.py`, `mtevilctl`, образ `ghcr.io/rsnest/mtevil:v0.1.0` |
 
 Область поддержки `v0.1.0`: Linux (`x86_64`) и IPv4 (`direct` и `edge → egress`). Сквозной IPv6 не проверялся и не заявляется.
+
+
+## 2026-11-21 · Baseline @ v0.1.5 (b2327a2) и Фаза 0 / T1: устойчивый accept-цикл (`F-15`)
+
+- **Baseline (`main @ b2327a2`, `rustc 1.100.0`):**
+  - `cargo test --workspace --locked`: 69 passed (`48` data-plane, `11` harness, `10` proto), 0 failed.
+  - `cargo clippy --workspace --all-targets --locked -- -D warnings`: 0 warnings.
+  - `deploy/failover_bench.py` («до», Linux 4 vCPU Xeon E5-2698 v4, изолированный стенд `edge -> 2x egress` на `ghcr.io/rsnest/mtevil:v0.1.5`):
+    - Warmup (5 клиентов, оба `egress` работают): `reconnected_ok = 5/5`, `wave_total_ms = 2345.2`, `p50 = 2140.9 ms`, `p95 = 2332.0 ms`, `max = 2332.0 ms`.
+    - Failover (30 клиентов через `docker compose exec`, основной `egress` убит `docker kill`): `reconnected_ok = 30/30`, `failed = 0`, `wave_total_ms = 15891.6`, `p50 = 13385.7 ms`, `p95 = 15780.4 ms`, `max = 15789.9 ms`, память `edge`: `1.449 MiB -> 3.113 MiB`.
+- **T1 (`F-15`, accept-цикл в `serve` и `serve_egress`):**
+  - Добавлен трейт `Acceptor`, классификатор `classify_accept_error` и `AcceptLoopState` с экспоненциальным backoff `10 мс -> 1 с` (сброс до `10 мс` после успешного `accept`), rate-limited логированием `accept_error` (не чаще 1/с на каждый `kind` с подсчётом `suppressed`) и счётчиками `Counters::accept_errors` по видам (`emfile`, `enfile`, `enobufs`, `enomem`, `connection_aborted`, `connection_reset`, `interrupted`, `would_block`, `fatal`, `other`).
+  - Тест `accept_loop_survives_emfile_and_econnaborted_bursts_and_shuts_down_cleanly` подтверждает выживание `serve` и `serve_egress` после серии `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM`/`ECONNABORTED`, приём последующих соединений, корректный graceful shutdown и остановку только на фатальной ошибке слушающего сокета (`EBADF`).
+- **T2 (`F-15`, бюджет FD и `RLIMIT_NOFILE`):**
+  - На старте читается `/proc/self/limits` (`Max open files`), вычисляется `effective_max = min(max_connections, (nofile - 128) / 2)` (fail-fast при `effective_max < 16`), в событие `startup` пишутся `max_connections`, `effective_max_connections` и `rlimit_nofile`.
+  - В `deploy/setup.py` (`render_compose`) лимит `ulimits.nofile` рассчитывается как `max(4096, max_connections * 2 + 512)`.
+  - Тесты `fd_budget_clamps_effective_max_connections_and_fails_fast_below_16` и `test_render_compose_without_build` зелёные.
+
+
+## 2026-11-21 · Фаза 1 / T3: Circuit breaker для всех стратегий (`ordered` и `round-robin`, `F-23`)
+
+- В `connect_upstream` (`crates/data-plane/src/main.rs`) `EgressHealth::try_claim` включён для всех стратегий (`Ordered` и `RoundRobin`). В режиме `RoundRobin` узлы, находящиеся в cooldown, пропускаются без ожидания `per_try`, а порядок обхода сохраняет RR-смещение `(start + offset) % count`.
+- Тест `round_robin_circuit_breaker_skips_cooldown_node_and_preserves_rr_offset` подтверждает, что из 3 узлов в `RoundRobin` отказавший узел `node1` после единственной ошибки получает `0` попыток подключения на протяжении cooldown (трафик распределяется между `node0` и `node2` по RR-смещению), а после истечения cooldown и восстановления — возвращается в ротацию.
+- **T4 (`F-24`, fail-open при «все узлы в cooldown»):**
+  - Добавлен `EgressHealth::try_claim_forced_soonest`: если в основном проходе все узлы `egress` оказались в cooldown, выполняется принудительная проба узла с ближайшим сроком окончания cooldown (в пределах общего бюджета `handshake`), с защитой от шторма (не более одной принудительной пробы на узел одновременно через флаг `probing` и автоматический сброс в `Drop` у `EgressAttemptClaim`).
+  - Тест `all_nodes_in_cooldown_fail_open_forces_soonest_probe_with_storm_protection` подтверждает мгновенное восстановление трафика после кратковременного падения всех узлов без ожидания 15-секундного окна cooldown и защиту от шторма при параллельных запросах.
+- **T5 (`F-23`, экспоненциальный backoff cooldown с jitter и конфигурацией):**
+  - В `Config` и CLI добавлены `egress_cooldown_base_ms` (default `3000`, `50..=300000`) и `egress_cooldown_max_ms` (default `60000`, `>= base_ms`, `<= 600000`) с полной обратной совместимостью для существующих `config.json`.
+  - В `CooldownSlot` добавлен счётчик подряд идущих сбоев `failures`: длительность cooldown растёт `×2` за каждый подряд сбой до `egress_cooldown_max_ms` с jitter `±20%` и сбрасывается в `0` при успешном соединении. Сбои узла (TCP/timeout/invalid ACK) и сбои конкретного DC (negative ACK) ведутся раздельно.
+  - Тест `egress_cooldown_exponential_backoff_jitter_reset_and_node_vs_dc_separation` зелёный.
+- **T6 (`F-24`, управление circuit breaker из фоновых проб и ротация DC):**
+  - В `Config` и CLI добавлены `egress_probe_interval_secs` (default `30`) и `egress_probe_degraded_interval_secs` (default `5`).
+  - `monitor_edge_egress` ротирует проверяемые DC по кругу (`2, 4, -2, -4`), переключает период с `30 с` на `5 с` при наличии хотя бы одного недоступного узла, ставит cooldown при сбое фоновой пробы и автоматически снимает cooldown/счётчик сбоев при успешной пробе (failback без жертвования живым клиентом). Подтверждение алертов двумя замерами подряд сохранено.
+  - Тест `background_probe_rotates_dcs_sets_and_clears_breaker_cooldown_and_switches_interval` зелёный.
+- **T7 (`F-23`, hedged connect в стратегии `ordered`):**
+  - В `Config` и CLI добавлен `egress_hedge_ms` (default `400`, `0` = выкл, `0..=30000`).
+  - В режиме `ordered`, если основной `egress` не прислал ACK за `egress_hedge_ms`, параллельно запускается подключение к следующему доступному узлу (не более одного хеджа на соединение); побеждает первый полученный ACK, проигравшая попытка отменяется и закрывает сокет.
+  - В `Counters` добавлены счётчики `hedge_started` и `hedge_won_by_backup`. Тест `hedged_connect_starts_backup_after_hedge_ms_and_tracks_metrics` зелёный.
+
+
+## 2026-11-22 · Фаза 2 / T8: Протокол egress `MTV3` и защита `egress` (`F-31`)
+
+- В `crates/proto/src/wire.rs` добавлен протокол `MTV3` (`126` байт): `magic ("MTV3") | dc (i16 LE) | timestamp (u64 LE) | nonce (16B) | HMAC-SHA256(token, magic||dc||timestamp||nonce||dc_header) (32B) | dc_header (64B)` с constant-time проверкой (`subtle::ConstantTimeEq`) и окном `±30 с` (`EGRESS_V3_MAX_SKEW_SECS`).
+- В `Config` и CLI добавлены `egress_accept_legacy` (default `true`, сохраняет приём `MTV2` при обновлении `egress` до `edge`), `egress_use_mtv3` (default `true`), `egress_allow_from` (список CIDR, default пусто) и `egress_max_failed_per_ip` (default `16`, окно 60 с).
+- На `egress` добавлены: replay-кэш `nonce` (`16384` записи, TTL `65 с`), фильтрация источников по `egress_allow_from`, sliding-window лимит неудачных handshake на IP, отдельный семафор одновременных незавершённых handshake (`(effective_max / 4).clamp(4, 128)`) и событие `egress_public_listen_warning` при привязке не к loopback/приватному/CGNAT адресу.
+- Тесты `egress_preface_v3_builds_verifies_and_rejects_hmac_tampering_or_skew` и `egress_mtv3_verifies_hmac_rejects_replay_skew_legacy_toggle_and_security_limits` зелёные (78/78 тестов workspace).
+- **T9 (`F-22`, консистентность и отказоустойчивость персистентного replay-кэша):**
+  - В `deploy/compose.yaml` том `state:/var/lib/mtevil` приведён в соответствие с `setup.py` (смонтирован `rw` при `read_only: true` на корневой ФС контейнера), в `deploy/README.md` зафиксировано сохранение replay-кэша при перезапуске.
+  - В `crates/data-plane/src/replay.rs` добавлен `ReplayCache::load_with_status` и `ReplayLoadStatus` (`disabled | fresh | loaded | corrupted_reinitialized`): повреждённый или усечённый `replay_file` больше не валит старт прокси, а переинициализирует пустой кэш с событием `replay_table_reinitialized` и записью `persistent_replay`, `replay_load_status` и `replay_loaded_entries` в событие `startup`.
+  - Снэпшот записывается атомарно (`tmp + sync_all + rename`), а при сбое записи инкрементируется метрика `Counters::replay_flush_failed` и пишется событие `replay_flush_failed`. Тест `inv02_persistent_replay_survives_reload` проверяет как сохранение ключей через рестарт, так и чистый старт на повреждённом файле.
+- **T10 (`F-23`, конфигурируемые `dc_media_override` и фоновая самопроверка DC):**
+  - В `Config` и CLI добавлены `dc_media_override` (default: `2=149.154.167.220:443`, `-2=149.154.167.151:443`, `-2=149.154.167.220:443`, `4=149.154.167.92:443`, `-4=149.154.166.120:443`, `-4=149.154.167.92:443`) и `dc_probe_interval_secs` (default `60`, `0` = выкл).
+  - На `direct` и `egress` запускается фоновая задача `monitor_dc_reachability`, проверяющая TCP-достижимость настроенных DC раз в `60 с`, обновляющая счётчики `dc_self_check_ok` / `dc_self_check_failed` и эмитящая событие `dc_self_check` без изменения клиентской маршрутизации. Тест `dc_media_override_is_configurable_and_background_dc_self_check_leaves_routing_unchanged` зелёный (79/79 тестов workspace).
+- **T11 (`F-01`, `F-02`, `INV-04`, фоновый DNS-резолвер для `cover` с TTL-кэшем и `last-known-good`):**
+  - В `Config` и CLI добавлен `cover_dns_ttl_secs` (default `60`, `1..=86400`), в `Counters` добавлен счётчик `cover_dns_fail`.
+  - Реализован `CoverResolver` и фоновая задача `spawn_cover_resolver`: `cover()` больше не вызывает `TcpStream::connect(&String)` с блокирующим DNS на data-потоке, а берёт `SocketAddr` из `RwLock`-кэша с round-robin и сохранением `last-known-good` при ошибках и таймаутах DNS (при пустом кэше — быстрый bounded close `cover_dns_unavailable`). Тест `inv04_cover_dns_caches_and_preserves_last_known_good_on_failure_or_timeout` зелёный (80/80 тестов workspace).
+
+
+## 2026-11-22 · Фаза 3 / T12: Периодический `sample_fd_retrans` (1 с) и флаг `diagnostics`
+
+- В `Config` и CLI добавлен флаг `diagnostics: bool` (default `false`), гейтящий вызовы `timeline.mark(...)` на каждый чанк в `upload()` и `download()` (`timeline.close` сохранён для атрибуции причины закрытия).
+- В `upload()`, `download()` и `counted_copy()` опрос `sample_fd_retrans` (`getsockopt(TCP_INFO)` на Linux) переведён с вызова на каждый чанк на таймер `1 с` на сессию + обязательный финальный вызов при закрытии/ошибке записи.
+- Локальный release-замер (`bench_t12_relay_loopback_throughput`, 64 MiB через loopback `download()` с AES-CTR + FakeTLS framing): `diagnostics=true` — `71.8 мс` (`891.8 MiB/s`), `diagnostics=false` — `71.5 мс` (`895.4 MiB/s`); на Linux дополнительно устраняются ~4096 системных вызовов `getsockopt(TCP_INFO)` на каждые 64 MiB трафика.
+- Тест `diagnostics_flag_gates_timeline_marks_and_preserves_close_attribution` зелёный (81/81 тестов workspace).
+- **T13 (`F-29`, опциональный localhost-only Prometheus `/metrics`):**
+  - В `Config` и CLI добавлен `metrics_listen: Option<SocketAddr>` (выключен по умолчанию, валидация требует loopback `127.0.0.1` / `::1`).
+  - В `Counters` добавлены `egress_failover_total`, `cover_rejected`, `replay_full`, `forced_close` и метод `render_prometheus` (Prometheus text exposition `0.0.4`, без внешних HTTP-зависимостей, работает в отдельной задаче `spawn_metrics_server`).
+  - Тест `metrics_endpoint_serves_prometheus_text_and_returns_404_on_other_paths` и валидация non-loopback адреса в `config::tests` зелёные (82/82 тестов workspace).
+
+
+## 2026-11-22 · Фаза 4 / T14: Интеграционные chaos-тесты (`tests/inv/chaos_egress.rs`, `INV-10`, `F-15`, `F-23`, `F-24`, `F-29`)
+
+- Создан набор интеграционных chaos-тестов [chaos_egress.rs](../tests/inv/chaos_egress.rs) (подключён как `[[test]] name = "inv_chaos"` в `crates/data-plane/Cargo.toml`), запускающий реальный собранный бинарник `mtevil` в режиме `edge` против `FakeEgress` (с 6 режимами инъекции отказов: `refuse`, `blackhole`, `slow_ack`, `negative_ack`, `flap`, `kill_mid_session`) и локального mock Telegram DC (`req_pq_multi -> resPQ`).
+- Покрытые сценарии (4/4 тестов зелёные):
+  - `inv10_f23_chaos_ordered_failover_modes_and_failback`: отказ первичного узла в режимах `blackhole` (hedge + failover), `slow_ack`, `negative_ack`, `flap`, `kill_mid_session` и `refuse`, переключение на резервный узел и автоматический failback фоновыми пробами;
+  - `inv10_f23_chaos_round_robin_with_dead_node_zero_errors`: 3 узла в `round-robin` с одним мёртвым узлом — `0` клиентских ошибок при серии прогонов и пропуск мёртвого узла через circuit breaker;
+  - `inv10_f24_all_nodes_down_and_recovered_without_15s_gap`: падение всех узлов одновременно с последующим восстановлением — трафик восстанавливается немедленно через fail-open пробу без 15-секундного простоя;
+  - `inv10_f15_f29_process_survives_aborted_accepts_and_metrics_live`: серия оборванных подключений на `edge` — процесс остаётся живым, `/metrics` доступен, последующий `probe-telegram` проходит успешно.
+- Проверка: `cargo fmt --all`, `cargo clippy --workspace --all-targets --locked -- -D warnings` (0 предупреждений), `cargo test --workspace --locked` (**86/86** тестов зелёные).
+- **T15 (Fuzz-таргеты `cargo-fuzz` для парсеров `proto::wire`):**
+  - Добавлен каталог `fuzz/` (исключён из workspace `Cargo.toml` для совместимости со стабильным Rust) с `fuzz/Cargo.toml` и 4 fuzz-таргетами: `fuzz_client_hello` (`authenticate` / `authenticate_with_record_version` / `handshake_length`), `fuzz_proxy_v2` (`parse_proxy_v2_header` / `parse_proxy_v2_payload`), `fuzz_obfuscated2_init` (`client_transport`) и `fuzz_egress_preface` (`verify_egress_preface_v3`).
+  - Сформированы seed-корпуса в `fuzz/corpus/` из тестовых векторов `tests/vectors/prototype/` и валидных бинарных образцов PROXY v2 и MTV3.
+  - В `crates/proto/src/wire.rs` добавлен детерминированный smoke-тест `fuzz_targets_smoke_on_corpus_and_mutations` (87/87 тестов workspace зелёные).
+- **T16 (CI workflow `.github/workflows/ci.yml` и `deny.toml`):**
+  - Добавлен `.github/workflows/ci.yml` (на `push` и `pull_request`): `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` (тулчейн `1.100.0`, как в `Dockerfile`), `cargo-deny check advisories licenses`, `cargo-audit`, прогон всех 4 fuzz-таргетов по `60 с` на nightly и сборка `Dockerfile` без push.
+  - Добавлен `deny.toml` (v2) с политикой advisories/licenses/sources; `.github/workflows/release.yml` не затронут; `Dockerfile` дополнен `COPY tests/inv ./tests/inv` для корректного манифеста `inv_chaos`.
+
+
+## 2026-11-22 · Фаза 5 / T17: Модуляризация `crates/data-plane/src/main.rs`
+
+- Монолит `crates/data-plane/src/main.rs` (~4974 строки) разбит на 7 тематических модулей без изменения поведения и без единой правки в тестах (`tests.rs` не изменялся):
+  - `egress_health.rs` (circuit breaker, exponential backoff/jitter, fail-open, state tracking);
+  - `alerts.rs` (форматирование алертов, HTTP webhook, `monitor_edge_egress`);
+  - `cover.rs` (фоновый `CoverResolver` с TTL/LKG и `bounded_cover`/`cover`);
+  - `connect.rs` (`connect_upstream`, hedged connect, `dial_egress_candidate`, `dc_media_override`, `monitor_dc_reachability`, `probe_telegram_e2e`);
+  - `relay.rs` (`TlsReader`, `relay_client`, `upload`/`download`, `RelayStats`, `sample_fd_retrans`);
+  - `serve.rs` (`Acceptor`, `AcceptLoopState`, `serve`, `connection`, `spawn_metrics_server`, FD budget);
+  - `egress_server.rs` (`serve_egress_with_security`, `egress_connection`, `IpFailureTracker`).
+- Проверка: `cargo fmt --all`, `cargo clippy --workspace --all-targets --locked -- -D warnings` (0 предупреждений), `cargo test --workspace --locked` (87/87 зелёные).
+- **T18 (Приведение workspace в соответствие с фактической архитектурой):**
+  - В `crates/guard` (`mtevil-guard`) перенесён реальный `ReplayCache` (`Decision`, `ReplayLoadStatus`, персистентный снэпшот + 3 unit-теста);
+  - В `crates/egress` (`mtevil-egress`) перенесены примитивы экспоненциального backoff и jitter (`compute_egress_cooldown_unclamped_ms`, `apply_cooldown_jitter_ms`, `compute_egress_cooldown` + unit-тест);
+  - Пустые placeholder-крейты `crates/me-pool` и `crates/control` удалены из `Cargo.toml` и репозитория, `Cargo.lock` обновлён только по workspace-зависимостям;
+  - Проверка: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings` (0 предупреждений), `cargo test --workspace --locked` (**88/88** тестов зелёные).
+
+
+## 2026-11-22 · Фаза A (Linux x86_64 стенд): сравнение «до» (`v0.1.5`) и «после» (`v0.2.0-rc.1`), реальные сетевые отказы, смешанные версии и `strace -c`
+
+Среда замера «после»: изолированный Linux x86_64 стенд (`1 vCPU`, `1.9 GiB RAM`, Docker `29.1.3`, ядро `7.0.0-38-generic`), без затрагивания рабочих контейнеров.
+
+### A1. Сборка и полные тесты на Linux
+- `docker build` (`Dockerfile`, `rust:1.100.0-bookworm`): **PASS**.
+- `cargo test --workspace --locked` в контейнере сборки: **88 passed, 0 failed, 1 ignored** (ручной бенчмарк T12).
+- `MTEVIL_REQUIRE_ALL_TESTS=1 python3 -m unittest discover -s deploy -p "test_*.py" -v`: **29/29 OK** (0 пропусков).
+
+### A2. Массовое переподключение `edge -> 2x egress` (30 клиентов, `docker kill` primary)
+
+| Сценарий / режим | Версия | Ошибки | `p50` (мс) | `p95` (мс) | `max` (мс) | `wave_total` (мс) | Память `edge` |
+|---|---|---:|---:|---:|---:|---:|---|
+| `failover_bench.py` (`docker compose exec`, 4 vCPU, «до») | `v0.1.5` | 0/30 | 13385.7 | 15780.4 | 15789.9 | 15891.6 | 1.45 → 3.11 MiB |
+| `failover_bench.py` (`docker compose exec`, 1 vCPU, контроль) | `v0.1.5` | 0/30 | 13123.4 | 13799.4 | 13830.8 | 13970.9 | — |
+| `failover_bench.py` (`docker compose exec`, 1 vCPU, медиана 3 прогонов) | `v0.2.0-rc.1` | 0/90 | 12172.5 | 12710.6 | 12750.9 | 12918.0 | 1.58 → 1.75 MiB |
+| Прямая волна 30 клиентов (`mtevil probe-telegram` без оверхеда `docker exec`, медиана 3 прогонов) | `v0.2.0-rc.1` | 0/90 | **458.4** | **482.5** | **488.8** | **697.8** | — |
+
+Наблюдение: в `failover_bench.py` основной вклад (~11–12 с) на 1 vCPU вносит параллельный спавн 30 процессов `docker compose exec`; прямая волна из 30 клиентов к порту `edge` показывает реальное время переключения при `egress_hedge_ms = 400` — **`p95 = 482.5 мс`** (цель `≤ 4 с` перевыполнена в 8×).
+
+### A3. Реальные сетевые отказы (`iptables` / `tc netem` в netns контейнеров `egress`)
+
+| Сценарий | Клиенты | Доля ошибок | `p50` (мс) | `p95` (мс) | `max` (мс) | Время восстановления |
+|---|---:|---:|---:|---:|---:|---|
+| 1. Blackhole primary (`iptables DROP`, loss 100%) | 30 | 0.0% | 451.3 | 461.3 | 475.2 | hedge на 400 мс, волна 687.9 мс |
+| 2. Loss 30% + RTT +300 мс (`tc netem`) | 30 | 0.0% | 457.6 | 468.8 | 470.8 | волна 666.2 мс |
+| 3. Flap primary каждые 10 с (32 с) | 60 | 0.0% | 14.2 | 415.2 | 422.0 | без потерь клиентов |
+| 4. Оба `egress` в `DROP` 20 с → восстановление | 1-я проба после | 0.0% | — | — | — | **90.3 мс** (1-я попытка, вместо окна 15 с) |
+| 5. `round-robin` с 1 мёртвым узлом (`iptables DROP`) | 30 | 0.0% | 2042.3 | 2074.9 | 2076.8 | волна 2302.3 мс |
+
+### A4. Смешанные версии (`egress` → `edge`) и `mtevilctl update` / `rollback`
+- `(a)` Новый `egress` (`egress_accept_legacy=true`) + старый `edge` (`v0.1.5`, MTV2): **PASS** (`rtt_ms = 7`).
+- `(b)` Новый `egress` + новый `edge` (MTV3): **PASS** (`rtt_ms = 9`).
+- `(c)` Новый `egress` (`egress_accept_legacy=false`) + старый `edge` (`v0.1.5`, MTV2): **корректный отказ** с событием `{"event":"session_error","details":{"reason":"egress legacy MTV2 disabled"}}`.
+- `(d)` `mtevilctl update` с инъекцией сбоя пробы (`v0.1.5 → v0.2.0-rc.2`): 3 сбоя пробы → **автооткат на `v0.1.5`** (проба после отката `17 мс`); чистое обновление `v0.1.5 → v0.2.0-rc.1`: **PASS** (`8 мс`); ручной `mtevilctl rollback → v0.1.5`: **PASS** (`31 мс`).
+
+### A5. Бенчмарк T12 на Linux (`strace -c -f -e trace=getsockopt`)
+
+| Нагрузка | Версия / режим | `getsockopt` вызовов | CPU (`user+sys`, мс) | Время (мс) | Скорость (MiB/s) |
+|---|---|---:|---:|---:|---:|
+| 64 MiB loopback (1 поток, `strace -c`) | `v0.1.5` («до») | **4395** | 370.0 | 880.3 | 72.7 |
+| 64 MiB loopback (1 поток, `strace -c`) | `v0.2.0-rc.1` (`diagnostics=true`) | **4** (−99.9%) | 230.0 | 545.9 | 117.2 |
+| 64 MiB loopback (1 поток, `strace -c`) | `v0.2.0-rc.1` (`diagnostics=false`) | **4** (−99.9%) | 320.0 | 742.4 | 86.2 |
+| 100 параллельных потоков × 512 KiB (50 MiB, `strace -c`) | `v0.1.5` («до») | **3839** | 420.0 | 1158.7 | 43.2 |
+| 100 параллельных потоков × 512 KiB (50 MiB, `strace -c`) | `v0.2.0-rc.1` (`diagnostics=true`) | **301** (−92.2%) | 380.0 | 1022.7 | 48.9 |
+| 100 параллельных потоков × 512 KiB (50 MiB, `strace -c`) | `v0.2.0-rc.1` (`diagnostics=false`) | **301** (−92.2%) | 400.0 | 1173.1 | 42.6 |
+| Rust release `bench_t12_relay_loopback_throughput` (64 MiB, без `strace`) | `diagnostics=true` / `false` | — | — | 245.0 / 242.6 | 261.2 / 263.9 |
+
+
+## 2026-11-22 · Фаза E (`release-prep-v0.2 @ a151ab8`): `state:ro` lifecycle (E1) и честный A/B-замер `v0.1.5` vs `rc.1` (E3/E4)
+
+- **Актуальные счётчики тестов (`a151ab8`):** `101` Rust-тест (`69` data-plane + `4` chaos + `1` egress + `4` guard + `11` harness + `12` proto; `0` failed, `2` ignored manual bench/stress), `30` тестов `deploy/test_setup.py`.
+- **E1 (`state:ro` + отдельный `replay`-том `/var/lib/mtevil-replay` на Linux-стенде):**
+  - В `compose.yaml` подтверждены `- state:/var/lib/mtevil:ro` и `- replay:/var/lib/mtevil-replay`; попытка записи из работающего контейнера в `/var/lib/mtevil` завершается ошибкой (read-only).
+  - `mtevilctl user add alice` (запись через `init` с `--entrypoint /usr/local/bin/mtevil`), `mtevilctl user list` (`alice` виден), горячая перезагрузка `users.json` без рестарта контейнера (`users_reloaded` в логе, `StartedAt` контейнера не изменился), `mtevil stats` и `mtevilctl status` (читают `/var/lib/mtevil-replay/runtime-stats.json`), `mtevilctl sni ya.ru`, `mtevilctl user del alice` и сквозная проба после `docker restart` — **все 16 проверок PASS**.
+- **E3/E4 — Честный A/B `v0.1.5` vs `rc.1` в одной методике (прямая волна 30 клиентов, без `docker exec`, медиана и min–max):**
+
+| Сценарий (`edge → 2× egress`, 30 клиентов) | Прогоны | `v0.1.5` `p50` (мс) | `v0.1.5` `p95` (мс) | `rc.1` `p50` (мс) | `rc.1` `p95` (мс) | Ошибки |
+|---|---:|---|---|---|---|---|
+| Baseline healthy (harness + Telegram overhead) | 3 | 143.0 (106.9–167.2) | 193.0 (128.9–241.4) | 124.1 (118.0–168.5) | 158.5 (145.0–241.1) | 0 / 0 |
+| `docker kill` primary (`ordered`) | 5 | 2078.6 (2063.7–2091.9) | 2126.0 (2079.8–2156.2) | **366.9** (323.4–412.3) | **517.8** (466.0–532.9) | 0 / 0 |
+| Blackhole primary (`iptables DROP`, loss 100%) | 5 | 2060.0 (2047.6–2075.7) | 2076.3 (2056.3–2103.0) | **349.7** (314.1–374.6) | **459.3** (441.0–491.3) | 0 / 0 |
+| Loss 30% + RTT +300 мс (`tc netem`) | 5 | 2368.7 (2088.1–2555.9) | 5113.5 (4165.1–5830.0) | **335.0** (310.5–355.5) | **439.8** (416.9–458.3) | 0 / 0 |
+| Flap primary каждые 10 с (22 с) | 3 | 14.1 (14.0–14.5) | 2014.5 (2014.4–2016.0) | 14.7 (14.4–14.9) | **315.1** (314.4–316.2) | 0 / 0 |
+| `round-robin` с 1 мёртвым узлом (`iptables DROP`, цель E4 `p95 ≤ 700 мс`) | 5 | 2041.3 (2031.1–2055.1) | 2096.0 (2084.9–2107.1) | **141.4** (132.9–192.0) | **394.5** (366.6–439.0) | 0 / 0 |
+| Оба `egress` в `DROP` 20 с → восстановление | 3 | — | **13091.1** (13076.9–13139.8) | — | **98.8** (92.7–109.7) | 0 / 0 |

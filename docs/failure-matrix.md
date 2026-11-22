@@ -12,8 +12,8 @@ Phase 0 (F1–F10 в phase-0.md §9) — подмножество; столбе�
 
 | ID | Сбой | Фаза | Ожидаемое поведение | Метрика | INV | Инъекция |
 |---|---|---|---|---|---|---|
-| F-01 | DNS cover недоступен | PreAuth/PreCommit | cached address → relay; кэша нет → bounded graceful close | cover_dns_fail | INV-04 | F3 |
-| F-02 | DNS timeout (не отказ) | PreAuth/PreCommit | то же, с тайм-аутом ≤ configured deadline | cover_dns_fail, dns_deadline_exceeded | INV-03, INV-04 | F3 |
+| F-01 | DNS cover недоступен | PreAuth/PreCommit | фоновый `CoverResolver` (`cover_dns_ttl_secs = 60 с`) сохраняет `last-known-good` → relay без блокировки data-потоков; кэша нет → bounded graceful close | cover_dns_fail | INV-04 | F3 |
+| F-02 | DNS timeout (не отказ) | PreAuth/PreCommit | то же, фоновый резолв ограничен `handshake_timeout_secs`, data-потоки не ждут DNS | cover_dns_fail, dns_deadline_exceeded | INV-03, INV-04 | F3 |
 | F-03 | Cover connect fail (основная цель) | PreAuth/PreCommit | запасная цель → relay; нет запасной → graceful close | cover_connect_fail | INV-04 | F9 |
 | F-04 | Cover перегрузка/сбой процесса | PreAuth + установленные сессии | новые PreAuth деградируют по INV-04; MTProto-сессии **не страдают** | cover_overload_degrades, mtproto_sessions_survive | INV-07 | F9 |
 | F-05 | ME dial fail | PostCommit | close сессии + reconnect клиента; новых bind на мёртвого writer нет | me_dial_fail | INV-05 | F2 |
@@ -26,23 +26,23 @@ Phase 0 (F1–F10 в phase-0.md §9) — подмножество; столбе�
 | F-12 | Budget exhausted (userspace) | PreAuth | relay в cover (дешёвый путь) | budget_refusals | INV-03 | F5 |
 | F-13 | Budget exhausted | PostCommit | пауза чтения (backpressure), не разрыв; emergency reserve на служебные пути | budget_refusals, reserve_usage, paused_duration_p99 | INV-03 | F5 |
 | F-14 | Emergency reserve exhausted | PostCommit | пути освобождения не требуют бюджета; graceful close по deadline | budget_stall_timeout | INV-03 | F5+F1 |
-| F-15 | FD exhaustion на accept | PreAuth | accept fails/backlog; установленные сессии не страдают | accept_failures | §6.1 | F4 |
+| F-15 | FD exhaustion на accept / бюджет FD | PreAuth | На старте `effective_max = min(max_connections, (nofile - 128) / 2)` (fail-fast `< 16`); на accept backoff 10 мс..1 с (`EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM`), транзиентные `ECONNABORTED`/`ECONNRESET` игнорируются; установленные сессии не страдают (`tests/inv/chaos_egress.rs`) | accept_errors{kind}, effective_max_connections | §6.1 | F4 |
 | F-16 | Memory pressure (cgroup) | обе | admission-отказы на PreAuth (→cover); PostCommit — backpressure; OOM — вне инварианта | budget_refusals, process_restarts | INV-03, §6.1 | F5 |
 | F-17 | Revoke пользователя | PostCommit | `immediate` (default): close; `grace-drain`: дренаж по deadline | revoked_sessions | §8 | F8 |
 | F-18 | Ротация секрета | обе | default `revoke`: старые сессии закрыты; `keep-until-close` — опция | secret_rotations | §8 | F8 |
 | F-19 | Clock jump >120 с | PreAuth | CH в skew → cover; готовые сессии не страдают | hello_clock_skew | §5.2 | F6 |
 | F-20 | Replay-таблица saturated | PreAuth | sweep; полно → CoverRelay новых CH (fail-safe наружу) | replay_saturated_relays | INV-02 | нагрузка |
 | F-21 | Replay: смерть владельца мьютекса | PreAuth | robust mutex `EOWNERDEAD` → recovery → ровно один Accepted из двух CH | replay_owner_died_recoveries | INV-02 | тест барьером |
-| F-22 | Replay-файл потерян (reboot/crash) | PreAuth | честный рестарт с пустой таблицей; остаточный риск <120 с задокументирован | replay_table_reinit | INV-02 | рестарт стенда |
-| F-23 | Upstream fail | PostCommit | новые conn на здоровый маршрут; старые дренируются по deadline | upstream_failover | §7 | F10 |
-| F-24 | Egress partition (loss 100%) | PostCommit | как F-23 + recovery-таксономия по §11.2 | upstream_recovery_time, service_recovery_time | §11.2 | F10 |
+| F-22 | Replay-файл потерян или повреждён (reboot/crash) | PreAuth | честный рестарт с пустой таблицей (`replay_load_status = corrupted_reinitialized`, событие `replay_table_reinitialized`), атомарный flush `tmp + fsync + rename`, ошибки flush в `replay_flush_failed`; **принятый риск:** остаточное окно повтора ≤ 120 с ограничено проверкой timestamp в FakeTLS, карантин на старте не вводится, чтобы сбой диска не вызывал 2-минутный простой легитимных клиентов | replay_table_reinit, replay_flush_failed | INV-02 | рестарт стенда |
+| F-23 | Upstream fail | PostCommit | новые conn на здоровый маршрут (circuit breaker с экспоненциальным backoff `egress_cooldown_base_ms`..`egress_cooldown_max_ms` ×2 ±20% jitter + hedged connect `egress_hedge_ms` = `400` мс в `ordered`; на `direct`/`egress` — конфигурируемый пул кандидатов `dc_media_override` и фоновая самопроверка `dc_self_check` раз в `60 с`); старые дренируются по deadline (`tests/inv/chaos_egress.rs`) | upstream_failover, hedge_started, hedge_won_by_backup, dc_self_check_ok, dc_self_check_failed | §7 | F10 |
+| F-24 | Egress partition (loss 100%) / все в cooldown | PostCommit | как F-23 + fail-open проба + фоновый монитор (`30 с` / `5 с` при деградации, ротация DC `2, 4, -2, -4`) ставит и снимает cooldown без жертвы живым клиентом (`tests/inv/chaos_egress.rs`) | upstream_recovery_time, service_recovery_time | §11.2 | F10 |
 | F-25 | Config prepare fail на любой стадии | control | drop PrepareSet → автооткат внешних ресурсов; commit не случается | config_prepare_failures | INV-06 | тест-фолт |
 | F-26 | Config retire error | control | лог/ретрай, commit не блокируется; reconcile против сирот | config_retire_errors, config_orphans | INV-06 | тест-фолт |
 | F-27 | Control API flood + blocking-шторм | control vs data | p99 data plane в пределах +10% или ADR-002 триггер | api_flood_p99_delta | INV-07, §3 | нагрузка |
 | F-28 | Cover backend replacement | PreAuth | новые relay-соединения на новый бэкенд; старые доживают | cover_backend_swaps | §8 | нагрузка |
-| F-29 | Upgrade процесса под нагрузкой | обе | zero accept-pause (REUSEPORT/SCM_RIGHTS); drain по deadline; forced close **с подсчётом** | accept_pause_ms, drained_sessions, forced_close_ratio | §9, INV-10 | F7 |
+| F-29 | Upgrade процесса под нагрузкой | обе | zero accept-pause (REUSEPORT/SCM_RIGHTS); drain по deadline; forced close **с подсчётом** (`mtevil_forced_close_total`) | accept_pause_ms, drained_sessions, forced_close | §9, INV-10 | F7 |
 | F-30 | Watchdog kill (OOM/kill -9) | обе | supervisor restart; сессии теряются честно | process_restarts | INV-10 | chaos |
-| F-31 | Guard: подозрительный источник (suspect) | PreAuth | shadow-ban → cover; canary-валидация исключений | suspects_shadow_banned | guard | нагрузка |
+| F-31 | Guard: подозрительный источник (suspect) / защита `egress` (`MTV3`) | PreAuth | shadow-ban → cover; на `egress`: `MTV3` HMAC-SHA256 + `±30 с` окно + replay-кэш `nonce`, `egress_allow_from` CIDR, лимит неудачных попыток на IP (`egress_max_failed_per_ip`) и отдельный лимит незавершённых handshake | suspects_shadow_banned | guard | нагрузка |
 | F-32 | Half-close (client SHUT_WR) | PostCommit | дожитие в drain-семантике §5.5, без преждевременного close | close_reasons | INV-04 | N/A (probe) |
 | F-33 | TCP zero window клиента | PostCommit | backpressure по outbound, deadline → graceful close | budget_stall_timeout | INV-03 | netem |
 | F-34 | Reordering/dup на пути | обе | корректность FIFO per-client сохраняется | fifo_violations (должно быть 0) | INV-05 | netem |

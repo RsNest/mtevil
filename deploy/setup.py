@@ -67,7 +67,7 @@ def select_latest_release(
         }
         if not {"install.sh", "setup.py"}.issubset(ready_names):
             continue
-        if key[3] < STAGE_RANKS[None]:
+        if rel.get("prerelease") or key[3] < STAGE_RANKS[None]:
             prerelease_candidates.append((key, tag))
             if allow_prerelease:
                 candidates.append((key, tag))
@@ -85,6 +85,36 @@ def select_latest_release(
         raise ValueError("no eligible published release with install.sh and setup.py assets")
     candidates.sort(key=lambda item: item[0])
     return candidates[-1][1]
+
+
+def compute_release_publish_flags(
+    tag: str,
+    published_releases: list[dict[str, object]],
+) -> tuple[str, str]:
+    """Return (prerelease_flag, latest_flag) for `gh release edit`.
+
+    Supported alpha/beta/rc tags are always published as prereleases and explicitly
+    excluded from GitHub Latest (`--prerelease=true`, `--latest=false`).
+    Stable tags are compared only against other non-draft stable releases so an older
+    stable tag gets `--latest=false` while a newer stable tag gets `--latest`.
+    """
+    if is_prerelease_tag(tag):
+        return ("--prerelease=true", "--latest=false")
+
+    target_key = parse_semver_tag(tag)
+    is_newest = True
+    if target_key is not None:
+        for rel in published_releases:
+            if not isinstance(rel, dict) or rel.get("isDraft") or rel.get("draft"):
+                continue
+            other_tag = str(rel.get("tagName") or rel.get("tag_name") or "").strip()
+            if rel.get("isPrerelease") or rel.get("prerelease") or is_prerelease_tag(other_tag):
+                continue
+            other_key = parse_semver_tag(other_tag)
+            if other_key is not None and other_key > target_key:
+                is_newest = False
+                break
+    return ("--prerelease=false", "--latest" if is_newest else "--latest=false")
 
 
 def resolve_commit_release_tag(
@@ -670,6 +700,10 @@ def compute_listen_and_health(bind_ip: str, pub_port: int, network_host: bool) -
     return f"{bind_ip}:{pub_port}", ("127.0.0.1" if bind_ip == "0.0.0.0" else bind_ip)
 
 
+def compute_compose_nofile(max_connections: int) -> int:
+    return max(4096, int(max_connections) * 2 + 512)
+
+
 def render_compose(
     repo_root: Path,
     deploy_dir: Path,
@@ -680,6 +714,7 @@ def render_compose(
     health_port: int | None = None,
     include_build: bool = True,
     extra_volumes: list[str] | None = None,
+    max_connections: int | None = None,
 ) -> str:
     try:
         rel_context = os.path.relpath(repo_root, deploy_dir).replace("\\", "/")
@@ -687,6 +722,8 @@ def render_compose(
         rel_context = str(repo_root).replace("\\", "/")
     internal_port = 29443 if role == "egress" else 24443
     hc_port = health_port if (network_host and health_port is not None) else internal_port
+    effective_max_conn = max_connections if max_connections is not None else (512 if role == "egress" else 256)
+    nofile = compute_compose_nofile(effective_max_conn)
     build_block = (
         f"\n  build:\n    context: {rel_context}\n    dockerfile: Dockerfile"
         if include_build
@@ -711,7 +748,8 @@ services:
 {net_block}
     volumes:
       - ./{config_name}:/etc/mtevil/config.json:ro
-      - state:/var/lib/mtevil{extra_vol_lines}
+      - state:/var/lib/mtevil:ro
+      - replay:/var/lib/mtevil-replay{extra_vol_lines}
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -721,8 +759,8 @@ services:
     pids_limit: 128
     ulimits:
       nofile:
-        soft: 4096
-        hard: 4096
+        soft: {nofile}
+        hard: {nofile}
     stop_grace_period: 10s
     healthcheck:
       test: [CMD, /usr/local/bin/mtevil, health, --address, "{health_host}:{hc_port}"]
@@ -736,8 +774,21 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  init:
+    <<: *image
+    profiles: [tools]
+    volumes:
+      - state:/var/lib/mtevil
+      - replay:/var/lib/mtevil-replay
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    pids_limit: 32
+
 volumes:
   state:
+  replay:
 """
 
 
@@ -751,6 +802,13 @@ def deployment_service(deploy_dir: Path) -> str:
 
 def compose_service(base: list[str]) -> str:
     return deployment_service(Path(base[-1]).parent)
+
+
+def compose_write_service(base: list[str]) -> str:
+    compose = Path(base[-1])
+    if compose.is_file() and "\n  init:\n" in compose.read_text(encoding="utf-8"):
+        return "init"
+    return compose_service(base)
 
 
 def compose_cmd(deploy_dir: Path, project: str, compose_name: str = "compose.yaml", env_name: str = ".env") -> list[str]:
@@ -796,7 +854,7 @@ def ensure_generated_secret(base: list[str], path_in_container: str) -> bool:
             "--no-deps",
             "--entrypoint",
             "/usr/local/bin/mtevil",
-            compose_service(base),
+            compose_write_service(base),
             "secret",
             "--output",
             path_in_container,
@@ -816,7 +874,7 @@ def write_volume_secret_stdin(base: list[str], path_in_container: str, hex_secre
             "--no-deps",
             "--entrypoint",
             "/bin/sh",
-            compose_service(base),
+            compose_write_service(base),
             "-c",
             f"umask 077 && cat > {path_in_container}",
         ],
@@ -1299,6 +1357,272 @@ def download_url_atomic(
                 pass
 
 
+class MigrationError(ValueError):
+    """Raised when an existing compose.yaml/config.json cannot be safely migrated to v0.2 layout."""
+
+
+def _plan_compose_v02_migration(compose_text: str, svc_name: str) -> tuple[bool, str]:
+    """Surgically patch compose.yaml for v0.2 (state:ro, replay volume, init service).
+
+    Preserves all user customizations (ports, environment, extra volumes, ulimits,
+    labels, cpus/mem_limit, extra services). Raises MigrationError if the compose
+    file is malformed or cannot be patched safely.
+    """
+    if "\t" in compose_text:
+        raise MigrationError("compose.yaml содержит символы табуляции (некорректный YAML)")
+    if not compose_text.strip():
+        raise MigrationError("compose.yaml пуст")
+
+    lines = compose_text.splitlines()
+    services_idx = None
+    volumes_idx = None
+    for i, line in enumerate(lines):
+        if re.match(r"^services\s*:\s*(#.*)?$", line):
+            services_idx = i
+        elif re.match(r"^volumes\s*:\s*(#.*)?$", line):
+            volumes_idx = i
+
+    if services_idx is None:
+        raise MigrationError("в compose.yaml отсутствует секция services:")
+
+    services_end = len(lines)
+    for i in range(services_idx + 1, len(lines)):
+        if lines[i] and not lines[i].startswith(" ") and not lines[i].startswith("#"):
+            services_end = i
+            break
+
+    svc_start = None
+    svc_indent = None
+    has_init_svc = False
+    for i in range(services_idx + 1, services_end):
+        m = re.match(r"^( +)([A-Za-z0-9_.-]+)\s*:\s*(#.*)?$", lines[i])
+        if m:
+            ind = len(m.group(1))
+            name = m.group(2)
+            if svc_indent is None or ind == svc_indent:
+                if name == svc_name and svc_start is None:
+                    svc_start = i
+                    svc_indent = ind
+                elif name == "init":
+                    has_init_svc = True
+
+    if svc_start is None or svc_indent is None:
+        raise MigrationError(f"в compose.yaml не найден сервис '{svc_name}:' в секции services:")
+
+    svc_end = services_end
+    for i in range(svc_start + 1, services_end):
+        if lines[i].strip() and not lines[i].lstrip().startswith("#"):
+            cur_ind = len(lines[i]) - len(lines[i].lstrip(" "))
+            if cur_ind <= svc_indent:
+                svc_end = i
+                break
+
+    svc_vol_hdr = None
+    svc_vol_indent = None
+    for i in range(svc_start + 1, svc_end):
+        m = re.match(r"^( +)volumes\s*:\s*(#.*)?$", lines[i])
+        if m and len(m.group(1)) > svc_indent:
+            svc_vol_hdr = i
+            svc_vol_indent = len(m.group(1))
+            break
+
+    if svc_vol_hdr is None or svc_vol_indent is None:
+        if "state:/var/lib/mtevil" not in compose_text:
+            return False, compose_text
+        raise MigrationError(f"в сервисе '{svc_name}' не найдена секция volumes:")
+
+    svc_vol_end = svc_end
+    for i in range(svc_vol_hdr + 1, svc_end):
+        if lines[i].strip() and not lines[i].lstrip().startswith("#"):
+            cur_ind = len(lines[i]) - len(lines[i].lstrip(" "))
+            if cur_ind <= svc_vol_indent and not lines[i].lstrip().startswith("-"):
+                svc_vol_end = i
+                break
+
+    state_line_idx = None
+    has_state_ro = False
+    has_replay_mount = False
+    for i in range(svc_vol_hdr + 1, svc_vol_end):
+        stripped = lines[i].strip()
+        if re.match(r'^-\s*["\']?state:/var/lib/mtevil:ro["\']?\s*(#.*)?$', stripped):
+            state_line_idx = i
+            has_state_ro = True
+        elif re.match(r'^-\s*["\']?state:/var/lib/mtevil(?::rw)?["\']?\s*(#.*)?$', stripped):
+            state_line_idx = i
+        elif "replay:/var/lib/mtevil-replay" in stripped:
+            has_replay_mount = True
+
+    if state_line_idx is None:
+        if "state:/var/lib/mtevil" not in compose_text:
+            return False, compose_text
+        raise MigrationError(f"не удалось безопасно распознать монтирование state:/var/lib/mtevil в сервисе '{svc_name}'")
+
+    has_top_replay = False
+    if volumes_idx is not None:
+        for i in range(volumes_idx + 1, len(lines)):
+            if lines[i] and not lines[i].startswith(" ") and not lines[i].startswith("#"):
+                break
+            if re.match(r"^ +replay\s*:", lines[i]):
+                has_top_replay = True
+                break
+    else:
+        raise MigrationError("в compose.yaml отсутствует корневая секция volumes: для тома state")
+
+    if has_state_ro and has_replay_mount and has_init_svc and has_top_replay:
+        return False, compose_text
+
+    out = list(lines)
+
+    # 1. Switch state mount to :ro and add replay mount right below it.
+    state_ind = " " * (len(out[state_line_idx]) - len(out[state_line_idx].lstrip(" ")))
+    if not has_state_ro:
+        out[state_line_idx] = f"{state_ind}- state:/var/lib/mtevil:ro"
+    inserted_offset = 0
+    if not has_replay_mount:
+        out.insert(state_line_idx + 1, f"{state_ind}- replay:/var/lib/mtevil-replay")
+        inserted_offset += 1
+
+    # 2. Insert `init` service if absent (reusing `<<: *image` if anchor exists, else matching image line).
+    if not has_init_svc:
+        has_image_anchor = any("&image" in l for l in out[:services_idx])
+        img_spec = "<<: *image"
+        if not has_image_anchor:
+            found_img = f"image: ${{MTEVIL_IMAGE:-{DEFAULT_IMAGE}}}"
+            for i in range(svc_start + 1, svc_end + inserted_offset):
+                m_img = re.match(r"^ +(image\s*:\s*.+)$", out[i])
+                if m_img:
+                    found_img = m_img.group(1).strip()
+                    break
+            img_spec = found_img
+        pad = " " * svc_indent
+        init_block = [
+            "",
+            f"{pad}init:",
+            f"{pad}  {img_spec}",
+            f"{pad}  profiles: [tools]",
+            f"{pad}  volumes:",
+            f"{pad}    - state:/var/lib/mtevil",
+            f"{pad}    - replay:/var/lib/mtevil-replay",
+            f"{pad}  read_only: true",
+            f"{pad}  cap_drop: [ALL]",
+            f"{pad}  security_opt: [no-new-privileges:true]",
+            f"{pad}  mem_limit: 64m",
+            f"{pad}  pids_limit: 32",
+        ]
+        insert_at = services_end + inserted_offset
+        while insert_at > services_idx + 1 and out[insert_at - 1].strip() == "":
+            insert_at -= 1
+        for offset_i, bl in enumerate(init_block):
+            out.insert(insert_at + offset_i, bl)
+        inserted_offset += len(init_block)
+
+    # 3. Declare `replay:` under top-level `volumes:` if absent.
+    if not has_top_replay:
+        vol_pos = None
+        state_vol_pos = None
+        state_vol_ind = "  "
+        for i, l in enumerate(out):
+            if re.match(r"^volumes\s*:\s*(#.*)?$", l):
+                vol_pos = i
+                break
+        if vol_pos is None:
+            raise MigrationError("в compose.yaml отсутствует корневая секция volumes:")
+        for i in range(vol_pos + 1, len(out)):
+            if out[i] and not out[i].startswith(" ") and not out[i].startswith("#"):
+                break
+            m_sv = re.match(r"^( +)state\s*:", out[i])
+            if m_sv:
+                state_vol_pos = i
+                state_vol_ind = m_sv.group(1)
+                break
+        if state_vol_pos is not None:
+            out.insert(state_vol_pos + 1, f"{state_vol_ind}replay:")
+        else:
+            out.insert(vol_pos + 1, f"{state_vol_ind}replay:")
+
+    return True, "\n".join(out) + "\n"
+
+
+def migrate_compose_and_replay_on_update(
+    deploy_dir: Path,
+    cfg_file: Path,
+    compose_file: Path,
+    *,
+    dry_run: bool = False,
+) -> bool:
+    """Safely migrate pre-v0.2 compose.yaml and config.json to isolated state:ro + replay.
+
+    - Preserves compose.yaml.pre-v0.2 and config.json.pre-v0.2 before the first edit (never overwrites existing).
+    - Surgically patches compose.yaml to keep all user customizations (ports, env, volumes, ulimits, labels, cpus/mem, extra services).
+    - Raises MigrationError without modifying any file if compose.yaml or config.json cannot be safely migrated.
+    """
+    try:
+        compose_text = compose_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise MigrationError(f"не удалось прочитать compose.yaml: {exc}") from exc
+    try:
+        cfg_text = cfg_file.read_text(encoding="utf-8")
+        cfg = json.loads(cfg_text)
+    except (OSError, ValueError) as exc:
+        raise MigrationError(f"некорректный config.json: {exc}") from exc
+    if not isinstance(cfg, dict):
+        raise MigrationError("config.json должен содержать JSON-объект")
+
+    svc_name = deployment_service(deploy_dir)
+    compose_changed, new_compose = _plan_compose_v02_migration(compose_text, svc_name)
+
+    role = str(cfg.get("role") or "direct")
+    cfg_changed = False
+    new_cfg = dict(cfg)
+    if compose_changed or "replay:/var/lib/mtevil-replay" in new_compose:
+        if new_cfg.get("replay_file") == "/var/lib/mtevil/replay.bin" or (
+            role in ("direct", "edge") and "replay_file" not in new_cfg
+        ):
+            new_cfg["replay_file"] = "/var/lib/mtevil-replay/replay.bin"
+            cfg_changed = True
+
+    if not compose_changed and not cfg_changed:
+        return False
+    if dry_run:
+        return True
+
+    pre_compose = deploy_dir / "compose.yaml.pre-v0.2"
+    if not pre_compose.exists():
+        pre_compose.write_text(compose_text, encoding="utf-8")
+    pre_cfg = deploy_dir / "config.json.pre-v0.2"
+    if not pre_cfg.exists():
+        pre_cfg.write_text(cfg_text, encoding="utf-8")
+
+    if compose_changed:
+        compose_file.write_text(new_compose, encoding="utf-8")
+    if cfg_changed:
+        cfg_file.write_text(json.dumps(new_cfg, indent=2) + "\n", encoding="utf-8")
+    return True
+
+
+def copy_legacy_replay_bin_to_replay_volume(base: list[str]) -> bool:
+    """Copy existing /var/lib/mtevil/replay.bin bytes into /var/lib/mtevil-replay/replay.bin via init service."""
+    if compose_write_service(base) != "init":
+        return False
+    proc = run(
+        base
+        + [
+            "run",
+            "--rm",
+            "-T",
+            "--no-deps",
+            "--entrypoint",
+            "/bin/sh",
+            "init",
+            "-c",
+            "if [ -f /var/lib/mtevil/replay.bin ] && [ ! -f /var/lib/mtevil-replay/replay.bin ]; then "
+            "cp -p /var/lib/mtevil/replay.bin /var/lib/mtevil-replay/replay.bin && echo COPIED; fi",
+        ],
+        check=False,
+    )
+    return proc.returncode == 0 and "COPIED" in (proc.stdout or "")
+
+
 def strip_legacy_default_mss(cfg_file: Path) -> bool:
     """Remove legacy default client_mss=100 / client_mss_bulk=1380 that clamped client SYN-ACK MSS."""
     if not cfg_file.is_file():
@@ -1746,6 +2070,16 @@ def run_update_command(
             print(detail, file=sys.stderr)
         return 1
 
+    # Validate migration plan BEFORE saving rollback or touching live files / stopping the running container.
+    try:
+        migrate_compose_and_replay_on_update(deploy_dir, cfg_file, compose_file, dry_run=True)
+    except MigrationError as exc:
+        print(
+            err_text(f"Не удалось безопасно мигрировать compose.yaml/config.json: {exc}. Обновление отменено, текущий сервис не затронут."),
+            file=sys.stderr,
+        )
+        return 1
+
     # Save rollback snapshot of the currently working version, image tag, and config before modifying anything.
     try:
         save_rollback_snapshot(
@@ -1761,10 +2095,13 @@ def run_update_command(
         return 1
 
     strip_legacy_default_mss(cfg_file)
+    migrated_v02 = migrate_compose_and_replay_on_update(deploy_dir, cfg_file, compose_file)
     orig_env_text = env_file.read_text(encoding="utf-8", errors="ignore")
     env_file.write_text(set_env_image(orig_env_text, target_image), encoding="utf-8")
 
     base = compose_cmd(deploy_dir, project)
+    if migrated_v02:
+        copy_legacy_replay_bin_to_replay_volume(base)
     up_proc = run(base + ["up", "-d", "--no-build", "--force-recreate", compose_service(base)], check=False)
     if up_proc.returncode != 0:
         detail = (up_proc.stderr or up_proc.stdout or "").strip()
@@ -1956,13 +2293,36 @@ def run_status_command(deploy_dir: Path) -> int:
     print(f"  Состояние:         {health_status}")
     print(f"  Время работы:      {uptime_str}")
     print(f"  Версия для отката: {rollback_ver}")
+    if role == "egress":
+        accept_legacy = saved_cfg.get("egress_accept_legacy", True) is not False
+        proto_mode = "MTV3 + legacy MTV2 (переходный)" if accept_legacy else "MTV3 only (строгий)"
+        print(f"  Протокол egress:   {proto_mode}")
+        if running:
+            rstats = read_container_runtime_stats(base, svc)
+            if isinstance(rstats, dict):
+                mtv3_cnt = rstats.get("egress_mtv3_connections")
+                legacy_cnt = rstats.get("egress_legacy_connections")
+                if mtv3_cnt is not None or legacy_cnt is not None:
+                    print(
+                        f"  Подключения:       MTV3={int(mtv3_cnt or 0)}, legacy MTV2={int(legacy_cnt or 0)}"
+                    )
+        if accept_legacy:
+            print(
+                "  Подсказка MTV3:    после обновления всех edge выставите "
+                '"egress_accept_legacy": false в config.json и перезапустите egress.'
+            )
     if role == "edge" and running:
-        alerts_proc = run(
-            base + ["exec", "-T", svc, "/bin/cat", "/var/lib/mtevil/edge-alerts.jsonl"],
-            check=False,
-        )
-        if alerts_proc.returncode == 0 and alerts_proc.stdout.strip():
-            lines = [ln.strip() for ln in alerts_proc.stdout.splitlines() if ln.strip()]
+        alerts_text = ""
+        for alerts_path in ("/var/lib/mtevil-replay/edge-alerts.jsonl", "/var/lib/mtevil/edge-alerts.jsonl"):
+            alerts_proc = run(
+                base + ["exec", "-T", svc, "/bin/cat", alerts_path],
+                check=False,
+            )
+            if alerts_proc.returncode == 0 and alerts_proc.stdout.strip():
+                alerts_text = alerts_proc.stdout.strip()
+                break
+        if alerts_text:
+            lines = [ln.strip() for ln in alerts_text.splitlines() if ln.strip()]
             if lines:
                 try:
                     last_ev = json.loads(lines[-1])
@@ -1975,17 +2335,19 @@ def run_status_command(deploy_dir: Path) -> int:
 
 
 def read_container_runtime_stats(base: list[str], svc: str) -> dict[str, object] | None:
-    proc = run(
-        base + ["exec", "-T", svc, "/bin/cat", "/var/lib/mtevil/runtime-stats.json"],
-        check=False,
-    )
-    if proc.returncode != 0 or not proc.stdout.strip():
-        return None
-    try:
-        data = json.loads(proc.stdout)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
+    for path in ("/var/lib/mtevil-replay/runtime-stats.json", "/var/lib/mtevil/runtime-stats.json"):
+        proc = run(
+            base + ["exec", "-T", svc, "/bin/cat", path],
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            try:
+                data = json.loads(proc.stdout)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+    return None
 
 
 def direction_labels_for_role(role: str) -> tuple[str, str, str, str, str, str]:
@@ -2260,6 +2622,7 @@ def run_link_command(
 
     cid = run(base + ["ps", "-q", svc], check=False).stdout.strip()
     cmd_prefix = base + (["exec", "-T", svc] if cid else ["run", "--rm", "-T", "--no-deps", svc])
+    write_prefix = base + ["run", "--rm", "-T", "--no-deps", compose_write_service(base)]
     link_args = [
         "mtevil",
         "link",
@@ -2416,11 +2779,24 @@ def run_user_command(deploy_dir: Path, action: str, name: str | None = None, sni
     base = compose_cmd(deploy_dir, project)
     svc = compose_service(base)
     cid = run(base + ["ps", "-q", svc], check=False).stdout.strip()
-    cmd_prefix = base + (["exec", "-T", svc] if cid else ["run", "--rm", "-T", "--no-deps", svc])
+    cmd_prefix = base + (
+        ["exec", "-T", svc, "/usr/local/bin/mtevil"]
+        if cid
+        else ["run", "--rm", "-T", "--no-deps", "--entrypoint", "/usr/local/bin/mtevil", svc]
+    )
+    write_prefix = base + [
+        "run",
+        "--rm",
+        "-T",
+        "--no-deps",
+        "--entrypoint",
+        "/usr/local/bin/mtevil",
+        compose_write_service(base),
+    ]
 
     act = (action or "list").strip().lower()
     if act in ("list", "ls"):
-        proc = run(cmd_prefix + ["mtevil", "user-list", "--users-file", users_file], check=False)
+        proc = run(cmd_prefix + ["user-list", "--users-file", users_file], check=False)
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()
             print(err_text(f"Не удалось получить список пользователей: {detail}"), file=sys.stderr)
@@ -2438,7 +2814,7 @@ def run_user_command(deploy_dir: Path, action: str, name: str | None = None, sni
         if not name:
             print(err_text("Укажите имя пользователя: mtevilctl user add <имя>"), file=sys.stderr)
             return 1
-        proc = run(cmd_prefix + ["mtevil", "user-add", "--users-file", users_file, "--name", name], check=False)
+        proc = run(write_prefix + ["user-add", "--users-file", users_file, "--name", name], check=False)
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()
             print(err_text(f"Не удалось добавить пользователя '{name}': {detail}"), file=sys.stderr)
@@ -2450,7 +2826,7 @@ def run_user_command(deploy_dir: Path, action: str, name: str | None = None, sni
         if not name:
             print(err_text("Укажите имя пользователя: mtevilctl user del <имя>"), file=sys.stderr)
             return 1
-        proc = run(cmd_prefix + ["mtevil", "user-del", "--users-file", users_file, "--name", name], check=False)
+        proc = run(write_prefix + ["user-del", "--users-file", users_file, "--name", name], check=False)
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()
             print(err_text(f"Не удалось удалить пользователя '{name}': {detail}"), file=sys.stderr)
@@ -2667,7 +3043,7 @@ def main(argv: list[str] | None = None) -> int:
                 "listen": "0.0.0.0:24443",
                 "secret_file": "/var/lib/mtevil/proxy-secret",
                 "users_file": "/var/lib/mtevil/users.json",
-                "replay_file": "/var/lib/mtevil/replay.bin",
+                "replay_file": "/var/lib/mtevil-replay/replay.bin",
                 "sni": sni,
                 "cover": cover,
                 "dc": DEFAULT_DCS,
@@ -2721,7 +3097,7 @@ def main(argv: list[str] | None = None) -> int:
                 "listen": "0.0.0.0:24443",
                 "secret_file": "/var/lib/mtevil/proxy-secret",
                 "users_file": "/var/lib/mtevil/users.json",
-                "replay_file": "/var/lib/mtevil/replay.bin",
+                "replay_file": "/var/lib/mtevil-replay/replay.bin",
                 "sni": sni,
                 "cover": cover,
                 "dc": DEFAULT_DCS,
@@ -2808,7 +3184,7 @@ def main(argv: list[str] | None = None) -> int:
                 "listen": "0.0.0.0:24443",
                 "secret_file": "/var/lib/mtevil/proxy-secret",
                 "users_file": "/var/lib/mtevil/users.json",
-                "replay_file": "/var/lib/mtevil/replay.bin",
+                "replay_file": "/var/lib/mtevil-replay/replay.bin",
                 "sni": sni,
                 "cover": cover,
                 "egress_upstreams": upstreams,
@@ -2887,6 +3263,7 @@ def main(argv: list[str] | None = None) -> int:
     compose_ref = f'--env-file "{abs_env}" -f "{abs_compose}"'
     include_build = not args.no_build and (repo_root / "Dockerfile").is_file()
     try:
+        max_conn_val = int(config_data.get("max_connections", 512 if role == "egress" else 256))
         cand_compose.write_text(
             render_compose(
                 repo_root,
@@ -2897,6 +3274,7 @@ def main(argv: list[str] | None = None) -> int:
                 health_host=health_host,
                 health_port=pub_port,
                 include_build=include_build,
+                max_connections=max_conn_val,
             ),
             encoding="utf-8",
         )
@@ -3022,6 +3400,7 @@ def main(argv: list[str] | None = None) -> int:
             health_host=health_host,
             health_port=pub_port,
             include_build=include_build,
+            max_connections=max_conn_val,
         )
     finally:
         if cand_token_in_volume:
@@ -3034,7 +3413,7 @@ def main(argv: list[str] | None = None) -> int:
                         "--no-deps",
                         "--entrypoint",
                         "/bin/rm",
-                        compose_service(cand_base),
+                        compose_write_service(cand_base),
                         "-f",
                         "/var/lib/mtevil/egress-token.candidate",
                     ],
@@ -3121,6 +3500,7 @@ def main(argv: list[str] | None = None) -> int:
                         health_host=health_host,
                         health_port=pub_port,
                         include_build=include_build,
+                        max_connections=max_conn_val,
                     ),
                     encoding="utf-8",
                 )
@@ -3228,7 +3608,8 @@ def main(argv: list[str] | None = None) -> int:
         print("\n" + heading("Что указать на входном сервере (edge)"))
         print(f"  Адрес выхода: {bind_ip}:{pub_port}")
         print("  Режим в мастере на edge: 2 (Расширенная настройка) -> 2 (edge)")
-        print(f"  Получить токен MTV2 безопасно: docker compose {compose_ref} exec -T {compose_service(base)} cat /var/lib/mtevil/egress-token")
+        print(f"  Получить токен безопасно: docker compose {compose_ref} exec -T {compose_service(base)} cat /var/lib/mtevil/egress-token")
+        print("  Миграция на MTV3: сначала обновите egress, затем все edge; после этого выставите \"egress_accept_legacy\": false в config.json egress.")
         print()
         print(f"Каталог установки: {deploy_dir}")
         print(f"Проверка статуса:  {status_cmd}")

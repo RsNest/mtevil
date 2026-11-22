@@ -1,8 +1,12 @@
 [package]
 name = "mtevil-egress"
-version = "0.0.0"
+version = "0.1.0"
 edition.workspace = true
-description = "Upstreams, health, routing. ПУСТО: spec-first, код после ADR-001 (ADR-000 §1)"
+license.workspace = true
+description = "Egress failover cooldown backoff and jitter primitives for mtevil"
+
+[dependencies]
+rand = "0.8"
 
 [lints]
 workspace = true

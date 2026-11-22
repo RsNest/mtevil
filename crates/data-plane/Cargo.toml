@@ -2,14 +2,21 @@
 name = "mtevil-data-plane"
 version = "0.1.0-alpha.1"
 edition.workspace = true
+license.workspace = true
 description = "Test-only FakeTLS Direct proxy authorized by ADR-001"
 
 [[bin]]
 name = "mtevil"
 path = "src/main.rs"
 
+[[test]]
+name = "inv_chaos"
+path = "../../tests/inv/chaos_egress.rs"
+
 [dependencies]
 mtevil-proto = { path = "../proto" }
+mtevil-egress = { path = "../egress" }
+mtevil-guard = { path = "../guard" }
 anyhow.workspace = true
 clap.workspace = true
 hex.workspace = true
@@ -24,6 +31,7 @@ zeroize = { version = "1", features = ["derive"] }
 [dev-dependencies]
 aes = "0.8"
 hmac = "0.12"
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -16,6 +16,7 @@ services:
     volumes:
       - ./config.json:/etc/mtevil/config.json:ro
       - state:/var/lib/mtevil:ro
+      - replay:/var/lib/mtevil-replay
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -54,3 +55,4 @@ services:
 
 volumes:
   state:
+  replay:

@@ -223,7 +223,7 @@ for rel in data:
     if {"install.sh", "setup.py"}.issubset(names):
         key = (int(m.group(1)), int(m.group(2)), int(m.group(3)), ranks[m.group(4)], int(m.group(5) or 0))
         all_cands.append((key, tag))
-        if m.group(4) is None:
+        if m.group(4) is None and not rel.get("prerelease"):
             stable_cands.append((key, tag))
 if not all_cands:
     print("Не найден ни один опубликованный релиз с готовыми файлами install.sh и setup.py.", file=sys.stderr)
