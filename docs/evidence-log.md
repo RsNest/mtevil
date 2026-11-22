@@ -1195,3 +1195,16 @@ wire-точность. Перебор высоких портов сгорает
 - **`TEST_B2_DIRECT_ROLLBACK_TO_V02`:** `setup.py rollback` → `v0.2.0`, пользователь `alice` подключился (**PASS**).
 - **`TEST_B3_ENABLE_ME_THEN_DOWNGRADE_V02`:** включён `me` на кандидате (`alice` подключилась) → `setup.py update --version v0.2.0` автоматически вырезал блок `me`, сохранил `config.json.pre-me-downgrade` (`0600`), контейнер `v0.2.0` стартовал и обслужил `alice` (**PASS**).
 - **`TEST_C_SPLIT_UPGRADE_EGRESS_THEN_EDGE`:** обновление `edge → egress` с `v0.2.0` на `618e5bf` в порядке `egress` → `edge`: после обновления `egress` прежний `edge v0.2.0` + `alice` продолжили работать; после обновления `edge` `alice` подключилась, `me` остался выключен (**PASS**).
+
+### 6. Исправление кодирования `RPC_PROXY_REQ` (`ad_tag` и флаги транспорта/`NOT_ENCRYPTED`/`QUICKACK`, `TEST_COMMIT = 919d069`)
+- **Воспроизведение симптома до фикса (`729c20d`, одноразовый Linux-стенд, `fallback_to_direct = false`):**
+  - Без `ad_tag`: `3/3` пробы `req_pq_multi → resPQ` **PASS** (`38.8 мс`, `32.0 мс`, `16.2 мс`).
+  - С реальным `ad_tag` из файла на стенде (значение не печаталось и не логировалось): `0/3` (`TimeoutError` на всех трёх пробах при живом пуле ME).
+- **Причина и сверка с пермиссивными эталонами (`alexbers/mtprotoproxy` MIT, `mtprotoproxy.py` строки 934–977; `seriyps/mtproto_proxy` Apache-2.0, `src/mtp_rpc.erl` строки 48–142):**
+  1. Секция `FLAG_HAS_AD_TAG` (`0x08`) должна содержать `[extra_size: u32 LE = 24][TL_PROXY_TAG: u32 LE = 0xdb1e26ae][tl_bytes(tag): 0x10 || 16B || 0x00 0x00 0x00]` (28 байт); ранее записывались только 20 байт `tl_encode_bytes(tag)` без `extra_size` и `0xdb1e26ae`.
+  2. Флаги `RPC_PROXY_REQ` должны включать флаг клиентского транспорта (`FLAG_ABRIDGED = 0x40000000`, `FLAG_INTERMEDIATE = 0x20000000`, `FLAG_INTERMEDIATE | FLAG_PAD (0x08000000)`), `FLAG_QUICKACK (0x80000000)` и `FLAG_NOT_ENCRYPTED (0x00000002)` только для кадров с `auth_key_id == 0` (снят для зашифрованных кадров реального клиента).
+- **Тесты (`919d069`):** 5 независимых байтовых тестовых векторов от MIT `alexbers/mtprotoproxy` (`rpc_proxy_req_matches_independent_mit_reference_vectors`), независимый строгий разбор в обоих мок-серверах и тест на реальных клиентских кадрах (`me_client_frames_verify_transport_encrypted_quickack_and_adtag_flags`, зашифрованный `auth_key_id != 0` и незашифрованный `auth_key_id == 0`, все 3 транспорта + quick-ack + `ad_tag`). Всего `130` Rust workspace тестов зелёные, `clippy -D warnings` — `0` предупреждений.
+- **Живая проверка после фикса (`919d069`, тот же реальный `ad_tag`, `fallback_to_direct = false`):**
+  - `direct` + реальный `ad_tag`: `padded-intermediate` `3/3` **PASS** (`113 B 37.8 мс`, `109 B 29.5 мс`, `110 B 42.6 мс`), `abridged` **PASS** (`100 B 66.1 мс`), `intermediate` **PASS** (`100 B 44.0 мс`).
+  - `split MTV4` (`edge → egress`) + реальный `ad_tag`: `padded-intermediate` **PASS** (`109 B 22.6 мс`), `abridged` **PASS** (`100 B 36.7 мс`), `intermediate` **PASS** (`100 B 41.7 мс`).
+  - **Что не проверялось на стенде:** полная пользовательская сессия настоящим клиентом Telegram (на стенде отсутствует `telethon` и клиент Telegram) и отображение спонсорского канала — проверяется вручную по `docs/me-manual-test.md`.

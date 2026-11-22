@@ -63,17 +63,20 @@
 - **Split-правило (логика «И»):** в `edge → egress` (`MTV4`) адрес клиента передаётся внутри аутентифицированной части префейса `MTV4` **только если** на `edge` включён `me.send_client_ip: true` (иначе в `MTV4` идут флаг `0` и `0.0.0.0:0`). На `egress` адрес передаётся в Telegram ME **только если** одновременно установлен флаг в `MTV4` **и** на `egress` включён `me.send_client_ip: true`. **На `egress` клиентский IP никогда не записывается в логи, метрики или файлы.**
 - **Предупреждение для README и мастера установки:** при включении ME мастер и `README.md` обязаны явно предупреждать оператора о том, что при `me.send_client_ip: true` (по умолчанию) Telegram видит реальный IP клиента, а режим `me.send_client_ip: false` (`0.0.0.0:0`) является экспериментальным.
 
-### 3.5. Спецификация протокола `MTV4` (Split `edge → egress` ME)
+### 3.5. Спецификация протокола `MTV4` (Split `edge → egress` ME) и `RPC_PROXY_REQ`
+- **Формат `RPC_PROXY_REQ` (`0x36cef1ee`, `egress`/`direct` → Telegram ME, сверено с MIT `alexbers/mtprotoproxy` и Apache-2.0 `seriyps/mtproto_proxy`):**
+  - Флаги `flags: u32 LE`: базовые `FLAG_MAGIC (0x1000) | FLAG_EXTMODE2 (0x20000)` + флаг клиентского транспорта (`FLAG_ABRIDGED = 0x40000000`, `FLAG_INTERMEDIATE = 0x20000000` или `FLAG_INTERMEDIATE | FLAG_PAD (0x08000000)` для `padded-intermediate`) + `FLAG_QUICKACK (0x80000000)` при установленном quick-ack бите клиента + `FLAG_NOT_ENCRYPTED (0x00000002)` для незашифрованных сообщений (`auth_key_id == 0`, снят для зашифрованных кадров реального клиента) + `FLAG_HAS_AD_TAG (0x00000008)` при наличии 16-байтного `ad_tag`.
+  - Дополнительная секция при `FLAG_HAS_AD_TAG` (ровно `28` байт перед `mtproto_payload`): `[extra_size: u32 LE = 24][TL_PROXY_TAG: u32 LE = 0xdb1e26ae][tl_bytes(ad_tag): 0x10 || 16B tag || 0x00 0x00 0x00]`.
 - **Префейс `MTV4` (ровно 70 байт, `edge → egress`):**
   - `0..4`: магия `MTV4` (`0x4d 0x54 0x56 0x34`);
   - `4..6`: `dc_id: i16` (BE, включая медиа-DC `-2`, `-4`, `1..=5`);
   - `6..14`: `timestamp: u64` (BE Unix seconds, окно `±30 с`);
   - `14..30`: `nonce: [u8; 16]` (проверка в `egress_nonce_cache`, защита от replay);
-  - `30..31`: `flags: u8` (`0x01` = `MTV4_FLAG_HAS_CLIENT_IP`, биты `1..7` должны быть `0`);
+  - `30..31`: `flags: u8` (`0x01` = `MTV4_FLAG_HAS_CLIENT_IP`; биты `1..2` (`0x06`) — клиентский транспорт: `0x00` = `padded-intermediate`, `0x02` = `intermediate`, `0x04` = `abridged`, `0x06` отклоняется; биты `3..7` должны быть `0`);
   - `31..32`: `reserved: u8` (`0x00`);
   - `32..36`: `client_ipv4: [u8; 4]` (`0.0.0.0`, если флаг `0x01` не выставлен);
   - `36..38`: `client_port: u16` (BE; `0`, если флаг `0x01` не выставлен);
-  - `38..70`: `hmac: [u8; 32]` = `HMAC-SHA256(egress_token, preface[0..38])` (аутентифицирует весь заголовок, включая `client_ipv4:port`).
+  - `38..70`: `hmac: [u8; 32]` = `HMAC-SHA256(egress_token, preface[0..38])` (аутентифицирует весь заголовок, включая `flags` и `client_ipv4:port`).
 - **Согласование режима и ACK (1 байт, `egress → edge`):**
   - `egress` проверяет `egress_allow_from`, rate-limit по IP, `HMAC-SHA256`, `timestamp ±30 с` и `nonce`-replay.
   - Если на `egress` `me.enabled == true` и пул открыл `MeSession` для `dc_id` → `egress` отвечает `EGRESS_ACK_OK` (`0x00`).
@@ -84,6 +87,7 @@
   - `kind = 0x01` (`PAYLOAD`): MTProto-кадр (`4 <= len <= 1 MiB`, кратно 4, проверка длины **до аллокации**, INV-08).
   - `kind = 0x02` (`QUICK_ACK`): `len == 4`, `confirm_key: u32 BE` (`egress → edge` при получении `RPC_SIMPLE_ACK`).
   - `kind = 0x03` (`EOF`): `len == 0`, штатное закрытие сессии.
+  - `kind = 0x04` (`PAYLOAD_QUICK_ACK`): MTProto-кадр от клиента с установленным quick-ack битом (`edge → egress`, выставляет `FLAG_QUICKACK` в `RPC_PROXY_REQ`).
 - **Обратная совместимость и порядок обновления:**
   - `egress v0.3` принимает `MTV2` (если `egress_accept_legacy = true`), `MTV3` (Direct stream) и `MTV4` (framed ME).
   - Порядок обновления split-инсталляции: **сначала `egress`, затем `edge`**. Старый `edge v0.2` продолжает работать с `egress v0.3` по `MTV3` без разрыва совместимости.
