@@ -319,6 +319,9 @@ struct State {
     egress_token: [u8; 16],
     egress_rr: std::sync::atomic::AtomicUsize,
     egress_health: std::sync::Mutex<EgressHealth>,
+    /// Per-egress cooldown strictly for `MTV4` (when an egress rejects `MTV4` or is `v0.2.0`),
+    /// kept separate from `EgressHealth` so `MTV3` Direct fallback is never penalized.
+    mtv4_cooldown: std::sync::Mutex<Vec<Option<Instant>>>,
     egress_probe_notify: Arc<tokio::sync::Notify>,
     egress_cooldown: Duration,
     egress_cooldown_max: Duration,
@@ -1063,6 +1066,7 @@ async fn main() -> Result<()> {
         egress_token,
         egress_rr: std::sync::atomic::AtomicUsize::new(0),
         egress_health: std::sync::Mutex::new(EgressHealth::new(egress_count)),
+        mtv4_cooldown: std::sync::Mutex::new(vec![None; egress_count]),
         egress_probe_notify: Arc::new(tokio::sync::Notify::new()),
         egress_cooldown: Duration::from_millis(config.egress_cooldown_base_ms),
         egress_cooldown_max: Duration::from_millis(config.egress_cooldown_max_ms),

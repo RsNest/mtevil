@@ -578,6 +578,44 @@ pub(crate) enum EgressAttemptErr {
     /// Attempt was cancelled because another concurrent attempt already signaled this node down.
     /// Must NOT record an extra failure or inflate cooldown backoff.
     SignaledDown(anyhow::Error),
+    /// Egress rejected `MTV4` (e.g. `egress v0.2.0` closed on unknown magic, or `egress v0.3`
+    /// returned `EGRESS_ACK_ERR` because ME is disabled/degraded). Must NOT penalize `MTV3`
+    /// health in `EgressHealth`; sets only the separate `mtv4_cooldown` slot.
+    Mtv4Unsupported(anyhow::Error),
+}
+
+const MTV4_UNSUPPORTED_COOLDOWN: Duration = Duration::from_secs(30);
+
+fn is_mtv4_in_cooldown(state: &State, idx: usize, now: Instant) -> bool {
+    let guard = state
+        .mtv4_cooldown
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard
+        .get(idx)
+        .and_then(|v| *v)
+        .is_some_and(|until| now < until)
+}
+
+fn mark_mtv4_cooldown(state: &State, idx: usize, now: Instant) {
+    let mut guard = state
+        .mtv4_cooldown
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if guard.len() <= idx {
+        guard.resize(idx + 1, None);
+    }
+    guard[idx] = Some(now + MTV4_UNSUPPORTED_COOLDOWN);
+}
+
+fn clear_mtv4_cooldown(state: &State, idx: usize) {
+    let mut guard = state
+        .mtv4_cooldown
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = guard.get_mut(idx) {
+        *slot = None;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -647,21 +685,36 @@ pub(crate) async fn dial_egress_candidate(
             .upstream_tx_bytes
             .fetch_add(preface.len() as u64, Relaxed);
         let mut ack = [0u8; 1];
-        upstream
-            .read_exact(&mut ack)
-            .await
-            .map_err(|e| EgressAttemptErr::Node(e.into()))?;
+        let is_mtv4 = matches!(mode, EgressDialMode::FramedMe { .. });
+        upstream.read_exact(&mut ack).await.map_err(|e| {
+            if is_mtv4 {
+                EgressAttemptErr::Mtv4Unsupported(anyhow::anyhow!(
+                    "egress closed after MTV4 preface (v0.2.0 or ME unsupported): {e}"
+                ))
+            } else {
+                EgressAttemptErr::Node(e.into())
+            }
+        })?;
         state
             .counters
             .upstream_rx_bytes
             .fetch_add(ack.len() as u64, Relaxed);
         if ack[0] == EGRESS_ACK_OK {
             EgressHealth::record_ack_latency(&state.egress_health, idx, t0.elapsed());
+            if is_mtv4 {
+                clear_mtv4_cooldown(state, idx);
+            }
             Ok(upstream)
         } else if ack[0] == EGRESS_ACK_ERR {
-            Err(EgressAttemptErr::Dc(anyhow::anyhow!(
-                "egress DC {dc_abs} unreachable (negative ACK)"
-            )))
+            if is_mtv4 {
+                Err(EgressAttemptErr::Mtv4Unsupported(anyhow::anyhow!(
+                    "egress rejected MTV4 for DC {dc_abs} (ME disabled or pool empty)"
+                )))
+            } else {
+                Err(EgressAttemptErr::Dc(anyhow::anyhow!(
+                    "egress DC {dc_abs} unreachable (negative ACK)"
+                )))
+            }
         } else {
             Err(EgressAttemptErr::Node(anyhow::anyhow!(
                 "egress upstream invalid ACK byte"
@@ -792,6 +845,12 @@ pub(crate) fn finalize_egress_error(
             drop(claim);
             e
         }
+        EgressAttemptErr::Mtv4Unsupported(e) => {
+            // Separate protocol cooldown: do NOT penalize EgressHealth so MTV3 Direct remains healthy.
+            drop(claim);
+            mark_mtv4_cooldown(state, idx, Instant::now());
+            e
+        }
     }
 }
 
@@ -853,10 +912,14 @@ async fn connect_egress_with_mode(
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempted_any = false;
         let mut hedged_this_conn = false;
+        let is_mtv4 = matches!(mode, EgressDialMode::FramedMe { .. });
         let mut offset = 0;
         while offset < count {
             let idx = (start + offset) % count;
             offset += 1;
+            if is_mtv4 && is_mtv4_in_cooldown(state, idx, Instant::now()) {
+                continue;
+            }
             let Some(claim) =
                 EgressHealth::try_claim(&state.egress_health, idx, dc_key, Instant::now())
             else {
@@ -899,6 +962,9 @@ async fn connect_egress_with_mode(
                 while offset < count {
                     let cand_idx = (start + offset) % count;
                     offset += 1;
+                    if is_mtv4 && is_mtv4_in_cooldown(state, cand_idx, Instant::now()) {
+                        continue;
+                    }
                     if let Some(c2) = EgressHealth::try_claim(
                         &state.egress_health,
                         cand_idx,
@@ -1039,6 +1105,11 @@ async fn connect_egress_with_mode(
         // Other concurrent callers wait in single-flight on `egress_probe_notify` within
         // the remaining handshake budget instead of failing immediately.
         if !attempted_any {
+            if is_mtv4 {
+                return Err(last_err.unwrap_or_else(|| {
+                    anyhow::anyhow!("all egress upstreams are in MTV4 unsupported cooldown")
+                }));
+            }
             struct NotifyOnDrop<'a>(&'a tokio::sync::Notify);
             impl Drop for NotifyOnDrop<'_> {
                 fn drop(&mut self) {

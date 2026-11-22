@@ -74,6 +74,7 @@ fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         egress_token: [0u8; 16],
         egress_rr: std::sync::atomic::AtomicUsize::new(0),
         egress_health: std::sync::Mutex::new(EgressHealth::new(0)),
+        mtv4_cooldown: std::sync::Mutex::new(Vec::new()),
         egress_probe_notify: Arc::new(tokio::sync::Notify::new()),
         egress_cooldown: Duration::from_millis(config::default_egress_cooldown_base_ms()),
         egress_cooldown_max: Duration::from_millis(config::default_egress_cooldown_max_ms()),

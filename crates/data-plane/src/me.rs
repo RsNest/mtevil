@@ -1601,6 +1601,7 @@ mod tests {
             egress_token: [0; 16],
             egress_rr: std::sync::atomic::AtomicUsize::new(0),
             egress_health: std::sync::Mutex::new(EgressHealth::new(0)),
+            mtv4_cooldown: std::sync::Mutex::new(Vec::new()),
             egress_probe_notify: Arc::new(tokio::sync::Notify::new()),
             egress_cooldown: Duration::from_secs(1),
             egress_cooldown_max: Duration::from_secs(5),
@@ -1891,6 +1892,7 @@ mod tests {
             egress_token: [0; 16],
             egress_rr: std::sync::atomic::AtomicUsize::new(0),
             egress_health: std::sync::Mutex::new(EgressHealth::new(0)),
+            mtv4_cooldown: std::sync::Mutex::new(Vec::new()),
             egress_probe_notify: Arc::new(tokio::sync::Notify::new()),
             egress_cooldown: Duration::from_secs(1),
             egress_cooldown_max: Duration::from_secs(5),
@@ -2127,6 +2129,7 @@ mod tests {
             egress_token: [0; 16],
             egress_rr: std::sync::atomic::AtomicUsize::new(0),
             egress_health: std::sync::Mutex::new(EgressHealth::new(0)),
+            mtv4_cooldown: std::sync::Mutex::new(Vec::new()),
             egress_probe_notify: Arc::new(tokio::sync::Notify::new()),
             egress_cooldown: Duration::from_secs(1),
             egress_cooldown_max: Duration::from_secs(5),
@@ -2243,6 +2246,7 @@ mod tests {
             egress_token,
             egress_rr: std::sync::atomic::AtomicUsize::new(0),
             egress_health: std::sync::Mutex::new(EgressHealth::new(count)),
+            mtv4_cooldown: std::sync::Mutex::new(vec![None; count]),
             egress_probe_notify: Arc::new(tokio::sync::Notify::new()),
             egress_cooldown: Duration::from_millis(200),
             egress_cooldown_max: Duration::from_secs(2),
@@ -2700,6 +2704,71 @@ mod tests {
             "edge must fall back to Direct via MTV3 when all egresses reject MTV4"
         );
         assert!(eg1_counters.egress_mtv3_connections.load(Ordering::Relaxed) >= 1);
+
+        // (d) Simulated v0.2.0 egress (closes immediately on unknown MTV4 magic with EOF,
+        // accepts MTV3): MTV4 unsupported sets separate mtv4_cooldown WITHOUT putting the node
+        // into EgressHealth cooldown, so immediate MTV3 fallback and subsequent calls stay healthy.
+        let v02_sim_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let v02_sim_addr = v02_sim_listener.local_addr()?;
+        let mtv4_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mtv3_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let m4_c = mtv4_hits.clone();
+        let m3_c = mtv3_hits.clone();
+        let v02_sim_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = v02_sim_listener.accept().await else {
+                    break;
+                };
+                let m4 = m4_c.clone();
+                let m3 = m3_c.clone();
+                tokio::spawn(async move {
+                    let mut magic = [0u8; 4];
+                    if s.read_exact(&mut magic).await.is_err() {
+                        return;
+                    }
+                    if magic == wire::EGRESS_MAGIC_V4 {
+                        m4.fetch_add(1, Ordering::Relaxed);
+                        // v0.2.0 closes immediately without sending an ACK byte
+                        return;
+                    }
+                    if magic == wire::EGRESS_MAGIC_V3 {
+                        m3.fetch_add(1, Ordering::Relaxed);
+                        let mut rest = [0u8; wire::EGRESS_PREFACE_V3_LEN - 4];
+                        if s.read_exact(&mut rest).await.is_ok() {
+                            let _ = s.write_all(&[EGRESS_ACK_OK]).await;
+                        }
+                    }
+                });
+            }
+        });
+        let compat_counters = Arc::new(telemetry::Counters::default());
+        let compat_state = make_edge_state(
+            client_secret,
+            token,
+            vec![v02_sim_addr],
+            Some(Arc::new(EdgeMeSettings::new(true, false))),
+            compat_counters,
+        );
+        // 1st MTV4 attempt hits v0.2.0 egress -> EOF -> Mtv4Unsupported (sets mtv4_cooldown, NOT EgressHealth!)
+        assert!(connect_upstream_mtv4(&compat_state, 2, None).await.is_err());
+        assert_eq!(mtv4_hits.load(Ordering::Relaxed), 1);
+        // Node must NOT be in EgressHealth cooldown (breaker state == 0 = healthy)
+        let breaker = EgressHealth::snapshot_breaker_states(
+            &compat_state.egress_health,
+            &compat_state.egress_upstreams,
+        );
+        assert_eq!(
+            breaker[0].1, 0,
+            "MTV4 unsupported must not put node in EgressHealth cooldown"
+        );
+        // Immediate MTV3 fallback succeeds without delay
+        let (_s_mtv3, r_mtv3) = connect_upstream(&compat_state, 2, &dc_t.header).await?;
+        assert_eq!(r_mtv3, "egress");
+        assert_eq!(mtv3_hits.load(Ordering::Relaxed), 1);
+        // 2nd MTV4 attempt skips v0.2.0 in 0ms without sending another failing MTV4 preface (avoids v0.2.0 rate-limit!)
+        assert!(connect_upstream_mtv4(&compat_state, 2, None).await.is_err());
+        assert_eq!(mtv4_hits.load(Ordering::Relaxed), 1);
+        v02_sim_task.abort();
 
         let _ = ed_stop_tx.send(());
         let _ = ed_task.await;
