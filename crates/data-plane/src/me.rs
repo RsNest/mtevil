@@ -3009,7 +3009,16 @@ mod tests {
                 }
             })
             .await??;
-            assert_eq!(reply, payload);
+            if kind == wire::ClientProtoKind::PaddedIntermediate {
+                assert!(
+                    reply.len() >= payload.len()
+                        && reply.len() <= payload.len() + 15
+                        && reply[..payload.len()] == payload[..],
+                    "padded-intermediate reply mismatch"
+                );
+            } else {
+                assert_eq!(reply, payload);
+            }
             Ok::<_, anyhow::Error>(())
         };
 
