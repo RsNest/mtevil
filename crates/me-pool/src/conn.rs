@@ -12,19 +12,22 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::time::timeout;
 
 /// Bounded per-session inbound frame queue (INV-03 backpressure).
 pub const SESSION_INBOUND_QUEUE_CAP: usize = 64;
 /// Bounded shared ME outbound frame queue (INV-03 backpressure).
 pub const ME_OUTBOUND_QUEUE_CAP: usize = 256;
+/// Default timeout for a single `write_all` on an ME TCP socket.
+pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub struct MeConnOptions {
     pub handshake_timeout: Duration,
     pub ping_interval: Duration,
     pub ping_timeout: Duration,
+    pub write_timeout: Duration,
     /// Optional public IPv4 override for KDF when running behind 1:1 NAT / Docker bridge.
     pub public_ipv4: Option<Ipv4Addr>,
 }
@@ -35,9 +38,17 @@ impl Default for MeConnOptions {
             handshake_timeout: Duration::from_secs(5),
             ping_interval: Duration::from_secs(20),
             ping_timeout: Duration::from_secs(10),
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
             public_ipv4: None,
         }
     }
+}
+
+/// Shared monotonic counters across one connection or an entire `MePool`.
+#[derive(Default)]
+pub(crate) struct MeConnCounters {
+    pub backpressure_drops: AtomicU64,
+    pub dropped_close_ext: AtomicU64,
 }
 
 struct SessionEntry {
@@ -50,8 +61,8 @@ struct ConnShared {
     next_conn_id: AtomicU64,
     our_addr: SocketAddrV4,
     out_tx: mpsc::Sender<Vec<u8>>,
-    /// Counter of sessions dropped due to slow-client inbound queue overflow (INV-03).
-    backpressure_drops: AtomicU64,
+    counters: Arc<MeConnCounters>,
+    shutdown_notify: Notify,
 }
 
 /// Active multiplexed connection to a single Telegram Middle-End server.
@@ -116,10 +127,16 @@ impl MeSession {
             map.remove(&self.conn_id);
         }
         if self.shared.alive.load(Ordering::Relaxed) {
-            let _ = self
+            if let Err(mpsc::error::TrySendError::Full(_)) = self
                 .shared
                 .out_tx
-                .try_send(encode_close_ext(self.conn_id).to_vec());
+                .try_send(encode_close_ext(self.conn_id).to_vec())
+            {
+                self.shared
+                    .counters
+                    .dropped_close_ext
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -137,6 +154,21 @@ impl MeConnection {
         endpoint: SocketAddrV4,
         proxy_secret: &[u8],
         opts: MeConnOptions,
+    ) -> Result<Self> {
+        Self::connect_with_counters(
+            endpoint,
+            proxy_secret,
+            opts,
+            Arc::new(MeConnCounters::default()),
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_with_counters(
+        endpoint: SocketAddrV4,
+        proxy_secret: &[u8],
+        opts: MeConnOptions,
+        counters: Arc<MeConnCounters>,
     ) -> Result<Self> {
         ensure!(
             proxy_secret.len() >= 16,
@@ -254,7 +286,8 @@ impl MeConnection {
             next_conn_id: AtomicU64::new(u64::from_le_bytes(init_id) | 1),
             our_addr,
             out_tx: out_tx.clone(),
-            backpressure_drops: AtomicU64::new(0),
+            counters,
+            shutdown_notify: Notify::new(),
         });
 
         let (mut rd, mut wr) = stream.into_split();
@@ -262,9 +295,21 @@ impl MeConnection {
 
         // Writer task: serializes seq_no = 0, 1, 2, ... and encrypts with continuous AES-256-CBC.
         let shared_w = shared.clone();
+        let write_timeout = opts.write_timeout;
         tokio::spawn(async move {
             let mut seq_no: i32 = 0;
-            while let Some(payload) = out_rx.recv().await {
+            loop {
+                if !shared_w.alive.load(Ordering::Relaxed) {
+                    break;
+                }
+                let payload = tokio::select! {
+                    biased;
+                    () = shared_w.shutdown_notify.notified() => break,
+                    maybe = out_rx.recv() => match maybe {
+                        Some(p) => p,
+                        None => break,
+                    }
+                };
                 let Ok(mut frame) = pack_rpc_frame(seq_no, &payload, true) else {
                     break;
                 };
@@ -272,7 +317,12 @@ impl MeConnection {
                 if enc.encrypt_in_place(&mut frame).is_err() {
                     break;
                 }
-                if wr.write_all(&frame).await.is_err() {
+                let write_ok = tokio::select! {
+                    biased;
+                    () = shared_w.shutdown_notify.notified() => false,
+                    res = timeout(write_timeout, wr.write_all(&frame)) => matches!(res, Ok(Ok(()))),
+                };
+                if !write_ok {
                     break;
                 }
             }
@@ -284,9 +334,15 @@ impl MeConnection {
         let out_tx_r = out_tx.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((_seq, payload)) =
-                    read_encrypted_frame(&mut rd, &mut dec, &mut read_buf).await
-                else {
+                if !shared_r.alive.load(Ordering::Relaxed) {
+                    break;
+                }
+                let read_res = tokio::select! {
+                    biased;
+                    () = shared_r.shutdown_notify.notified() => break,
+                    res = read_encrypted_frame(&mut rd, &mut dec, &mut read_buf) => res,
+                };
+                let Ok((_seq, payload)) = read_res else {
                     break;
                 };
                 let Ok(msg) = parse_rpc_message(&payload) else {
@@ -305,7 +361,10 @@ impl MeConnection {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
                                     // INV-03: slow client must never stall the shared ME reader loop.
-                                    shared_r.backpressure_drops.fetch_add(1, Ordering::Relaxed);
+                                    shared_r
+                                        .counters
+                                        .backpressure_drops
+                                        .fetch_add(1, Ordering::Relaxed);
                                     {
                                         let mut map = shared_r
                                             .sessions
@@ -313,7 +372,14 @@ impl MeConnection {
                                             .unwrap_or_else(|e| e.into_inner());
                                         map.remove(&conn_id);
                                     }
-                                    let _ = out_tx_r.try_send(encode_close_ext(conn_id).to_vec());
+                                    if let Err(mpsc::error::TrySendError::Full(_)) =
+                                        out_tx_r.try_send(encode_close_ext(conn_id).to_vec())
+                                    {
+                                        shared_r
+                                            .counters
+                                            .dropped_close_ext
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
                                     let mut map =
@@ -342,7 +408,8 @@ impl MeConnection {
             shutdown_shared(&shared_r);
         });
 
-        // Keepalive ping task: closes dead/hung ME sockets when pong does not arrive within ping_timeout.
+        // Keepalive ping task: closes dead/hung ME sockets when enqueueing RPC_PING or receiving
+        // RPC_PONG does not complete within ping_timeout.
         if !opts.ping_interval.is_zero() {
             let shared_p = shared.clone();
             let out_tx_p = out_tx;
@@ -354,25 +421,41 @@ impl MeConnection {
                 ticker.tick().await; // skip immediate first tick
                 let mut next_ping_id: i64 = 1;
                 loop {
-                    ticker.tick().await;
+                    if !shared_p.alive.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    tokio::select! {
+                        biased;
+                        () = shared_p.shutdown_notify.notified() => break,
+                        _ = ticker.tick() => {}
+                    }
                     if !shared_p.alive.load(Ordering::Relaxed) {
                         break;
                     }
                     let pid = next_ping_id;
                     next_ping_id = next_ping_id.wrapping_add(1);
-                    if out_tx_p.send(encode_ping(pid).to_vec()).await.is_err() {
+                    let ping_frame = encode_ping(pid).to_vec();
+                    let sent = tokio::select! {
+                        biased;
+                        () = shared_p.shutdown_notify.notified() => break,
+                        res = timeout(ping_timeout, out_tx_p.send(ping_frame)) => matches!(res, Ok(Ok(()))),
+                    };
+                    if !sent {
+                        shutdown_shared(&shared_p);
                         break;
                     }
-                    let got_pong = timeout(ping_timeout, async {
-                        while let Some(id) = pong_rx.recv().await {
-                            if id == pid {
-                                return true;
+                    let got_pong = tokio::select! {
+                        biased;
+                        () = shared_p.shutdown_notify.notified() => break,
+                        res = timeout(ping_timeout, async {
+                            while let Some(id) = pong_rx.recv().await {
+                                if id == pid {
+                                    return true;
+                                }
                             }
-                        }
-                        false
-                    })
-                    .await
-                    .unwrap_or(false);
+                            false
+                        }) => res.unwrap_or(false),
+                    };
                     if !got_pong {
                         shutdown_shared(&shared_p);
                         break;
@@ -388,8 +471,29 @@ impl MeConnection {
         self.shared.alive.load(Ordering::Relaxed)
     }
 
+    pub async fn wait_closed(&self) {
+        if !self.is_alive() {
+            return;
+        }
+        let notified = self.shared.shutdown_notify.notified();
+        if !self.is_alive() {
+            return;
+        }
+        notified.await;
+    }
+
     pub fn backpressure_drops(&self) -> u64 {
-        self.shared.backpressure_drops.load(Ordering::Relaxed)
+        self.shared
+            .counters
+            .backpressure_drops
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn dropped_close_ext(&self) -> u64 {
+        self.shared
+            .counters
+            .dropped_close_ext
+            .load(Ordering::Relaxed)
     }
 
     pub fn active_sessions(&self) -> usize {
@@ -433,8 +537,11 @@ impl MeConnection {
 
 fn shutdown_shared(shared: &Arc<ConnShared>) {
     shared.alive.store(false, Ordering::Relaxed);
-    let mut map = shared.sessions.lock().unwrap_or_else(|e| e.into_inner());
-    map.clear();
+    {
+        let mut map = shared.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        map.clear();
+    }
+    shared.shutdown_notify.notify_waiters();
 }
 
 async fn read_plain_frame<R: AsyncReadExt + Unpin>(

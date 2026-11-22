@@ -5,7 +5,7 @@ pub mod pool;
 pub mod wire;
 
 pub use config::{is_global_ipv4, parse_ad_tag_hex, MeConfigBundle, MeDiskCache, ProxyMultiConfig};
-pub use conn::{MeConnOptions, MeConnection, MeSession};
+pub use conn::{MeConnOptions, MeConnection, MeSession, DEFAULT_WRITE_TIMEOUT};
 pub use crypto::{derive_me_aes_key_iv, KdfPurpose, MeCbcDecryptor, MeCbcEncryptor};
 pub use pool::{MePool, MePoolConfig, MePoolHealth};
 pub use wire::{
@@ -45,6 +45,9 @@ mod tests {
         pings_seen: Arc<AtomicUsize>,
         drop_pongs: Arc<AtomicBool>,
         burst_count: Arc<AtomicUsize>,
+        accepts: Arc<AtomicUsize>,
+        freeze_first_n: Arc<AtomicUsize>,
+        refuse_all: Arc<AtomicBool>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -64,18 +67,29 @@ mod tests {
         let pings_seen = Arc::new(AtomicUsize::new(0));
         let drop_pongs = Arc::new(AtomicBool::new(false));
         let burst_count = Arc::new(AtomicUsize::new(1));
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let freeze_first_n = Arc::new(AtomicUsize::new(0));
+        let refuse_all = Arc::new(AtomicBool::new(false));
 
         let obs_cl = observed.clone();
         let cls_cl = closed_conns.clone();
         let ping_cl = pings_seen.clone();
         let dp_cl = drop_pongs.clone();
         let bc_cl = burst_count.clone();
+        let acc_cl = accepts.clone();
+        let frz_cl = freeze_first_n.clone();
+        let ref_cl = refuse_all.clone();
 
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut s, peer)) = listener.accept().await else {
                     break;
                 };
+                let conn_idx = acc_cl.fetch_add(1, Ordering::Relaxed) + 1;
+                if ref_cl.load(Ordering::Relaxed) {
+                    drop(s);
+                    continue;
+                }
                 let SocketAddr::V4(peer_v4) = peer else {
                     continue;
                 };
@@ -85,6 +99,7 @@ mod tests {
                 let pings = ping_cl.clone();
                 let dp = dp_cl.clone();
                 let bc = bc_cl.clone();
+                let should_freeze = conn_idx <= frz_cl.load(Ordering::Relaxed);
                 tokio::spawn(async move {
                     let mut plain_buf = Vec::new();
                     let mut tmp = [0u8; 256];
@@ -181,6 +196,10 @@ mod tests {
                                 {
                                     return;
                                 }
+                                if should_freeze {
+                                    // Keep socket open but stop reading/writing completely.
+                                    std::future::pending::<()>().await;
+                                }
                             }
                             RPC_PING if rpay.len() >= 12 => {
                                 pings.fetch_add(1, Ordering::Relaxed);
@@ -273,6 +292,9 @@ mod tests {
             pings_seen,
             drop_pongs,
             burst_count,
+            accepts,
+            freeze_first_n,
+            refuse_all,
             task,
         })
     }
@@ -367,7 +389,7 @@ mod tests {
                 handshake_timeout: Duration::from_secs(3),
                 ping_interval: Duration::ZERO,
                 ping_timeout: Duration::from_secs(2),
-                public_ipv4: None,
+                ..MeConnOptions::default()
             },
         )
         .await?;
@@ -428,7 +450,7 @@ mod tests {
                 handshake_timeout: Duration::from_secs(3),
                 ping_interval: Duration::ZERO,
                 ping_timeout: Duration::from_secs(2),
-                public_ipv4: None,
+                ..MeConnOptions::default()
             },
         )
         .await?;
@@ -479,8 +501,9 @@ mod tests {
                     handshake_timeout: Duration::from_secs(2),
                     ping_interval: Duration::from_millis(80),
                     ping_timeout: Duration::from_millis(150),
-                    public_ipv4: None,
+                    ..MeConnOptions::default()
                 },
+                ..MePoolConfig::default()
             },
         );
 
@@ -519,19 +542,327 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .is_empty());
 
-        // Simulate hung ME server (drops pongs): ping timeout closes dead socket and marks pool degraded.
+        // Simulate hung ME server (drops pongs): ping timeout closes dead socket (active session gets EOF)
+        // and worker reconnects to srv2.
+        let accepts_before = srv2.accepts.load(Ordering::Relaxed);
         srv2.drop_pongs.store(true, Ordering::Relaxed);
-        let mut became_degraded = false;
+        let eof = timeout(Duration::from_secs(2), sess.recv_frame())
+            .await
+            .context("ping timeout did not close active session")?;
+        assert!(
+            eof.is_none(),
+            "active session must receive EOF on ping timeout"
+        );
+        let mut reconnected = false;
         for _ in 0..40 {
-            if pool.health().degraded {
-                became_degraded = true;
+            if srv2.accepts.load(Ordering::Relaxed) > accepts_before {
+                reconnected = true;
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(30)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(became_degraded, "ping timeout must detect hung ME socket");
+        assert!(
+            reconnected,
+            "ping timeout must close hung ME socket and trigger reconnect"
+        );
 
         pool.shutdown();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chaos_stalled_me_under_load_times_out_eof_and_reconnects() -> Result<()> {
+        let secret = vec![0xaa; 128];
+        let srv = spawn_mock_me_server(secret.clone()).await?;
+        // First ME connection completes handshake then stops reading/replying completely;
+        // subsequent connections behave normally.
+        srv.freeze_first_n.store(1, Ordering::Relaxed);
+
+        let write_timeout = Duration::from_secs(2);
+        let ping_interval = Duration::from_secs(1);
+        let ping_timeout = Duration::from_secs(2);
+
+        let conf = format!("default 2;\nproxy_for 2 {};\n", srv.addr);
+        let bundle = MeConfigBundle::from_raw(secret.clone(), &conf)?;
+        let pool = MePool::start(
+            bundle,
+            MePoolConfig {
+                conns_per_dc: 1,
+                reconnect_base: Duration::from_millis(100),
+                reconnect_max: Duration::from_millis(500),
+                conn_opts: MeConnOptions {
+                    handshake_timeout: Duration::from_secs(2),
+                    ping_interval,
+                    ping_timeout,
+                    write_timeout,
+                    public_ipv4: None,
+                },
+                ..MePoolConfig::default()
+            },
+        );
+
+        // Wait until first (soon-to-freeze) connection finishes handshake.
+        for _ in 0..50 {
+            if !pool.health().degraded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!pool.health().degraded);
+
+        let mut active_sess = pool.open_session(2, None, None)?;
+        let flood_sess = pool.open_session(2, None, None)?;
+        let close_sess = pool.open_session(2, None, None)?;
+
+        let t0 = tokio::time::Instant::now();
+        // Saturate OS TCP send buffer + ME_OUTBOUND_QUEUE_CAP so writer stalls on write_all
+        // and out_tx is full.
+        let flood_handle = tokio::spawn(async move {
+            let chunk = vec![0xcd; 64 * 1024];
+            for _ in 0..600 {
+                if flood_sess.send_frame(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Give flood task time to fill the TCP send buffer and out_tx channel.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Closing a session while out_tx is saturated must count dropped RPC_CLOSE_EXT (never block).
+        close_sess.close();
+        assert!(
+            pool.health().dropped_close_ext >= 1,
+            "closing a session while out_tx is full must increment dropped_close_ext"
+        );
+
+        // Active session must receive EOF within write/ping timeout bound.
+        let eof = timeout(Duration::from_secs(6), active_sess.recv_frame())
+            .await
+            .context("stalled ME did not close active session within timeout")?;
+        assert!(
+            eof.is_none(),
+            "active session must receive EOF when stalled ME socket times out"
+        );
+        let elapsed = t0.elapsed();
+        let max_expected =
+            write_timeout.max(ping_interval + ping_timeout) + Duration::from_millis(500);
+        assert!(
+            elapsed <= max_expected,
+            "stalled ME detection took {elapsed:?}, expected <= {max_expected:?}"
+        );
+        let _ = flood_handle.await;
+
+        // Pool must reconnect to the healthy 2nd connection and serve new sessions.
+        for _ in 0..80 {
+            if srv.accepts.load(Ordering::Relaxed) >= 2 && !pool.health().degraded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            srv.accepts.load(Ordering::Relaxed) >= 2 && !pool.health().degraded,
+            "pool must reconnect after stalled ME socket closes"
+        );
+        let mut recovered = pool.open_session(2, None, None)?;
+        recovered.send_frame(&[0x42; 16]).await?;
+        let reply = timeout(Duration::from_secs(2), recovered.recv_frame())
+            .await?
+            .context("recovered session reply")?;
+        assert_eq!(reply, vec![0x42; 16]);
+
+        pool.shutdown();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chaos_all_me_sockets_down_no_tight_loop_and_no_task_leaks() -> Result<()> {
+        let secret = vec![0xbb; 128];
+        let srv = spawn_mock_me_server(secret.clone()).await?;
+        srv.refuse_all.store(true, Ordering::Relaxed);
+
+        let conf = format!(
+            "default 2;\nproxy_for 2 {};\nproxy_for 4 {};\n",
+            srv.addr, srv.addr
+        );
+        let bundle = MeConfigBundle::from_raw(secret, &conf)?;
+        let pool = MePool::start(
+            bundle,
+            MePoolConfig {
+                conns_per_dc: 2,
+                reconnect_base: Duration::from_millis(200),
+                reconnect_max: Duration::from_secs(2),
+                conn_opts: MeConnOptions {
+                    handshake_timeout: Duration::from_millis(200),
+                    ping_interval: Duration::ZERO,
+                    ..MeConnOptions::default()
+                },
+                ..MePoolConfig::default()
+            },
+        );
+        assert_eq!(pool.active_workers(), 4);
+
+        // Advance 5 seconds of virtual time across 4 workers; backoff must prevent tight-looping.
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let health = pool.health();
+        assert!(health.degraded);
+        assert_eq!(health.alive_connections, 0);
+        assert!(
+            pool.open_session(2, None, None).is_err(),
+            "open_session must fail immediately when all ME sockets are down"
+        );
+        let attempts = srv.accepts.load(Ordering::Relaxed);
+        assert!(
+            (4..=40).contains(&attempts),
+            "expected bounded backoff attempts across 4 workers over 5s, got {attempts}"
+        );
+
+        pool.shutdown();
+        for _ in 0..20 {
+            if pool.active_workers() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            pool.active_workers(),
+            0,
+            "all worker tasks must exit cleanly after shutdown"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn corrupted_conf_or_secret_never_overwrites_lkg_cache() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "mtevil-me-lkg-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = MeDiskCache::new(&dir);
+
+        let valid_secret = vec![0x5c; 128];
+        let valid_conf = "default 2;\nproxy_for 2 149.154.167.50:88;\n";
+        let lkg = cache.save_validated(&valid_secret, valid_conf)?;
+
+        // Corrupted proxy-multi.conf variants must fail and leave LKG intact.
+        assert!(cache.save_validated(&valid_secret, "").is_err());
+        assert!(cache
+            .save_validated(&valid_secret, "not valid conf\nproxy_for x y;\n")
+            .is_err());
+        assert!(cache.save_validated(&valid_secret, "default 2;\n").is_err());
+
+        // Corrupted proxy-secret variants (< 16 bytes) must fail and leave LKG intact.
+        assert!(cache.save_validated(&[], valid_conf).is_err());
+        assert!(cache.save_validated(&[0x11; 8], valid_conf).is_err());
+
+        let reloaded = cache.load()?;
+        assert_eq!(reloaded, lkg);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hot_swap_config_without_breaking_existing_sessions() -> Result<()> {
+        let secret = vec![0x66; 128];
+        let srv1 = spawn_mock_me_server(secret.clone()).await?;
+        let srv2 = spawn_mock_me_server(secret.clone()).await?;
+
+        let conf1 = format!("default 2;\nproxy_for 2 {};\n", srv1.addr);
+        let bundle1 = MeConfigBundle::from_raw(secret.clone(), &conf1)?;
+        let pool = MePool::start(
+            bundle1,
+            MePoolConfig {
+                conns_per_dc: 1,
+                reconnect_base: Duration::from_millis(50),
+                reconnect_max: Duration::from_millis(200),
+                drain_timeout: Duration::from_secs(5),
+                conn_opts: MeConnOptions {
+                    handshake_timeout: Duration::from_secs(2),
+                    ping_interval: Duration::ZERO,
+                    ..MeConnOptions::default()
+                },
+            },
+        );
+
+        for _ in 0..40 {
+            if !pool.health().degraded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!pool.health().degraded);
+
+        // Open existing session on srv1 before hot-swap.
+        let mut sess_old = pool.open_session(2, None, None)?;
+        sess_old.send_frame(&[0x11; 16]).await?;
+        let rep1 = timeout(Duration::from_secs(2), sess_old.recv_frame())
+            .await?
+            .context("pre-swap reply on srv1")?;
+        assert_eq!(rep1, vec![0x11; 16]);
+
+        // Hot-swap config to srv2 without closing sess_old.
+        let conf2 = format!("default 2;\nproxy_for 2 {};\n", srv2.addr);
+        let bundle2 = MeConfigBundle::from_raw(secret.clone(), &conf2)?;
+        pool.update_config(bundle2);
+
+        for _ in 0..40 {
+            if !pool.health().degraded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!pool.health().degraded);
+
+        // Existing session opened before update_config must continue working without interruption.
+        sess_old.send_frame(&[0x22; 16]).await?;
+        let rep2 = timeout(Duration::from_secs(2), sess_old.recv_frame())
+            .await?
+            .context("post-swap reply on existing sess_old")?;
+        assert_eq!(rep2, vec![0x22; 16]);
+
+        // New session must route to srv2.
+        let mut sess_new = pool.open_session(2, None, None)?;
+        sess_new.send_frame(&[0x33; 16]).await?;
+        let rep3 = timeout(Duration::from_secs(2), sess_new.recv_frame())
+            .await?
+            .context("new session reply on srv2")?;
+        assert_eq!(rep3, vec![0x33; 16]);
+        assert!(
+            !srv2
+                .observed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "new session must use srv2 after hot-swap"
+        );
+
+        // Verify MePoolHealth surfaces backpressure_drops monotonically across the pool.
+        let _slow = pool.open_session(2, None, None)?;
+        srv2.burst_count
+            .store(SESSION_INBOUND_QUEUE_CAP + 4, Ordering::Relaxed);
+        _slow.send_frame(&[0x44; 16]).await?;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let h = pool.health();
+        assert_eq!(h.backpressure_drops, 1);
+        assert_eq!(h.dropped_close_ext, 0);
+
+        sess_old.close();
+        sess_new.close();
+        pool.shutdown();
+        for _ in 0..30 {
+            if pool.active_workers() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(pool.active_workers(), 0);
         Ok(())
     }
 
@@ -562,6 +893,7 @@ mod tests {
                 ping_interval: Duration::ZERO,
                 ping_timeout: Duration::from_secs(5),
                 public_ipv4,
+                ..MeConnOptions::default()
             },
         )
         .await?;

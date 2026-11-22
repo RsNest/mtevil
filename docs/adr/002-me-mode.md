@@ -43,7 +43,7 @@
 | Критерий | Вариант 1: ME только на `edge` | Вариант 2 (выбран): `edge` передаёт кадры по `MTV4`, ME ведёт `egress` |
 |---|---|---|
 | **Что видит `edge`** | Клиентский FakeTLS/`obfuscated2`, `users.json`, расшифрованный транспортный кадр MTProto, `proxy-secret`/`proxy-multi.conf`, `ad_tag`. | Клиентский FakeTLS/`obfuscated2`, `users.json`, расшифрованный транспортный кадр MTProto (внутренний MTProto остаётся E2E-шифрованным ключом клиента). Не требует доступа к `core.telegram.org` и ME-серверам. |
-| **Что видит `egress`** | Не участвует в ME (либо вообще не используется). | `dc_id`, транспортные кадры MTProto, ME-пул, `proxy-secret`/`proxy-multi.conf`, `ad_tag`, и клиентский `remote_ip:port` **только если** включён `me.send_client_ip: true` (иначе `0.0.0.0:0`). **Клиентские IP на `egress` никогда не пишутся в логи.** Не видит клиентский FakeTLS и `users.json`. |
+| **Что видит `egress`** | Не участвует в ME (либо вообще не используется). | `dc_id`, транспортные кадры MTProto, ME-пул, `proxy-secret`/`proxy-multi.conf`, `ad_tag`, и клиентский `remote_ip:port` при `me.send_client_ip: true` (по умолчанию, как в официальном MTProxy; при экспериментальном `me.send_client_ip: false` передаётся `0.0.0.0:0`). **Клиентские IP на `egress` никогда не пишутся в логи.** Не видит клиентский FakeTLS и `users.json`. |
 | **Доступность в блокируемой сети** | **Неработоспособен в РФ/блокируемых сетях:** `edge` не имеет прямого доступа к `core.telegram.org` и ME-серверам (подтверждено отказом `WinError 10060` в спайке 0.3). | **Работает в split-топологии:** весь доступ к `core.telegram.org` и ME-серверам идёт с зарубежного `egress`. |
 | **Безопасность канала `edge ↔ egress`** | Не меняется. | `MTV4` сохраняет HMAC-SHA256 аутентификацию префейса `MTV3` (`timestamp ±30s`, `nonce`-replay, CIDR `egress_allow_from`), добавляет флаг режима `framed_me` + опциональный `remote_ip:port` + length-prefixed кадры с проверкой max-frame-size до аллокации (INV-08). |
 | **Failover (`breaker`/`hedge`/`cooldown`)** | Нет failover между `egress`. | Полностью сохраняются `EgressHealth`, `egress_hedge_ms`, per-node адаптивный `per_try`, `DcAckTimeout` + F3b-эскалация. `egress` шлёт `EGRESS_ACK_OK` только если выбран живой ME-канал (или разрешённый Direct-fallback), иначе `EGRESS_ACK_ERR`. |
@@ -55,11 +55,13 @@
 ## 3. Приватность, NAT/Docker, `ad_tag` и политика Fallback
 
 ### 3.1. Приватность (`me.send_client_ip`)
-- В протоколе ME пакет `RPC_PROXY_REQ` содержит поля `remote_ip` и `remote_port` — если передавать реальный адрес клиента, Telegram (ME-сервер) видит IP-адрес пользователя, в отличие от Direct-режима, где Telegram видит только IP прокси.
-- **Эмпирическая проверка спайком (`scripts/me_spike.py --dc 2 --remote-ip 0.0.0.0 --remote-port 0`):** Telegram ME **принимает** нулевой адрес `0.0.0.0:0` и возвращает валидный `resPQ#05162463` (`100 B`, `RTT = 22.1 ms`).
-- **Решение:** вводится параметр `me.send_client_ip: bool` со значением **по умолчанию `false`** (передаётся `0.0.0.0:0`). Если оператору требуется передача клиентского IP (например, по требованию Telegram/антиспама), он включает `me.send_client_ip: true` осознанно.
-- **Split-правило:** даже при `me.send_client_ip: true` на `egress` клиентский IP используется только в памяти для заполнения `RPC_PROXY_REQ` и **никогда не записывается в логи, метрики или файлы**.
-- **Предупреждение для README и мастера установки:** при включении ME (и особенно `me.send_client_ip: true`) мастер и `README.md` обязаны явно предупреждать оператора о том, какие метаданные передаются на серверы Telegram.
+- В протоколе ME пакет `RPC_PROXY_REQ` содержит поля `remote_ip` и `remote_port` — в отличие от Direct-режима, где Telegram видит только IP прокси, в ME-режиме по умолчанию Telegram (ME-сервер) получает реальный IP-адрес клиента (как в официальном MTProxy).
+- **Эмпирическая проверка спайком (`scripts/me_spike.py --dc 2 --remote-ip 0.0.0.0 --remote-port 0`):** Telegram ME **принимает** нулевой адрес `0.0.0.0:0` на уровне `req_pq_multi → resPQ#05162463` (`100 B`, `RTT = 22.1 ms`), однако полная пользовательская сессия реального клиента Telegram (авторизация, чаты, медиа, `ad_tag`) с `0.0.0.0:0` ещё не проверялась.
+- **Решение:** вводится явная настройка `me.send_client_ip: bool`:
+  - **По умолчанию `true`** — отправляется реальный адрес клиента (`remote_ip:port`), как в официальном MTProxy.
+  - **Значение `false` (`0.0.0.0:0`) — помечено «экспериментально»** до проверки реальной сессии реальным клиентом Telegram.
+- **Split-правило:** на `egress` клиентский IP используется только в памяти для заполнения `RPC_PROXY_REQ` и **никогда не записывается в логи, метрики или файлы**.
+- **Предупреждение для README и мастера установки:** при включении ME мастер и `README.md` обязаны явно предупреждать оператора о том, что при `me.send_client_ip: true` (по умолчанию) Telegram видит реальный IP клиента, а режим `me.send_client_ip: false` (`0.0.0.0:0`) является экспериментальным.
 
 ### 3.2. NAT и Docker (`me.public_ipv4`)
 - В формуле KDF ME-протокола участвуют локальный IPv4 (`clt_ip`) и локальный порт (`clt_port`) TCP-сокета. Telegram ME подставляет в KDF тот публичный IPv4 и порт, с которого пришло соединение.
@@ -92,7 +94,7 @@
 
 ## 4. Решение
 
-1. **В `direct`:** встроенный `crates/me-pool`, выключенный по умолчанию (`me.enabled = false`), `me.send_client_ip = false`, `me.fallback_to_direct = true` (с индикацией `ME degraded` в `status`), `me.public_ipv4` (авто + ручной), `ad_tag` в отдельном файле `0600` с горячим перечитыванием без рестарта, кэш `proxy-secret`/`proxy-multi.conf` в томе `replay`.
+1. **В `direct`:** встроенный `crates/me-pool`, выключенный по умолчанию (`me.enabled = false`), явная настройка `me.send_client_ip = true` по умолчанию (как в официальном MTProxy; `false` / `0.0.0.0:0` помечено «экспериментально» до проверки реальным клиентом Telegram), `me.fallback_to_direct = true` (с индикацией `ME degraded` в `status`), `me.public_ipv4` (авто + ручной), `ad_tag` в отдельном файле `0600` с горячим перечитыванием без рестарта, кэш `proxy-secret`/`proxy-multi.conf` в томе `replay`.
 2. **В split `edge → egress`:** **Вариант 2** — `edge` расшифровывает клиентский транспорт и передаёт MTProto-кадры на `egress` по версионированному протоколу **`MTV4`**, а `egress` ведёт ME-пул, `ad_tag` и `core.telegram.org` refresh (не логируя клиентские IP). `MTV2` и `MTV3` остаются рабочими; порядок обновления `v0.2 → v0.3` — сначала `egress`, потом `edge`.
 
 ---
