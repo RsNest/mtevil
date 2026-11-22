@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 mtevil-proto = { path = "../crates/proto" }
+mtevil-me-pool = { path = "../crates/me-pool" }
 
 [[bin]]
 name = "fuzz_client_hello"
@@ -35,6 +36,20 @@ bench = false
 [[bin]]
 name = "fuzz_egress_preface"
 path = "fuzz_targets/fuzz_egress_preface.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_me_rpc_frame"
+path = "fuzz_targets/fuzz_me_rpc_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_me_proxy_conf"
+path = "fuzz_targets/fuzz_me_proxy_conf.rs"
 test = false
 doc = false
 bench = false
