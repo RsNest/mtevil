@@ -2678,6 +2678,80 @@ class SetupValidationTests(unittest.TestCase):
         )
         self.assertEqual(setup.format_handshake_diag_lines("egress", {"client_hello_incomplete_timeout": 1}), [])
 
+    def test_self_steal_wizard_port_owner_loop_check_host_mode_and_reconfigure_preserve(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            # 1. Busy 443 prints owner + self-steal hint, and non-443 prints soft note.
+            with (
+                mock.patch.object(setup, "deployment_owns_port", return_value=False),
+                mock.patch.object(setup, "is_port_available", side_effect=[False, True]),
+                mock.patch.object(setup, "describe_port_owner", return_value="nginx (pid 4321)"),
+                mock.patch.object(setup, "find_free_port", return_value=24443),
+                mock.patch.object(sys, "stdin", io.StringIO("24443\n")),
+                mock.patch.object(sys, "stdout", new_callable=io.StringIO) as out_buf,
+            ):
+                chosen_port = setup.ensure_available_port(d, "mtevil-direct", "0.0.0.0", 443)
+            self.assertEqual(chosen_port, 24443)
+            self.assertIn("nginx (pid 4321)", out_buf.getvalue())
+            self.assertIn("self-steal", out_buf.getvalue())
+            self.assertIn("нестандартный порт 24443", out_buf.getvalue())
+
+            # 2. Loop detection prevents cover from pointing back to mtevil's own entry port.
+            self.assertTrue(setup.cover_loops_to_public_entry("127.0.0.1:443", "0.0.0.0", 443, "site.example.org", "site.example.org"))
+            self.assertTrue(setup.cover_loops_to_public_entry("site.example.org:443", "0.0.0.0", 443, "site.example.org", "site.example.org"))
+            self.assertFalse(setup.cover_loops_to_public_entry("127.0.0.1:8443", "0.0.0.0", 443, "site.example.org", "site.example.org"))
+
+            # 3. resolve_network_host_port with allow_bridge_fallback=False never offers bridge for loopback-cover.
+            with (
+                mock.patch.object(setup, "read_unprivileged_port_start", return_value=1024),
+                mock.patch.object(setup, "find_free_port", return_value=24443),
+                mock.patch.object(setup, "deployment_owns_port", return_value=False),
+                mock.patch.object(setup, "is_port_available", return_value=True),
+                mock.patch.object(sys, "stdin", io.StringIO("24443\n")),
+                mock.patch.object(sys, "stdout", new_callable=io.StringIO) as host_out,
+            ):
+                port_out, net_host_out = setup.resolve_network_host_port(
+                    d,
+                    "mtevil-direct",
+                    "0.0.0.0",
+                    443,
+                    True,
+                    explicit_network_host=True,
+                    allow_bridge_fallback=False,
+                )
+            self.assertEqual((port_out, net_host_out), (24443, True))
+            self.assertIn("автоматический переход в bridge недоступен", host_out.getvalue())
+
+            # 4. choose_wizard_mode supports self-steal (option 3 and default="self-steal").
+            with mock.patch.object(sys, "stdin", io.StringIO("3\n")), mock.patch.object(sys, "stdout", io.StringIO()):
+                self.assertEqual(setup.choose_wizard_mode(), "self-steal")
+            with mock.patch.object(sys, "stdin", io.StringIO("\n")), mock.patch.object(sys, "stdout", io.StringIO()):
+                self.assertEqual(setup.choose_wizard_mode(default="self-steal"), "self-steal")
+
+            # 5. Failing check_cover_from_container in --self-steal aborts BEFORE touching live config.json.
+            (d / "config.json").write_text('{"role":"direct","sni":"old.example.org","cover":"127.0.0.1:8443"}\n', encoding="utf-8")
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: old\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_PORT=443\n", encoding="utf-8")
+            with (
+                mock.patch.object(sys, "argv", ["mtevilctl", "--self-steal", "--no-build", "--dir", str(d)]),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "prompt_client_address", return_value=("site.example.org", None)),
+                mock.patch.object(setup, "deployment_owns_port", return_value=True),
+                mock.patch.object(setup, "read_unprivileged_port_start", return_value=0),
+                mock.patch.object(setup, "ensure_generated_secret", return_value=False),
+                mock.patch.object(setup, "volume_file_exists", return_value=True),
+                mock.patch.object(setup, "record_allowed_snis_in_volume"),
+                mock.patch.object(setup, "check_cover_from_container", return_value=(False, "verify error:self-signed")),
+                mock.patch.object(setup, "run", return_value=mock.Mock(returncode=0, stdout="", stderr="")),
+                mock.patch.object(sys, "stdin", io.StringIO("y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n")),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+                mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err_buf,
+            ):
+                rc = setup.main()
+            self.assertEqual(rc, 1)
+            self.assertIn("не прошёл проверку сертификата/TLS", err_buf.getvalue())
+            self.assertIn("old.example.org", (d / "config.json").read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     prog = unittest.main(verbosity=2, exit=False)
