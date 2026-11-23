@@ -2399,6 +2399,8 @@ def run_status_command(deploy_dir: Path) -> int:
     rstats = read_container_runtime_stats(base, svc) if running else None
     for me_line in format_me_status_lines(role, saved_cfg, rstats):
         print(me_line)
+    for diag_line in format_handshake_diag_lines(role, rstats):
+        print(diag_line)
     if role == "egress":
         accept_legacy = saved_cfg.get("egress_accept_legacy", True) is not False
         proto_mode = "MTV4 + MTV3 + legacy MTV2 (переходный)" if accept_legacy else "MTV4 + MTV3 (строгий)"
@@ -3020,6 +3022,33 @@ def format_me_status_lines(
             f"  Счётчики ME:       fallback={fb_total}, refresh_err={ref_err}, backpressure_drops={bp_drops}, dropped_close_ext={cl_drops}"
         )
         lines.append(f"  Рекламный тег:     {ad_status}")
+    return lines
+
+
+def format_handshake_diag_lines(
+    role: str,
+    rstats: dict[str, object] | None,
+) -> list[str]:
+    if role not in ("direct", "edge") or not isinstance(rstats, dict):
+        return []
+    if (
+        "client_hello_incomplete_timeout" not in rstats
+        and "client_hello_incomplete_close" not in rstats
+        and "inner_header_incomplete" not in rstats
+    ):
+        return []
+    ch_to = int(rstats.get("client_hello_incomplete_timeout") or 0)
+    ch_cl = int(rstats.get("client_hello_incomplete_close") or 0)
+    ih_inc = int(rstats.get("inner_header_incomplete") or 0)
+    lines = [
+        f"  Сбои handshake:    таймаут ClientHello={ch_to}, закрытие сокета={ch_cl}, после ServerHello={ih_inc}"
+    ]
+    sample = rstats.get("last_client_hello_incomplete")
+    if (ch_to + ch_cl) > 0 and isinstance(sample, dict):
+        rx = int(sample.get("received_bytes") or 0)
+        exp = int(sample.get("expected_bytes") or 0)
+        reason_lbl = "таймаут" if sample.get("timeout") else "закрытие сокета"
+        lines.append(f"  Последний обрыв:   ClientHello: получено {rx} из {exp} байт ({reason_lbl})")
     return lines
 
 

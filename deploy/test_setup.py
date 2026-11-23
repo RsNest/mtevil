@@ -2655,6 +2655,29 @@ class SetupValidationTests(unittest.TestCase):
             self.assertEqual(loaded["config"]["sni"], "example.com")
             self.assertEqual(loaded["config"]["cover"], "example.com:443")
 
+    def test_format_handshake_diag_lines(self):
+        lines = setup.format_handshake_diag_lines(
+            "direct",
+            {
+                "client_hello_incomplete_timeout": 12,
+                "client_hello_incomplete_close": 2,
+                "inner_header_incomplete": 3,
+                "last_client_hello_incomplete": {
+                    "received_bytes": 1448,
+                    "expected_bytes": 1549,
+                    "timeout": True,
+                },
+            },
+        )
+        self.assertEqual(
+            lines,
+            [
+                "  Сбои handshake:    таймаут ClientHello=12, закрытие сокета=2, после ServerHello=3",
+                "  Последний обрыв:   ClientHello: получено 1448 из 1549 байт (таймаут)",
+            ],
+        )
+        self.assertEqual(setup.format_handshake_diag_lines("egress", {"client_hello_incomplete_timeout": 1}), [])
+
 
 if __name__ == "__main__":
     prog = unittest.main(verbosity=2, exit=False)
