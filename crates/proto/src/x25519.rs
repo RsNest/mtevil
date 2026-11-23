@@ -352,6 +352,19 @@ mod tests {
     }
 
     #[test]
+    fn x25519_matches_x25519_dalek_across_10000_random_scalars() {
+        use rand::RngCore;
+        for _ in 0..10_000 {
+            let mut sk = [0u8; 32];
+            OsRng.fill_bytes(&mut sk);
+            let ours = public_from_secret(&sk);
+            let dalek_sk = x25519_dalek::StaticSecret::from(sk);
+            let dalek_pk = x25519_dalek::PublicKey::from(&dalek_sk);
+            assert_eq!(ours, *dalek_pk.as_bytes());
+        }
+    }
+
+    #[test]
     #[ignore = "manual CPU cost benchmark for 10,000 X25519 key generations"]
     fn bench_x25519_10000_keys_cpu_cost() {
         let t0 = std::time::Instant::now();

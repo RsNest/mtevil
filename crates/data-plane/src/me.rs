@@ -1672,6 +1672,9 @@ mod tests {
             idle: Duration::from_secs(5),
             drain: Duration::from_secs(1),
             flight: wire::ServerFlightProfile::default(),
+            flight_cert_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(
+                wire::DEFAULT_CERT_BYTES,
+            )),
             flight_shaping: false,
             client_mss_bulk: None,
             replay: tokio::sync::Mutex::new(ReplayCache::new(1024, Duration::from_secs(300))),
@@ -1963,6 +1966,9 @@ mod tests {
             idle: Duration::from_secs(5),
             drain: Duration::from_secs(1),
             flight: wire::ServerFlightProfile::default(),
+            flight_cert_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(
+                wire::DEFAULT_CERT_BYTES,
+            )),
             flight_shaping: false,
             client_mss_bulk: None,
             replay: tokio::sync::Mutex::new(ReplayCache::new(1024, Duration::from_secs(300))),
@@ -2200,6 +2206,9 @@ mod tests {
             idle: Duration::from_secs(3),
             drain: Duration::from_secs(1),
             flight: wire::ServerFlightProfile::default(),
+            flight_cert_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(
+                wire::DEFAULT_CERT_BYTES,
+            )),
             flight_shaping: false,
             client_mss_bulk: None,
             replay: tokio::sync::Mutex::new(ReplayCache::new(1024, Duration::from_secs(300))),
@@ -2317,6 +2326,9 @@ mod tests {
             idle: Duration::from_secs(5),
             drain: Duration::from_secs(1),
             flight: wire::ServerFlightProfile::default(),
+            flight_cert_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(
+                wire::DEFAULT_CERT_BYTES,
+            )),
             flight_shaping: false,
             client_mss_bulk: None,
             replay: tokio::sync::Mutex::new(ReplayCache::new(1024, Duration::from_secs(300))),
@@ -2932,6 +2944,9 @@ mod tests {
             idle: Duration::from_secs(5),
             drain: Duration::from_secs(1),
             flight: wire::ServerFlightProfile::default(),
+            flight_cert_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(
+                wire::DEFAULT_CERT_BYTES,
+            )),
             flight_shaping: false,
             client_mss_bulk: None,
             replay: tokio::sync::Mutex::new(ReplayCache::new(1024, Duration::from_secs(300))),

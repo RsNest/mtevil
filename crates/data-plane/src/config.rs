@@ -170,6 +170,10 @@ pub struct Config {
     /// ADR-000 §5.2: the size comes from the measured profile, not a constant.
     #[serde(default = "default_fake_tls_cert_bytes")]
     pub fake_tls_cert_bytes: usize,
+    /// Whether `fake_tls_cert_bytes` was explicitly configured by the user.
+    /// When false, `mtevil` auto-calibrates the flight size against `cover`.
+    #[serde(skip)]
+    pub fake_tls_cert_bytes_explicit: bool,
     /// Symmetric spread applied to the certificate size.
     #[serde(default = "default_fake_tls_cert_jitter")]
     pub fake_tls_cert_jitter: usize,
@@ -436,6 +440,11 @@ impl Config {
         ensure!(meta.len() <= 65536, "config exceeds 64 KiB");
         let bytes = std::fs::read(path).context("config file")?;
         let mut config: Self = serde_json::from_slice(&bytes).context("invalid configuration")?;
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+        {
+            config.fake_tls_cert_bytes_explicit = map.contains_key("fake_tls_cert_bytes");
+        }
         let base = path.parent().unwrap_or(Path::new("."));
         for p in [
             &mut config.secret_file,
@@ -803,6 +812,34 @@ mod tests {
         let mut c = config()?;
         c.fake_tls_cert_jitter = 4096;
         assert!(c.validate().is_err());
+
+        let dir = std::env::temp_dir().join(format!("mtevil-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let omitted_path = dir.join("omitted.json");
+        std::fs::write(
+            &omitted_path,
+            r#"{"secret_file":"s","sni":"mozilla.org","cover":"mozilla.org:443","dc":["2=149.154.167.51:443"]}"#,
+        )?;
+        let loaded_omitted = Config::load(&omitted_path)?;
+        assert!(!loaded_omitted.fake_tls_cert_bytes_explicit);
+        assert_eq!(
+            loaded_omitted.fake_tls_cert_bytes,
+            mtevil_proto::DEFAULT_CERT_BYTES
+        );
+        assert_eq!(
+            loaded_omitted.fake_tls_cert_jitter,
+            mtevil_proto::DEFAULT_CERT_JITTER
+        );
+
+        let explicit_path = dir.join("explicit.json");
+        std::fs::write(
+            &explicit_path,
+            r#"{"secret_file":"s","sni":"mozilla.org","cover":"mozilla.org:443","dc":["2=149.154.167.51:443"],"fake_tls_cert_bytes":2878}"#,
+        )?;
+        let loaded_explicit = Config::load(&explicit_path)?;
+        assert!(loaded_explicit.fake_tls_cert_bytes_explicit);
+        assert_eq!(loaded_explicit.fake_tls_cert_bytes, 2878);
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
     #[test]

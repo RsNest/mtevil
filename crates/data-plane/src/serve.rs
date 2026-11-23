@@ -694,10 +694,11 @@ pub(crate) async fn connection_inner(
         );
         return bounded_cover(client, raw, state, session_id).await;
     }
+    let flight_profile = state.flight_profile();
     let flight = wire::server_flight(
         &matched_secret.key,
         &hello,
-        &state.flight,
+        &flight_profile,
         &mut rand::rngs::OsRng,
     )?;
     // INV-01: from the first write onwards every error only closes this path.
@@ -736,7 +737,7 @@ pub(crate) async fn connection_inner(
             json!({
                 "reason":reason,
                 "flight_bytes":flight.len(),
-                "fake_tls_cert_bytes":state.flight.cert_bytes,
+                "fake_tls_cert_bytes":flight_profile.cert_bytes,
                 "client_bytes_after_flight":tls.consumed,
                 "client_hello_bytes":raw.len(),
                 "client_hello_records":hello_records,
@@ -771,7 +772,7 @@ pub(crate) async fn connection_inner(
                 client_template: hello.template.clone(),
                 cipher_suite: hello.cipher_suite,
                 flight_bytes: flight.len(),
-                fake_tls_cert_bytes: state.flight.cert_bytes,
+                fake_tls_cert_bytes: flight_profile.cert_bytes,
             },
         },
     )

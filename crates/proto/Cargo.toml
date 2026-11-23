@@ -16,6 +16,7 @@ subtle = "2"
 
 [dev-dependencies]
 hex.workspace = true
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [lints]
 workspace = true

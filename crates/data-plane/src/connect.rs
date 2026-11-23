@@ -323,6 +323,7 @@ pub(crate) fn default_media_override_map() -> HashMap<i16, Vec<SocketAddr>> {
         idle_timeout_secs: 300,
         drain_timeout_secs: 5,
         fake_tls_cert_bytes: wire::DEFAULT_CERT_BYTES,
+        fake_tls_cert_bytes_explicit: false,
         fake_tls_cert_jitter: 0,
         flight_shaping: false,
         client_mss: None,

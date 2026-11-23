@@ -177,10 +177,10 @@ DEFAULT_DCS = [
     "4=149.154.167.91:443",
     "5=91.108.56.100:443",
 ]
-DEFAULT_SNI = "wikipedia.org"
+DEFAULT_SNI = "mozilla.org"
 POPULAR_SNIS: tuple[tuple[str, str], ...] = (
+    ("mozilla.org", "Mozilla (TLS 1.3, X25519, 3 записи, [51, 43], 0 NST — ближайший профиль)"),
     ("wikipedia.org", "Wikipedia (TLS 1.3, X25519, нейтральный международный домен)"),
-    ("mozilla.org", "Mozilla (TLS 1.3, X25519, для зарубежных VPS)"),
     ("kernel.org", "Linux Kernel (TLS 1.3, X25519, стабильный cover)"),
     ("ya.ru", "Яндекс (TLS 1.3, X25519, только если входной VPS в РФ)"),
     ("vk.com", "ВКонтакте (TLS 1.3, X25519, только если входной VPS в РФ)"),
@@ -3503,8 +3503,7 @@ def main(argv: list[str] | None = None) -> int:
                 "handshake_timeout_secs": 10,
                 "idle_timeout_secs": 300,
                 "drain_timeout_secs": 5,
-                "fake_tls_cert_bytes": 2878,
-                "fake_tls_cert_jitter": 256,
+                "fake_tls_cert_jitter": 16,
                 "flight_shaping": True,
             }
 
@@ -3561,8 +3560,7 @@ def main(argv: list[str] | None = None) -> int:
                 "handshake_timeout_secs": 10,
                 "idle_timeout_secs": 300,
                 "drain_timeout_secs": 5,
-                "fake_tls_cert_bytes": 2878,
-                "fake_tls_cert_jitter": 256,
+                "fake_tls_cert_jitter": 16,
                 "flight_shaping": True,
             }
         elif role == "egress":
@@ -3654,8 +3652,7 @@ def main(argv: list[str] | None = None) -> int:
                 "handshake_timeout_secs": 10,
                 "idle_timeout_secs": 300,
                 "drain_timeout_secs": 5,
-                "fake_tls_cert_bytes": 2878,
-                "fake_tls_cert_jitter": 256,
+                "fake_tls_cert_jitter": 16,
                 "flight_shaping": True,
             }
 

@@ -23,7 +23,7 @@ pub type AesCtr = ctr::Ctr128BE<aes::Aes256>;
 pub const DEFAULT_CERT_BYTES: usize = 2878;
 /// Default symmetric spread (in bytes) around `DEFAULT_CERT_BYTES` so FakeTLS
 /// flights do not emit a single constant length on the wire.
-pub const DEFAULT_CERT_JITTER: usize = 128;
+pub const DEFAULT_CERT_JITTER: usize = 16;
 
 /// Valid X25519 public keys (real scalar multiples of the base point,
 /// generated offline). The stock client builds its own key_share with an

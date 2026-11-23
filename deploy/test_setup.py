@@ -1951,12 +1951,12 @@ class SetupValidationTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            # 1. prompt_sni_choice supports numbered quick-pick (1 -> wikipedia.org, 2 -> mozilla.org) and custom hostname.
+            # 1. prompt_sni_choice supports numbered quick-pick (1 -> mozilla.org, 2 -> wikipedia.org) and custom hostname.
             with mock.patch.object(setup, "probe_cover_reachable", return_value=(True, "TLSv1.3")):
                 with mock.patch.object(sys, "stdin", io.StringIO("1\n")), mock.patch.object(sys, "stdout", io.StringIO()):
-                    self.assertEqual(setup.prompt_sni_choice("example.com"), "wikipedia.org")
-                with mock.patch.object(sys, "stdin", io.StringIO("2\n")), mock.patch.object(sys, "stdout", io.StringIO()):
                     self.assertEqual(setup.prompt_sni_choice("example.com"), "mozilla.org")
+                with mock.patch.object(sys, "stdin", io.StringIO("2\n")), mock.patch.object(sys, "stdout", io.StringIO()):
+                    self.assertEqual(setup.prompt_sni_choice("example.com"), "wikipedia.org")
                 with mock.patch.object(sys, "stdin", io.StringIO("custom.example.org\n")), mock.patch.object(sys, "stdout", io.StringIO()):
                     self.assertEqual(setup.prompt_sni_choice("example.com"), "custom.example.org")
 
