@@ -52,7 +52,7 @@ fn fragmented(raw: &[u8], records: usize) -> Vec<u8> {
     out
 }
 
-fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
+pub(crate) fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
     Arc::new(State {
         secrets: std::sync::RwLock::new(Arc::new(vec![NamedSecret {
             name: "default".into(),

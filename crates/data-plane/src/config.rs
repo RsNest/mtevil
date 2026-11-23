@@ -384,7 +384,7 @@ fn default_fake_tls_cert_bytes() -> usize {
     mtevil_proto::DEFAULT_CERT_BYTES
 }
 fn default_fake_tls_cert_jitter() -> usize {
-    0
+    mtevil_proto::DEFAULT_CERT_JITTER
 }
 pub fn default_egress_cooldown_base_ms() -> u64 {
     3_000
@@ -765,7 +765,7 @@ mod tests {
         assert_eq!(c.max_connections, 128);
         assert!(!c.enable_dd);
         assert_eq!(c.fake_tls_cert_bytes, mtevil_proto::DEFAULT_CERT_BYTES);
-        assert_eq!(c.fake_tls_cert_jitter, 0);
+        assert_eq!(c.fake_tls_cert_jitter, mtevil_proto::DEFAULT_CERT_JITTER);
         assert_eq!(c.egress_cooldown_base_ms, 3_000);
         assert_eq!(c.egress_cooldown_max_ms, 60_000);
         assert_eq!(c.egress_probe_interval_secs, 30);

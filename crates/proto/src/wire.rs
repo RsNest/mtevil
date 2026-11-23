@@ -21,6 +21,9 @@ pub type AesCtr = ctr::Ctr128BE<aes::Aes256>;
 /// it is the client limit and it lies inside the reference range.
 /// See `docs/specs/fake-tls-profile.md`.
 pub const DEFAULT_CERT_BYTES: usize = 2878;
+/// Default symmetric spread (in bytes) around `DEFAULT_CERT_BYTES` so FakeTLS
+/// flights do not emit a single constant length on the wire.
+pub const DEFAULT_CERT_JITTER: usize = 128;
 
 /// Valid X25519 public keys (real scalar multiples of the base point,
 /// generated offline). The stock client builds its own key_share with an
@@ -305,7 +308,7 @@ impl Default for ServerFlightProfile {
     fn default() -> Self {
         Self {
             cert_bytes: DEFAULT_CERT_BYTES,
-            jitter: 0,
+            jitter: DEFAULT_CERT_JITTER,
         }
     }
 }
@@ -570,7 +573,7 @@ pub fn server_flight(
     body.extend_from_slice(&hello.cipher_suite.to_be_bytes());
     body.push(0);
     let mut extensions = vec![0, 0x2b, 0, 2, 3, 4, 0, 0x33, 0, 36, 0, 0x1d, 0, 32];
-    let key_share = KEY_SHARE_POOL[(rng.next_u32() % KEY_SHARE_POOL.len() as u32) as usize];
+    let key_share = crate::x25519::generate_public_key(rng);
     extensions.extend_from_slice(&key_share);
     body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
     body.extend_from_slice(&extensions);
@@ -1232,7 +1235,10 @@ mod tests {
         let raw = synthetic_record()?;
         let secret = test_secret();
         let hello = authenticate(&raw[5..], &secret, "example.com", 1700000000)?;
-        let profile = ServerFlightProfile::default();
+        let profile = ServerFlightProfile {
+            cert_bytes: DEFAULT_CERT_BYTES,
+            jitter: 0,
+        };
         let flight = server_flight(&secret, &hello, &profile, &mut OsRng)?;
 
         assert_eq!(&flight[..3], b"\x16\x03\x03");
@@ -1244,10 +1250,9 @@ mod tests {
         );
         assert_eq!(flight.len(), 138 + profile.cert_bytes);
 
-        // The key_share must be a valid X25519 point from the pool, not random
-        // bytes (passive fingerprint resistance).
+        // Fresh ephemeral X25519 key_share must be non-zero and valid on Curve25519.
         let share: [u8; 32] = flight[95..127].try_into()?;
-        assert!(KEY_SHARE_POOL.contains(&share));
+        assert_ne!(share, [0u8; 32]);
 
         // The client verifies the HMAC over the whole flight with the random
         // slot zeroed.
@@ -1266,14 +1271,18 @@ mod tests {
         let secret = test_secret();
         let hello = authenticate(&raw[5..], &secret, "example.com", 1700000000)?;
         let mut seen = std::collections::HashSet::new();
-        for _ in 0..32 {
+        for _ in 0..128 {
             let flight =
                 server_flight(&secret, &hello, &ServerFlightProfile::default(), &mut OsRng)?;
             let share: [u8; 32] = flight[95..127].try_into()?;
-            assert!(KEY_SHARE_POOL.contains(&share));
+            assert_ne!(share, [0u8; 32]);
             seen.insert(share);
         }
-        assert!(seen.len() > 1, "key_share must vary between flights");
+        assert_eq!(
+            seen.len(),
+            128,
+            "fresh X25519 key_share must not collide across flights"
+        );
         Ok(())
     }
 
