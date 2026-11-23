@@ -1951,13 +1951,14 @@ class SetupValidationTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            # 1. prompt_sni_choice supports numbered quick-pick (1 -> ya.ru, 2 -> vk.com) and custom hostname.
-            with mock.patch.object(sys, "stdin", io.StringIO("1\n")), mock.patch.object(sys, "stdout", io.StringIO()):
-                self.assertEqual(setup.prompt_sni_choice("example.com"), "ya.ru")
-            with mock.patch.object(sys, "stdin", io.StringIO("2\n")), mock.patch.object(sys, "stdout", io.StringIO()):
-                self.assertEqual(setup.prompt_sni_choice("example.com"), "vk.com")
-            with mock.patch.object(sys, "stdin", io.StringIO("custom.example.org\n")), mock.patch.object(sys, "stdout", io.StringIO()):
-                self.assertEqual(setup.prompt_sni_choice("example.com"), "custom.example.org")
+            # 1. prompt_sni_choice supports numbered quick-pick (1 -> mozilla.org, 2 -> wikipedia.org) and custom hostname.
+            with mock.patch.object(setup, "probe_cover_reachable", return_value=(True, "TLSv1.3")):
+                with mock.patch.object(sys, "stdin", io.StringIO("1\n")), mock.patch.object(sys, "stdout", io.StringIO()):
+                    self.assertEqual(setup.prompt_sni_choice("example.com"), "mozilla.org")
+                with mock.patch.object(sys, "stdin", io.StringIO("2\n")), mock.patch.object(sys, "stdout", io.StringIO()):
+                    self.assertEqual(setup.prompt_sni_choice("example.com"), "wikipedia.org")
+                with mock.patch.object(sys, "stdin", io.StringIO("custom.example.org\n")), mock.patch.object(sys, "stdout", io.StringIO()):
+                    self.assertEqual(setup.prompt_sni_choice("example.com"), "custom.example.org")
 
             # 2. mtevilctl link (--sni ya.ru) passes --sni to mtevil link and prints the link.
             out_link = io.StringIO()
@@ -2629,6 +2630,53 @@ class SetupValidationTests(unittest.TestCase):
             self.assertFalse(changed)
             self.assertIn("# custom operator comment", (d / "compose.yaml").read_text(encoding="utf-8"))
             self.assertNotIn("me", setup.json.loads((d / "config.json").read_text(encoding="utf-8")))
+
+    def test_default_sni_not_example_and_cover_warning_and_existing_preserved(self):
+        self.assertNotEqual(setup.DEFAULT_SNI, "example.com")
+        self.assertNotIn("example.com", [d for d, _ in setup.POPULAR_SNIS])
+        with (
+            mock.patch.object(setup, "probe_cover_reachable", return_value=(False, "timed out")),
+            mock.patch.object(sys, "stdin", io.StringIO("wikipedia.org\n")),
+            mock.patch.object(sys, "stdout", new_callable=io.StringIO) as out_buf,
+        ):
+            chosen = setup.prompt_sni_choice()
+        self.assertEqual(chosen, "wikipedia.org")
+        self.assertIn("Предупреждение: cover wikipedia.org:443 не отвечает", out_buf.getvalue())
+        self.assertIn("fake_tls_cert_bytes", out_buf.getvalue())
+
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / ".env").write_text("MTEVIL_IMAGE=ghcr.io/rsnest/mtevil:v0.3.0\n", encoding="utf-8")
+            (d / "config.json").write_text(
+                setup.json.dumps({"role": "direct", "sni": "example.com", "cover": "example.com:443"}),
+                encoding="utf-8",
+            )
+            loaded = setup.load_existing_defaults(d)
+            self.assertEqual(loaded["config"]["sni"], "example.com")
+            self.assertEqual(loaded["config"]["cover"], "example.com:443")
+
+    def test_format_handshake_diag_lines(self):
+        lines = setup.format_handshake_diag_lines(
+            "direct",
+            {
+                "client_hello_incomplete_timeout": 12,
+                "client_hello_incomplete_close": 2,
+                "inner_header_incomplete": 3,
+                "last_client_hello_incomplete": {
+                    "received_bytes": 1448,
+                    "expected_bytes": 1549,
+                    "timeout": True,
+                },
+            },
+        )
+        self.assertEqual(
+            lines,
+            [
+                "  Сбои handshake:    таймаут ClientHello=12, закрытие сокета=2, после ServerHello=3",
+                "  Последний обрыв:   ClientHello: получено 1448 из 1549 байт (таймаут)",
+            ],
+        )
+        self.assertEqual(setup.format_handshake_diag_lines("egress", {"client_hello_incomplete_timeout": 1}), [])
 
 
 if __name__ == "__main__":

@@ -70,6 +70,13 @@ impl AcceptErrorCounters {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientHelloIncompleteSample {
+    pub received_bytes: usize,
+    pub expected_bytes: usize,
+    pub timeout: bool,
+}
+
 #[derive(Default)]
 pub struct Counters {
     pub next: AtomicU64,
@@ -103,9 +110,34 @@ pub struct Counters {
     pub me_active_sessions: AtomicU64,
     pub me_fallback_direct_total: AtomicU64,
     pub me_refresh_errors: AtomicU64,
+    pub client_hello_incomplete_timeout: AtomicU64,
+    pub client_hello_incomplete_close: AtomicU64,
+    pub inner_header_incomplete: AtomicU64,
+    pub last_client_hello_incomplete: Mutex<Option<ClientHelloIncompleteSample>>,
 }
 
 impl Counters {
+    pub fn record_client_hello_incomplete(
+        &self,
+        received_bytes: usize,
+        expected_bytes: usize,
+        timeout: bool,
+    ) {
+        if timeout {
+            self.client_hello_incomplete_timeout
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.client_hello_incomplete_close
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if let Ok(mut guard) = self.last_client_hello_incomplete.lock() {
+            *guard = Some(ClientHelloIncompleteSample {
+                received_bytes,
+                expected_bytes,
+                timeout,
+            });
+        }
+    }
     pub fn ensure_started(&self) -> u64 {
         let cur = self.started_unix_ms.load(Ordering::Relaxed);
         if cur != 0 {
@@ -213,6 +245,26 @@ impl Counters {
                 .egress_failed_tracker_evictions
                 .load(Ordering::Relaxed),
             "alert_webhook_dropped": self.alert_webhook_dropped.load(Ordering::Relaxed),
+            "client_hello_incomplete_timeout": self
+                .client_hello_incomplete_timeout
+                .load(Ordering::Relaxed),
+            "client_hello_incomplete_close": self
+                .client_hello_incomplete_close
+                .load(Ordering::Relaxed),
+            "inner_header_incomplete": self.inner_header_incomplete.load(Ordering::Relaxed),
+            "last_client_hello_incomplete": self
+                .last_client_hello_incomplete
+                .lock()
+                .ok()
+                .and_then(|g| *g)
+                .map(|s| {
+                    json!({
+                        "received_bytes": s.received_bytes,
+                        "expected_bytes": s.expected_bytes,
+                        "timeout": s.timeout,
+                    })
+                })
+                .unwrap_or(Value::Null),
             "me": me_json,
         })
     }
@@ -445,6 +497,32 @@ impl Counters {
         let _ = writeln!(out, "# TYPE mtevil_fd_limit gauge");
         let _ = writeln!(out, "mtevil_fd_limit {}", fd_limit.unwrap_or(0));
 
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_client_hello_incomplete_total Client connections terminated before completing the initial TLS ClientHello record"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_client_hello_incomplete_total counter");
+        let _ = writeln!(
+            out,
+            "mtevil_client_hello_incomplete_total{{reason=\"timeout\"}} {}",
+            self.client_hello_incomplete_timeout.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "mtevil_client_hello_incomplete_total{{reason=\"close\"}} {}",
+            self.client_hello_incomplete_close.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP mtevil_inner_header_incomplete_total Client connections that failed or timed out reading the 64-byte MTProto header after ServerHello"
+        );
+        let _ = writeln!(out, "# TYPE mtevil_inner_header_incomplete_total counter");
+        let _ = writeln!(
+            out,
+            "mtevil_inner_header_incomplete_total {}",
+            self.inner_header_incomplete.load(Ordering::Relaxed)
+        );
+
         if let Some(m) = me.filter(|m| m.enabled) {
             let _ = writeln!(
                 out,
@@ -672,5 +750,39 @@ impl Drop for Session<'_> {
             self.id,
             json!({"outcome":self.outcome,"duration_ms":self.start.elapsed().as_millis() as u64,"active":active,"completed":self.counters.completed.load(Ordering::Relaxed),"failed":self.counters.failed.load(Ordering::Relaxed)}),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_handshake_counters_export_to_stats_json_and_prometheus() {
+        let counters = Counters::default();
+        counters.record_client_hello_incomplete(1448, 1549, true);
+        counters.record_client_hello_incomplete(1048, 1532, false);
+        counters
+            .inner_header_incomplete
+            .fetch_add(3, Ordering::Relaxed);
+
+        let stats = counters.snapshot_json("direct");
+        assert_eq!(stats["client_hello_incomplete_timeout"], 1);
+        assert_eq!(stats["client_hello_incomplete_close"], 1);
+        assert_eq!(stats["inner_header_incomplete"], 3);
+        assert_eq!(
+            stats["last_client_hello_incomplete"]["received_bytes"],
+            1048
+        );
+        assert_eq!(
+            stats["last_client_hello_incomplete"]["expected_bytes"],
+            1532
+        );
+        assert_eq!(stats["last_client_hello_incomplete"]["timeout"], false);
+
+        let prom = counters.render_prometheus_with_me(&[], None, None, None);
+        assert!(prom.contains("mtevil_client_hello_incomplete_total{reason=\"timeout\"} 1"));
+        assert!(prom.contains("mtevil_client_hello_incomplete_total{reason=\"close\"} 1"));
+        assert!(prom.contains("mtevil_inner_header_incomplete_total 3"));
     }
 }

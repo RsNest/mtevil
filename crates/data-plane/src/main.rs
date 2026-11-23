@@ -253,7 +253,10 @@ impl Args {
             idle_timeout_secs: self.idle_timeout_secs.unwrap_or(300),
             drain_timeout_secs: self.drain_timeout_secs.unwrap_or(5),
             fake_tls_cert_bytes: self.fake_tls_cert_bytes.unwrap_or(wire::DEFAULT_CERT_BYTES),
-            fake_tls_cert_jitter: self.fake_tls_cert_jitter.unwrap_or(0),
+            fake_tls_cert_bytes_explicit: self.fake_tls_cert_bytes.is_some(),
+            fake_tls_cert_jitter: self
+                .fake_tls_cert_jitter
+                .unwrap_or(wire::DEFAULT_CERT_JITTER),
             flight_shaping: self.flight_shaping,
             client_mss: self.client_mss,
             client_mss_bulk: self.client_mss_bulk,
@@ -334,6 +337,7 @@ struct State {
     idle: Duration,
     drain: Duration,
     flight: wire::ServerFlightProfile,
+    flight_cert_bytes: Arc<std::sync::atomic::AtomicUsize>,
     flight_shaping: bool,
     client_mss_bulk: Option<u16>,
     replay: Mutex<ReplayCache>,
@@ -346,6 +350,15 @@ struct State {
 }
 
 impl State {
+    fn flight_profile(&self) -> wire::ServerFlightProfile {
+        wire::ServerFlightProfile {
+            cert_bytes: self
+                .flight_cert_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            jitter: self.flight.jitter,
+        }
+    }
+
     fn current_secrets(&self) -> Arc<Vec<NamedSecret>> {
         self.secrets
             .read()
@@ -1084,6 +1097,9 @@ async fn main() -> Result<()> {
             cert_bytes: config.fake_tls_cert_bytes,
             jitter: config.fake_tls_cert_jitter,
         },
+        flight_cert_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(
+            config.fake_tls_cert_bytes,
+        )),
         flight_shaping: config.flight_shaping,
         client_mss_bulk: config.client_mss_bulk,
         replay: Mutex::new(replay),
@@ -1141,6 +1157,7 @@ async fn main() -> Result<()> {
             "replay_load_status":replay_load_status.as_str(),
             "replay_loaded_entries":replay_load_status.loaded_entries(),
             "fake_tls_cert_bytes":config.fake_tls_cert_bytes,
+            "fake_tls_cert_auto_calibrate":!config.fake_tls_cert_bytes_explicit,
             "fake_tls_cert_jitter":config.fake_tls_cert_jitter,
             "flight_shaping":state.flight_shaping,
             "client_mss":config.client_mss,
@@ -1215,10 +1232,20 @@ async fn main() -> Result<()> {
     let (cover_stop_tx, cover_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let cover_dns_task = (!cover_resolver.is_static_ip()).then(|| {
         spawn_cover_resolver(
-            cover_resolver,
+            cover_resolver.clone(),
             state.counters.clone(),
             handshake_dur,
             cover_stop_rx,
+        )
+    });
+    let (calib_stop_tx, calib_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let cover_calib_task = (!config.fake_tls_cert_bytes_explicit).then(|| {
+        spawn_cover_calibrator(
+            cover_resolver,
+            state.sni.clone(),
+            handshake_dur.min(Duration::from_secs(5)),
+            state.flight_cert_bytes.clone(),
+            calib_stop_rx,
         )
     });
     let (users_stop_tx, users_stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1255,6 +1282,11 @@ async fn main() -> Result<()> {
     }
     let _ = cover_stop_tx.send(());
     if let Some(task) = cover_dns_task {
+        let _ = task.await;
+    }
+    let _ = calib_stop_tx.send(());
+    if let Some(task) = cover_calib_task {
+        task.abort();
         let _ = task.await;
     }
     let _ = users_stop_tx.send(());

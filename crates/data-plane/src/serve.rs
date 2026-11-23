@@ -550,23 +550,32 @@ pub(crate) async fn connection_inner(
         }
         _ => None,
     };
-    if received.is_err() && indicated_record_bytes.is_some_and(|size| raw.len() < size) {
-        // The input deadline has expired with an incomplete first record.
-        // Starting another upstream exchange would consume another full budget.
-        telemetry::event(
-            "client_hello_incomplete",
-            session_id,
-            json!({
-                "received_bytes":raw.len(),
-                "first_tls_record_bytes":indicated_record_bytes,
-            }),
-        );
-        let _ = timeout(DC_EOF_SHUTDOWN_TIMEOUT, async {
-            client.shutdown().await?;
-            tokio::io::copy(client, &mut tokio::io::sink()).await
-        })
-        .await;
-        return Ok(());
+    if let Some(size) = indicated_record_bytes.filter(|&size| raw.len() < size) {
+        if received.is_err() {
+            // The input deadline has expired with an incomplete first record.
+            // Starting another upstream exchange would consume another full budget.
+            state
+                .counters
+                .record_client_hello_incomplete(raw.len(), size, true);
+            telemetry::event(
+                "client_hello_incomplete",
+                session_id,
+                json!({
+                    "received_bytes":raw.len(),
+                    "first_tls_record_bytes":indicated_record_bytes,
+                }),
+            );
+            let _ = timeout(DC_EOF_SHUTDOWN_TIMEOUT, async {
+                client.shutdown().await?;
+                tokio::io::copy(client, &mut tokio::io::sink()).await
+            })
+            .await;
+            return Ok(());
+        } else if matches!(received, Ok(Err(_))) {
+            state
+                .counters
+                .record_client_hello_incomplete(raw.len(), size, false);
+        }
     }
     if matches!(received, Ok(Ok(None))) {
         let secrets = state.current_secrets();
@@ -694,10 +703,11 @@ pub(crate) async fn connection_inner(
         );
         return bounded_cover(client, raw, state, session_id).await;
     }
+    let flight_profile = state.flight_profile();
     let flight = wire::server_flight(
         &matched_secret.key,
         &hello,
-        &state.flight,
+        &flight_profile,
         &mut rand::rngs::OsRng,
     )?;
     // INV-01: from the first write onwards every error only closes this path.
@@ -730,13 +740,17 @@ pub(crate) async fn connection_inner(
         Err(_) => Some("deadline".to_string()),
     };
     if let Some(reason) = failure {
+        state
+            .counters
+            .inner_header_incomplete
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         telemetry::event(
             "inner_header_incomplete",
             session_id,
             json!({
                 "reason":reason,
                 "flight_bytes":flight.len(),
-                "fake_tls_cert_bytes":state.flight.cert_bytes,
+                "fake_tls_cert_bytes":flight_profile.cert_bytes,
                 "client_bytes_after_flight":tls.consumed,
                 "client_hello_bytes":raw.len(),
                 "client_hello_records":hello_records,
@@ -771,7 +785,7 @@ pub(crate) async fn connection_inner(
                 client_template: hello.template.clone(),
                 cipher_suite: hello.cipher_suite,
                 flight_bytes: flight.len(),
-                fake_tls_cert_bytes: state.flight.cert_bytes,
+                fake_tls_cert_bytes: flight_profile.cert_bytes,
             },
         },
     )

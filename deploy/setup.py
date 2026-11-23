@@ -177,11 +177,13 @@ DEFAULT_DCS = [
     "4=149.154.167.91:443",
     "5=91.108.56.100:443",
 ]
+DEFAULT_SNI = "mozilla.org"
 POPULAR_SNIS: tuple[tuple[str, str], ...] = (
-    ("ya.ru", "Яндекс (TLS 1.3, рекомендуется для РФ)"),
-    ("vk.com", "ВКонтакте (TLS 1.3)"),
-    ("ozon.ru", "Ozon (TLS 1.3)"),
-    ("example.com", "example.com (нейтральный международный домен)"),
+    ("mozilla.org", "Mozilla (TLS 1.3, X25519, 3 записи, [51, 43], 0 NST — ближайший профиль)"),
+    ("wikipedia.org", "Wikipedia (TLS 1.3, X25519, нейтральный международный домен)"),
+    ("kernel.org", "Linux Kernel (TLS 1.3, X25519, стабильный cover)"),
+    ("ya.ru", "Яндекс (TLS 1.3, X25519, только если входной VPS в РФ)"),
+    ("vk.com", "ВКонтакте (TLS 1.3, X25519, только если входной VPS в РФ)"),
 )
 HEX32_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 SNI_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
@@ -1128,25 +1130,59 @@ def ask_simple_confirm() -> str:
         print("Некорректный выбор: введите y (установить), s (сменить SNI), a (расширенная настройка) или n (отмена).")
 
 
-def prompt_sni_choice(default_sni: str = "example.com") -> str:
+def probe_cover_reachable(cover: str, sni: str, timeout_s: float = 4.0) -> tuple[bool, str]:
+    """Quickly verify TLS reachability of `cover` from this VPS before writing config."""
+    import ssl
+
+    host, _, port_str = cover.rpartition(":")
+    if not host:
+        host, port = cover, 443
+    else:
+        host = host.strip("[]")
+        try:
+            port = int(port_str)
+        except ValueError:
+            return False, f"некорректный порт в адресе cover: {cover}"
+    ctx = ssl.create_default_context()
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s) as raw_sock:
+            with ctx.wrap_socket(raw_sock, server_hostname=sni) as tls_sock:
+                ver = tls_sock.version() or "TLS"
+                return True, ver
+    except Exception as exc:
+        return False, str(exc)
+
+
+def prompt_sni_choice(default_sni: str = DEFAULT_SNI) -> str:
     print()
     print(heading("Выбор домена для HTTPS-маскировки (SNI)"))
     for idx, (dom, desc) in enumerate(POPULAR_SNIS, start=1):
         mark = " [текущий]" if dom == default_sni else ""
-        print(f"  {idx}. {dom:<12} — {desc}{mark}")
+        print(f"  {idx}. {dom:<14} — {desc}{mark}")
     print("  Или введите любой другой домен с поддержкой TLS 1.3 (без https:// и порта).")
+    print("  Подсказка: для лучшего сходства подбирайте fake_tls_cert_bytes под выбранный домен (см. docs/dpi-audit/REPORT.md).")
     while True:
-        raw = ask("Домен SNI (номер 1-4 или имя домена)", default_sni).strip()
+        raw = ask(f"Домен SNI (номер 1-{len(POPULAR_SNIS)} или имя домена)", default_sni).strip()
+        chosen: str | None = None
         if raw.isdigit():
             num = int(raw)
             if 1 <= num <= len(POPULAR_SNIS):
-                return POPULAR_SNIS[num - 1][0]
-            print(f"Введите номер от 1 до {len(POPULAR_SNIS)} или доменное имя.")
-            continue
-        try:
-            return validate_sni(raw)
-        except Exception as exc:
-            print(f"Некорректный домен SNI: {exc}")
+                chosen = POPULAR_SNIS[num - 1][0]
+            else:
+                print(f"Введите номер от 1 до {len(POPULAR_SNIS)} или доменное имя.")
+                continue
+        else:
+            try:
+                chosen = validate_sni(raw)
+            except Exception as exc:
+                print(f"Некорректный домен SNI: {exc}")
+                continue
+        ok, detail = probe_cover_reachable(f"{chosen}:443", chosen)
+        if not ok:
+            print(f"Предупреждение: cover {chosen}:443 не отвечает с этого VPS ({detail}).")
+            if sys.stdin.isatty() and not ask_yes_no("Всё равно выбрать этот домен?", default=False):
+                continue
+        return chosen
 
 
 def choose_advanced_role(default_role: str = "direct") -> str:
@@ -2363,6 +2399,8 @@ def run_status_command(deploy_dir: Path) -> int:
     rstats = read_container_runtime_stats(base, svc) if running else None
     for me_line in format_me_status_lines(role, saved_cfg, rstats):
         print(me_line)
+    for diag_line in format_handshake_diag_lines(role, rstats):
+        print(diag_line)
     if role == "egress":
         accept_legacy = saved_cfg.get("egress_accept_legacy", True) is not False
         proto_mode = "MTV4 + MTV3 + legacy MTV2 (переходный)" if accept_legacy else "MTV4 + MTV3 (строгий)"
@@ -2752,7 +2790,7 @@ def run_sni_command(deploy_dir: Path, new_sni_arg: str | None = None) -> int:
         print(err_text("Команда sni доступна только на сервере входа (direct или edge)."), file=sys.stderr)
         return 1
 
-    old_sni = str(saved_cfg.get("sni") or "example.com").strip()
+    old_sni = str(saved_cfg.get("sni") or DEFAULT_SNI).strip()
     if new_sni_arg:
         try:
             new_sni = validate_sni(new_sni_arg)
@@ -2984,6 +3022,33 @@ def format_me_status_lines(
             f"  Счётчики ME:       fallback={fb_total}, refresh_err={ref_err}, backpressure_drops={bp_drops}, dropped_close_ext={cl_drops}"
         )
         lines.append(f"  Рекламный тег:     {ad_status}")
+    return lines
+
+
+def format_handshake_diag_lines(
+    role: str,
+    rstats: dict[str, object] | None,
+) -> list[str]:
+    if role not in ("direct", "edge") or not isinstance(rstats, dict):
+        return []
+    if (
+        "client_hello_incomplete_timeout" not in rstats
+        and "client_hello_incomplete_close" not in rstats
+        and "inner_header_incomplete" not in rstats
+    ):
+        return []
+    ch_to = int(rstats.get("client_hello_incomplete_timeout") or 0)
+    ch_cl = int(rstats.get("client_hello_incomplete_close") or 0)
+    ih_inc = int(rstats.get("inner_header_incomplete") or 0)
+    lines = [
+        f"  Сбои handshake:    таймаут ClientHello={ch_to}, закрытие сокета={ch_cl}, после ServerHello={ih_inc}"
+    ]
+    sample = rstats.get("last_client_hello_incomplete")
+    if (ch_to + ch_cl) > 0 and isinstance(sample, dict):
+        rx = int(sample.get("received_bytes") or 0)
+        exp = int(sample.get("expected_bytes") or 0)
+        reason_lbl = "таймаут" if sample.get("timeout") else "закрытие сокета"
+        lines.append(f"  Последний обрыв:   ClientHello: получено {rx} из {exp} байт ({reason_lbl})")
     return lines
 
 
@@ -3394,7 +3459,7 @@ def main(argv: list[str] | None = None) -> int:
         mode = choose_wizard_mode(default="simple")
 
     default_bind = str(saved.get("MTEVIL_BIND") or "0.0.0.0")
-    default_sni = str(saved_cfg.get("sni") or "example.com")
+    default_sni = str(saved_cfg.get("sni") or DEFAULT_SNI)
     default_cover = str(saved_cfg.get("cover") or f"{default_sni}:443")
     use_network_host = True if args.network_host else existing_network_host
     advanced_changed: list[str] = []
@@ -3467,8 +3532,7 @@ def main(argv: list[str] | None = None) -> int:
                 "handshake_timeout_secs": 10,
                 "idle_timeout_secs": 300,
                 "drain_timeout_secs": 5,
-                "fake_tls_cert_bytes": 2878,
-                "fake_tls_cert_jitter": 256,
+                "fake_tls_cert_jitter": 16,
                 "flight_shaping": True,
             }
 
@@ -3498,14 +3562,18 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             print("\n" + heading("Шаг 3. Маскировка (HTTPS-cover)"))
+            print("Подсказка: после настройки можно уточнить fake_tls_cert_bytes в config.json под размер цепочки сертификата выбранного домена.")
             sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, default_sni)
             cover_default = default_cover if sni == default_sni else f"{sni}:443"
             cover = ask("Адрес HTTPS-cover (host:port)", cover_default)
+            cover_ok_host, cover_detail_host = probe_cover_reachable(cover, sni)
+            if not cover_ok_host:
+                print(f"Предупреждение: cover {cover} (SNI {sni}) не отвечает с этого VPS ({cover_detail_host}).")
             if dns_records is not None:
                 check_domain_expected_ips(dns_records)
             if bind_ip != "0.0.0.0":
                 advanced_changed.append(f"IP привязки: {bind_ip}")
-            if sni != "example.com" or cover != "example.com:443":
+            if sni != DEFAULT_SNI or cover != f"{DEFAULT_SNI}:443":
                 advanced_changed.append(f"HTTPS-cover: {cover} (SNI: {sni})")
             config_data = {
                 "role": "direct",
@@ -3521,8 +3589,7 @@ def main(argv: list[str] | None = None) -> int:
                 "handshake_timeout_secs": 10,
                 "idle_timeout_secs": 300,
                 "drain_timeout_secs": 5,
-                "fake_tls_cert_bytes": 2878,
-                "fake_tls_cert_jitter": 256,
+                "fake_tls_cert_jitter": 16,
                 "flight_shaping": True,
             }
         elif role == "egress":
@@ -3576,14 +3643,18 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             print("\n" + heading("Шаг 3. Маскировка (HTTPS-cover)"))
+            print("Подсказка: после настройки можно уточнить fake_tls_cert_bytes в config.json под размер цепочки сертификата выбранного домена.")
             sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, default_sni)
             cover_default = default_cover if sni == default_sni else f"{sni}:443"
             cover = ask("Адрес HTTPS-cover (host:port)", cover_default)
+            cover_ok_host, cover_detail_host = probe_cover_reachable(cover, sni)
+            if not cover_ok_host:
+                print(f"Предупреждение: cover {cover} (SNI {sni}) не отвечает с этого VPS ({cover_detail_host}).")
             if dns_records is not None:
                 check_domain_expected_ips(dns_records)
             if bind_ip != "0.0.0.0":
                 advanced_changed.append(f"IP привязки: {bind_ip}")
-            if sni != "example.com" or cover != "example.com:443":
+            if sni != DEFAULT_SNI or cover != f"{DEFAULT_SNI}:443":
                 advanced_changed.append(f"HTTPS-cover: {cover} (SNI: {sni})")
 
             print("\n" + heading("Шаг 4. Узлы egress и отказоустойчивость"))
@@ -3610,8 +3681,7 @@ def main(argv: list[str] | None = None) -> int:
                 "handshake_timeout_secs": 10,
                 "idle_timeout_secs": 300,
                 "drain_timeout_secs": 5,
-                "fake_tls_cert_bytes": 2878,
-                "fake_tls_cert_jitter": 256,
+                "fake_tls_cert_jitter": 16,
                 "flight_shaping": True,
             }
 
