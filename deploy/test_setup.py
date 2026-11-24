@@ -2749,8 +2749,218 @@ class SetupValidationTests(unittest.TestCase):
             ):
                 rc = setup.main()
             self.assertEqual(rc, 1)
-            self.assertIn("не прошёл проверку сертификата/TLS", err_buf.getvalue())
+            self.assertIn("Проверка cover перед развёртыванием не пройдена", err_buf.getvalue())
             self.assertIn("old.example.org", (d / "config.json").read_text(encoding="utf-8"))
+
+    def _run_self_steal_wizard(
+        self,
+        deploy_dir: Path,
+        stdin_text: str,
+        *,
+        role_arg: str | None = None,
+        local_https_ok: tuple[bool, str] = (True, "TLSv1.3, HTTP/1.1 200 OK"),
+        public_https_ok: tuple[bool, str] = (True, "TLSv1.3, HTTP/1.1 200 OK"),
+        telegram_ok: tuple[bool, str] = (True, "DC2 ping OK"),
+        public_port_status: tuple[str, str] = ("ok", "open"),
+        cover_check_ok: tuple[bool, str] = (True, "Verify return code: 0 (ok)"),
+    ):
+        argv = ["mtevilctl", "--self-steal", "--no-build", "--dir", str(deploy_dir)]
+        if role_arg:
+            argv.extend(["--role", role_arg])
+        run_calls: list[list[str]] = []
+
+        def fake_run(cmd, **_kw):
+            run_calls.append(list(cmd))
+            return mock.Mock(returncode=0, stdout="ok", stderr="")
+
+        def fake_https_get(host, port, sni, timeout_s=5.0):
+            if host in ("127.0.0.1", "localhost", "::1"):
+                return local_https_ok
+            return public_https_ok
+
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(setup, "check_prerequisites"),
+            mock.patch.object(setup, "prompt_client_address", return_value=("site.example.org", None)),
+            mock.patch.object(setup, "deployment_owns_port", return_value=True),
+            mock.patch.object(setup, "is_port_available", return_value=True),
+            mock.patch.object(setup, "read_unprivileged_port_start", return_value=0),
+            mock.patch.object(setup, "ensure_generated_secret", return_value=False),
+            mock.patch.object(setup, "volume_file_exists", return_value=True),
+            mock.patch.object(setup, "read_allowed_snis_from_volume", return_value=["old.example.org"]),
+            mock.patch.object(setup, "record_allowed_snis_in_volume") as rec_snis,
+            mock.patch.object(setup, "write_volume_secret_stdin") as write_vol,
+            mock.patch.object(setup, "check_cover_from_container", return_value=cover_check_ok),
+            mock.patch.object(setup, "wait_healthy") as wait_h,
+            mock.patch.object(setup, "probe_local_https_get", side_effect=fake_https_get),
+            mock.patch.object(setup, "verify_telegram_e2e", return_value=telegram_ok),
+            mock.patch.object(setup, "check_public_port_reachable", return_value=public_port_status),
+            mock.patch.object(setup, "run", side_effect=fake_run),
+            mock.patch.object(sys, "stdin", io.StringIO(stdin_text)),
+            mock.patch.object(sys, "stdout", out_buf),
+            mock.patch.object(sys, "stderr", err_buf),
+        ):
+            rc = setup.main()
+        return rc, out_buf.getvalue(), err_buf.getvalue(), run_calls, rec_snis, write_vol, wait_h
+
+    def test_self_steal_reconfigure_preserves_direct_and_edge_settings(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            # 1. Direct reconfigure preserves me, client_mss, max_connections, fake_tls_cert_bytes.
+            (d / "config.json").write_text(
+                setup.json.dumps(
+                    {
+                        "role": "direct",
+                        "listen": "0.0.0.0:443",
+                        "secret_file": "/var/lib/mtevil/proxy-secret",
+                        "users_file": "/var/lib/mtevil/users.json",
+                        "replay_file": "/var/lib/mtevil-replay/replay.bin",
+                        "sni": "old.example.org",
+                        "cover": "127.0.0.1:8443",
+                        "max_connections": 777,
+                        "client_mss": 1200,
+                        "fake_tls_cert_bytes": 4320,
+                        "me": {"enabled": True, "public_ipv4": "1.2.3.4", "pool_size": 4},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: old\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_PORT=443\nMTEVIL_PUBLIC_HOST=old.example.org\n", encoding="utf-8")
+
+            rc, _out, err, _calls, _rec, _wv, _wh = self._run_self_steal_wizard(
+                d,
+                "y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n",
+            )
+            self.assertEqual(rc, 0, msg=err)
+            cfg = setup.json.loads((d / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(cfg["sni"], "site.example.org")
+            self.assertEqual(cfg["cover"], "127.0.0.1:8443")
+            self.assertEqual(cfg["max_connections"], 777)
+            self.assertEqual(cfg["client_mss"], 1200)
+            self.assertEqual(cfg["fake_tls_cert_bytes"], 4320)
+            self.assertEqual(cfg["me"], {"enabled": True, "public_ipv4": "1.2.3.4", "pool_size": 4})
+
+            # 2. Edge reconfigure preserves egress_strategy and egress_token_file.
+            (d / "config.json").write_text(
+                setup.json.dumps(
+                    {
+                        "role": "direct",
+                        "listen": "0.0.0.0:443",
+                        "sni": "old.example.org",
+                        "cover": "127.0.0.1:8443",
+                        "max_connections": 512,
+                        "egress_upstreams": ["10.0.0.2:29443"],
+                        "egress_strategy": "ordered",
+                        "egress_token_file": "/var/lib/mtevil/custom-token",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rc, _out, err, _calls, _rec, _wv, _wh = self._run_self_steal_wizard(
+                d,
+                "y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n10.0.0.2:29443\ny\n",
+                role_arg="edge",
+            )
+            self.assertEqual(rc, 0, msg=err)
+            edge_cfg = setup.json.loads((d / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(edge_cfg["egress_strategy"], "ordered")
+            self.assertEqual(edge_cfg["egress_token_file"], "/var/lib/mtevil/custom-token")
+            self.assertEqual(edge_cfg["max_connections"], 512)
+
+            # 3. Explicit role change (edge -> direct) does NOT carry over egress settings.
+            rc, _out, err, _calls, _rec, _wv, _wh = self._run_self_steal_wizard(
+                d,
+                "y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n",
+                role_arg="direct",
+            )
+            self.assertEqual(rc, 0, msg=err)
+            switched_cfg = setup.json.loads((d / "config.json").read_text(encoding="utf-8"))
+            self.assertNotIn("egress_upstreams", switched_cfg)
+            self.assertNotIn("egress_strategy", switched_cfg)
+
+    def test_self_steal_preflight_failure_leaves_config_and_allowed_snis_untouched(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            orig_cfg = '{"role":"direct","sni":"old.example.org","cover":"127.0.0.1:8443"}\n'
+            (d / "config.json").write_text(orig_cfg, encoding="utf-8")
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: old\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_PORT=443\n", encoding="utf-8")
+
+            rc, _out, err, _calls, rec_snis, _wv, _wh = self._run_self_steal_wizard(
+                d,
+                "y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n",
+                cover_check_ok=(False, "verify error:self-signed"),
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("Проверка cover перед развёртыванием не пройдена", err)
+            self.assertEqual((d / "config.json").read_text(encoding="utf-8"), orig_cfg)
+            rec_snis.assert_not_called()
+
+    def test_self_steal_rollback_on_broken_https_and_failed_telegram_and_fresh_stop(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            orig_cfg = '{"role":"direct","sni":"old.example.org","cover":"127.0.0.1:8443"}\n'
+            (d / "config.json").write_text(orig_cfg, encoding="utf-8")
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: old\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_PORT=443\n", encoding="utf-8")
+
+            # 1. Healthy container with broken HTTPS fallback triggers rollback.
+            rc, _out, err, calls, _rec, write_vol, wait_h = self._run_self_steal_wizard(
+                d,
+                "y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n",
+                local_https_ok=(False, "connection reset"),
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("Проверка локального HTTPS GET", err)
+            self.assertEqual((d / "config.json").read_text(encoding="utf-8"), orig_cfg)
+            self.assertTrue(any("--force-recreate" in c for c in calls))
+            self.assertEqual(wait_h.call_count, 2)
+            self.assertTrue(any("allowed-sni.txt" in str(c) for c in write_vol.call_args_list))
+
+            # 2. Failed Telegram probe after HTTPS succeeds triggers rollback.
+            rc2, _out2, err2, calls2, _rec2, _wv2, wait_h2 = self._run_self_steal_wizard(
+                d,
+                "y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n",
+                telegram_ok=(False, "dc_timeout"),
+            )
+            self.assertEqual(rc2, 1)
+            self.assertIn("Сквозная проверка Telegram через self-steal не пройдена", err2)
+            self.assertEqual((d / "config.json").read_text(encoding="utf-8"), orig_cfg)
+            self.assertTrue(any("--force-recreate" in c for c in calls2))
+            self.assertEqual(wait_h2.call_count, 2)
+
+        # 3. Fresh install failure stops & removes failed candidate.
+        with tempfile.TemporaryDirectory() as td_fresh:
+            d_fresh = Path(td_fresh)
+            rc3, _out3, err3, calls3, _rec3, _wv3, _wh3 = self._run_self_steal_wizard(
+                d_fresh,
+                "site.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n",
+                telegram_ok=(False, "dc_timeout"),
+            )
+            self.assertEqual(rc3, 1)
+            self.assertIn("Неудачный кандидат остановлен", err3)
+            self.assertTrue(any("stop" in c for c in calls3))
+            self.assertTrue(any("rm" in c for c in calls3))
+
+    def test_self_steal_success_when_public_address_is_unreachable(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            rc, out, err, _calls, _rec, _wv, _wh = self._run_self_steal_wizard(
+                d,
+                "site.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n",
+                public_https_ok=(False, "timed out"),
+                public_port_status=("unreachable", "timed out"),
+            )
+            self.assertEqual(rc, 0, msg=err)
+            self.assertIn("Локальный вход: HTTPS GET", out)
+            self.assertIn("Публичный HTTPS GET", err)
+            self.assertIn("откат не требуется", err)
+            self.assertTrue((d / "config.json").is_file())
 
 
 if __name__ == "__main__":
