@@ -3161,7 +3161,7 @@ class SetupValidationTests(unittest.TestCase):
 
                 # 2. Build a distinct failing candidate image under the exact same shared_tag.
                 (Path(bad_ctx) / "Dockerfile").write_text(
-                    f'FROM {orig_img_id}\nENTRYPOINT ["/bin/sh", "-c", "sleep 300"]\n',
+                    f'FROM {shared_tag}\nENTRYPOINT ["/bin/sh", "-c", "sleep 300"]\n',
                     encoding="utf-8",
                 )
                 setup.run(["docker", "build", "-t", shared_tag, bad_ctx])
