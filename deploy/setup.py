@@ -971,6 +971,23 @@ def write_volume_secret_stdin(base: list[str], path_in_container: str, hex_secre
     )
 
 
+def remove_volume_file(base: list[str], path_in_container: str) -> None:
+    run(
+        base
+        + [
+            "run",
+            "--rm",
+            "--no-deps",
+            "--entrypoint",
+            "/bin/rm",
+            compose_write_service(base),
+            "-f",
+            path_in_container,
+        ],
+        check=False,
+    )
+
+
 def read_volume_secret(base: list[str], path_in_container: str) -> str:
     return run(
         base
@@ -1312,12 +1329,24 @@ def probe_local_https_get(host: str, port: int, sni: str, timeout_s: float = 5.0
                     f"Connection: close\r\n\r\n"
                 ).encode("ascii", errors="ignore")
                 tls_sock.sendall(req)
-                raw_resp = tls_sock.recv(4096)
-                if not raw_resp:
+                buf = bytearray()
+                while b"\r\n" not in buf and len(buf) < 8192:
+                    chunk = tls_sock.recv(1024)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                if not buf:
                     return False, f"{ver}, пустой ответ на HTTPS GET /"
-                status_line = raw_resp.split(b"\r\n", 1)[0].decode("latin-1", errors="replace").strip()
-                if not status_line.startswith("HTTP/"):
-                    return False, f"{ver}, некорректный HTTP-ответ: {status_line[:80]}"
+                if b"\r\n" not in buf:
+                    preview = bytes(buf[:80]).decode("latin-1", errors="replace").strip()
+                    return False, f"{ver}, неполный HTTP-ответ: {preview}"
+                status_line = bytes(buf).split(b"\r\n", 1)[0].decode("latin-1", errors="replace").strip()
+                m = re.match(r"^HTTP/(?:1\.[01]|2(?:\.0)?)\s+(\d{3})(?:\s.*)?$", status_line)
+                if not m:
+                    return False, f"{ver}, некорректная строка статуса HTTP: {status_line[:80]}"
+                status_code = int(m.group(1))
+                if status_code >= 500 or status_code < 100:
+                    return False, f"{ver}, сервер вернул ошибку {status_line}"
                 return True, f"{ver}, {status_line}"
     except ssl.SSLCertVerificationError as exc:
         return False, f"сертификат не подходит для SNI {sni}: {exc}"
@@ -4065,11 +4094,44 @@ def main(argv: list[str] | None = None) -> int:
     compose_ref = f'--env-file "{abs_env}" -f "{abs_compose}"'
     include_build = not args.no_build and (repo_root / "Dockerfile").is_file()
     cover_val = str(config_data.get("cover") or "")
+    effective_egress_token_file = str(config_data.get("egress_token_file") or "/var/lib/mtevil/egress-token")
+    if role in ("edge", "egress"):
+        config_data["egress_token_file"] = effective_egress_token_file
+    cand_token_path = f"{effective_egress_token_file}.candidate"
     compose_extra_hosts = (
         ["host.docker.internal:host-gateway"]
         if (not use_network_host and "host.docker.internal" in cover_val.lower())
         else None
     )
+
+    prev_image_id: str | None = None
+    pinned_rollback_tag: str | None = None
+    if existing_cfg.exists():
+        prev_image_ref = str(saved.get("MTEVIL_IMAGE") or args.image).strip()
+        try:
+            prev_image_id, prev_digest, prev_version = inspect_current_deployment(
+                deploy_dir, project, prev_image_ref
+            )
+            if prev_image_id:
+                pinned_rollback_tag = save_rollback_snapshot(
+                    deploy_dir,
+                    project,
+                    prev_version,
+                    prev_image_ref,
+                    prev_image_id,
+                    prev_digest,
+                )
+        except Exception as exc:
+            print(err_text(f"Не удалось зафиксировать текущий образ для отката: {exc}"), file=sys.stderr)
+            return 1
+
+    had_proxy_secret = False
+    created_proxy_secret = False
+    had_users_json = False
+    created_users_json = False
+    had_allowed_sni = False
+    prev_allowed_snis: list[str] | None = None
+    allowed_snis_modified = False
     try:
         max_conn_val = int(config_data.get("max_connections", 512 if role == "egress" else 256))
         cand_compose.write_text(
@@ -4104,8 +4166,6 @@ def main(argv: list[str] | None = None) -> int:
             print(ok_text("Docker-образ собран"))
 
         # Ensure secrets / tokens in the state volume without overwriting existing ones.
-        prev_allowed_snis: list[str] | None = None
-        allowed_snis_modified = False
         if role in ("direct", "edge"):
             if mode == "self-steal":
                 print(f"Проверка локального HTTPS-сайта {cover_val} (SNI {sni}) из временного контейнера...")
@@ -4126,27 +4186,29 @@ def main(argv: list[str] | None = None) -> int:
                     return 1
                 print(ok_text(f"Сертификат и доступность {cover_val} из контейнера подтверждены."))
             try:
-                created = ensure_generated_secret(cand_base, "/var/lib/mtevil/proxy-secret")
-                if not volume_file_exists(cand_base, "/var/lib/mtevil/users.json"):
+                had_proxy_secret = volume_file_exists(cand_base, "/var/lib/mtevil/proxy-secret")
+                created_proxy_secret = ensure_generated_secret(cand_base, "/var/lib/mtevil/proxy-secret")
+                had_users_json = volume_file_exists(cand_base, "/var/lib/mtevil/users.json")
+                if not had_users_json:
                     write_volume_secret_stdin(cand_base, "/var/lib/mtevil/users.json", "{}")
-                prev_allowed_snis = read_allowed_snis_from_volume(cand_base)
-                prev_sni = str(saved_cfg.get("sni") or "").strip()
-                snis_to_record = [sni] + ([prev_sni] if prev_sni and prev_sni != sni else [])
-                record_allowed_snis_in_volume(cand_base, snis_to_record)
-                allowed_snis_modified = True
+                    created_users_json = True
             except RuntimeError as exc:
                 summary, action = diagnose_docker_error(str(exc), args.image)
                 print(f"{err_text(summary)}\nДальше: {action}", file=sys.stderr)
                 return 1
-            print("Секрет клиента: создан в томе state." if created else "Секрет клиента: сохранён прежний из тома state.")
+            print(
+                "Секрет клиента: создан в томе state."
+                if created_proxy_secret
+                else "Секрет клиента: сохранён прежний из тома state."
+            )
 
         if role == "egress":
-            has_egress_tok = volume_file_exists(cand_base, "/var/lib/mtevil/egress-token")
+            has_egress_tok = volume_file_exists(cand_base, effective_egress_token_file)
             if has_egress_tok and ask_yes_no("Использовать существующий токен MTV2 из тома state?", default=True):
                 print("Токен MTV2: сохранён прежний из тома state.")
             else:
                 if has_egress_tok:
-                    previous_token = read_volume_secret(cand_base, "/var/lib/mtevil/egress-token")
+                    previous_token = read_volume_secret(cand_base, effective_egress_token_file)
                 is_first = ask_yes_no("Это первый узел egress (сгенерировать новый токен MTV2)?", default=True)
                 if is_first:
                     pending_token = secrets.token_hex(16)
@@ -4157,22 +4219,22 @@ def main(argv: list[str] | None = None) -> int:
                     pending_token = ask_hidden_token("Введите токен MTV2 с основного egress")
                     print("Токен MTV2 подготовлен для проверки (рабочий том state пока не изменён).")
         elif role == "edge":
-            has_edge_tok = volume_file_exists(cand_base, "/var/lib/mtevil/egress-token")
+            has_edge_tok = volume_file_exists(cand_base, effective_egress_token_file)
             if has_edge_tok and ask_yes_no(
                 "Использовать существующий токен MTV2 из тома state?", default=True
             ):
                 print("Токен MTV2: сохранён прежний из тома state.")
             else:
                 if has_edge_tok:
-                    previous_token = read_volume_secret(cand_base, "/var/lib/mtevil/egress-token")
+                    previous_token = read_volume_secret(cand_base, effective_egress_token_file)
                 pending_token = ask_hidden_token("Введите общий токен MTV2")
                 print("Токен MTV2 подготовлен для проверки (рабочий том state пока не изменён).")
 
         if pending_token is not None:
-            write_volume_secret_stdin(cand_base, "/var/lib/mtevil/egress-token.candidate", pending_token)
+            write_volume_secret_stdin(cand_base, cand_token_path, pending_token)
             cand_token_in_volume = True
             cand_cfg_data = dict(config_data)
-            cand_cfg_data["egress_token_file"] = "/var/lib/mtevil/egress-token.candidate"
+            cand_cfg_data["egress_token_file"] = cand_token_path
             cand_config.write_text(json.dumps(cand_cfg_data, indent=2) + "\n", encoding="utf-8")
 
         cfg_check = run(
@@ -4236,23 +4298,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     finally:
         if cand_token_in_volume:
-            try:
-                run(
-                    cand_base
-                    + [
-                        "run",
-                        "--rm",
-                        "--no-deps",
-                        "--entrypoint",
-                        "/bin/rm",
-                        compose_write_service(cand_base),
-                        "-f",
-                        "/var/lib/mtevil/egress-token.candidate",
-                    ],
-                    check=False,
-                )
-            except Exception:
-                pass
+            remove_volume_file(cand_base, cand_token_path)
         for p in (cand_compose, cand_env, cand_config):
             if p.exists():
                 p.unlink()
@@ -4272,8 +4318,15 @@ def main(argv: list[str] | None = None) -> int:
         (deploy_dir / "compose.yaml").write_text(live_compose, encoding="utf-8")
         (deploy_dir / ".env").write_text(env_text, encoding="utf-8")
         (deploy_dir / "config.json").write_text(cfg_text, encoding="utf-8")
+        if role in ("direct", "edge"):
+            had_allowed_sni = volume_file_exists(base, "/var/lib/mtevil/allowed-sni.txt")
+            prev_allowed_snis = read_allowed_snis_from_volume(base) if had_allowed_sni else []
+            prev_sni = str(saved_cfg.get("sni") or "").strip()
+            snis_to_record = [sni] + ([prev_sni] if prev_sni and prev_sni != sni else [])
+            record_allowed_snis_in_volume(base, snis_to_record)
+            allowed_snis_modified = True
         if pending_token is not None:
-            write_volume_secret_stdin(base, "/var/lib/mtevil/egress-token", pending_token)
+            write_volume_secret_stdin(base, effective_egress_token_file, pending_token)
             token_written_to_volume = True
             print("Токен MTV2 сохранён в томе state.")
         run(base + ["config", "--quiet"])
@@ -4381,23 +4434,50 @@ def main(argv: list[str] | None = None) -> int:
             if backed_up_files:
                 restore_backup_files(deploy_dir, backed_up_files)
                 print("Прежние файлы конфигурации восстановлены.", file=sys.stderr)
-            if token_written_to_volume and previous_token is not None:
+            if pinned_rollback_tag and (deploy_dir / ".env.rollback").is_file():
                 try:
-                    write_volume_secret_stdin(base, "/var/lib/mtevil/egress-token", previous_token)
+                    shutil.copyfile(deploy_dir / ".env.rollback", deploy_dir / ".env")
+                except OSError:
+                    pass
+            if token_written_to_volume:
+                try:
+                    if previous_token is not None:
+                        write_volume_secret_stdin(base, effective_egress_token_file, previous_token)
+                    else:
+                        remove_volume_file(base, effective_egress_token_file)
                 except Exception as exc:
                     print(err_text(f"Не удалось вернуть прежний токен MTV2 в том state: {exc}"), file=sys.stderr)
-            if allowed_snis_modified and prev_allowed_snis is not None:
+            if allowed_snis_modified:
                 try:
-                    restored_snis = "\n".join(prev_allowed_snis) + ("\n" if prev_allowed_snis else "")
-                    write_volume_secret_stdin(base, "/var/lib/mtevil/allowed-sni.txt", restored_snis)
+                    if had_allowed_sni and prev_allowed_snis:
+                        write_volume_secret_stdin(base, "/var/lib/mtevil/allowed-sni.txt", "\n".join(prev_allowed_snis))
+                    elif not had_allowed_sni:
+                        remove_volume_file(base, "/var/lib/mtevil/allowed-sni.txt")
                 except Exception as exc:
                     print(err_text(f"Не удалось восстановить allowed-sni.txt в томе state: {exc}"), file=sys.stderr)
+            if created_proxy_secret:
+                remove_volume_file(base, "/var/lib/mtevil/proxy-secret")
+            if created_users_json:
+                remove_volume_file(base, "/var/lib/mtevil/users.json")
             if had_backup and up_attempted:
                 rb_up = run(base + ["up", "-d", "--force-recreate", compose_service(base)], check=False)
                 if rb_up.returncode == 0:
                     try:
                         wait_healthy(base)
-                        print("Прежний контейнер снова работает.", file=sys.stderr)
+                        if prev_image_id:
+                            restored_ref = pinned_rollback_tag or str(saved.get("MTEVIL_IMAGE") or args.image)
+                            restored_id, _, _ = inspect_current_deployment(deploy_dir, project, restored_ref)
+                            if restored_id and restored_id != prev_image_id:
+                                print(
+                                    err_text(
+                                        f"Откат перезапустил контейнер с другим image ID ({restored_id} вместо {prev_image_id})."
+                                    ),
+                                    file=sys.stderr,
+                                )
+                            else:
+                                print("Прежний контейнер снова работает.", file=sys.stderr)
+                        else:
+                            print("Прежний контейнер снова работает.", file=sys.stderr)
                     except Exception as exc:
                         print(err_text(f"Прежний контейнер запущен, но не подтвердил статус healthy: {exc}"), file=sys.stderr)
                 else:
@@ -4498,7 +4578,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\n" + heading("Что указать на входном сервере (edge)"))
         print(f"  Адрес выхода: {bind_ip}:{pub_port}")
         print("  Режим в мастере на edge: 2 (Расширенная настройка) -> 2 (edge)")
-        print(f"  Получить токен безопасно: docker compose {compose_ref} exec -T {compose_service(base)} cat /var/lib/mtevil/egress-token")
+        print(f"  Получить токен безопасно: docker compose {compose_ref} exec -T {compose_service(base)} cat {effective_egress_token_file}")
         print("  Миграция на MTV3: сначала обновите egress, затем все edge; после этого выставите \"egress_accept_legacy\": false в config.json egress.")
         print()
         print(f"Каталог установки: {deploy_dir}")
