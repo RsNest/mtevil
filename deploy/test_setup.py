@@ -3135,9 +3135,10 @@ class SetupValidationTests(unittest.TestCase):
             base = setup.compose_cmd(d, proj)
             try:
                 # 1. Deploy good image under shared_tag and verify Telegram E2E.
-                stdin_good = f"1\n127.0.0.1\n{port}\n0.0.0.0\nmozilla.org\nmozilla.org:443\nn\ny\n"
+                stdin_good = f"127.0.0.1\n{port}\n0.0.0.0\nmozilla.org\nmozilla.org:443\nn\ny\n"
                 with (
                     mock.patch.object(sys, "argv", ["setup.py", "--mode", "advanced", "--role", "direct", "--dir", str(d), "--project", proj, "--image", shared_tag, "--no-build", "--network-host"]),
+                    mock.patch.object(setup, "prompt_client_address", return_value=("127.0.0.1", None)),
                     mock.patch.object(setup, "check_cover_from_container", return_value=(True, "ok")),
                     mock.patch.object(setup, "probe_cover_reachable", return_value=(True, "TLSv1.3")),
                     mock.patch.object(setup, "verify_telegram_e2e", return_value=(True, "mock")),
