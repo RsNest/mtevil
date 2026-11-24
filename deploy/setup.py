@@ -1310,8 +1310,8 @@ def probe_cover_reachable(cover: str, sni: str, timeout_s: float = 4.0) -> tuple
         return False, str(exc)
 
 
-def probe_local_https_get(host: str, port: int, sni: str, timeout_s: float = 5.0) -> tuple[bool, str]:
-    """Perform a real HTTPS GET with SNI and certificate validation against host:port."""
+def probe_cover_status(host: str, port: int, sni: str, timeout_s: float = 5.0) -> tuple[bool, str, int | None]:
+    """Perform a real HTTPS GET with SNI/cert validation and return (ok, detail, cert_days_left)."""
     import ssl
 
     ctx = ssl.create_default_context()
@@ -1321,7 +1321,15 @@ def probe_local_https_get(host: str, port: int, sni: str, timeout_s: float = 5.0
                 ver = tls_sock.version() or "TLS"
                 cert = tls_sock.getpeercert()
                 if not cert:
-                    return False, f"{ver}, но сервер не предъявил сертификат для SNI {sni}"
+                    return False, f"{ver}, но сервер не предъявил сертификат для SNI {sni}", None
+                days_left: int | None = None
+                not_after = cert.get("notAfter")
+                if isinstance(not_after, str) and not_after:
+                    try:
+                        exp_ts = ssl.cert_time_to_seconds(not_after)
+                        days_left = int((exp_ts - time.time()) // 86400)
+                    except Exception:
+                        days_left = None
                 req = (
                     f"GET / HTTP/1.1\r\n"
                     f"Host: {sni}\r\n"
@@ -1336,22 +1344,28 @@ def probe_local_https_get(host: str, port: int, sni: str, timeout_s: float = 5.0
                         break
                     buf.extend(chunk)
                 if not buf:
-                    return False, f"{ver}, пустой ответ на HTTPS GET /"
+                    return False, f"{ver}, пустой ответ на HTTPS GET /", days_left
                 if b"\r\n" not in buf:
                     preview = bytes(buf[:80]).decode("latin-1", errors="replace").strip()
-                    return False, f"{ver}, неполный HTTP-ответ: {preview}"
+                    return False, f"{ver}, неполный HTTP-ответ: {preview}", days_left
                 status_line = bytes(buf).split(b"\r\n", 1)[0].decode("latin-1", errors="replace").strip()
                 m = re.match(r"^HTTP/(?:1\.[01]|2(?:\.0)?)\s+(\d{3})(?:\s.*)?$", status_line)
                 if not m:
-                    return False, f"{ver}, некорректная строка статуса HTTP: {status_line[:80]}"
+                    return False, f"{ver}, некорректная строка статуса HTTP: {status_line[:80]}", days_left
                 status_code = int(m.group(1))
                 if status_code >= 500 or status_code < 100:
-                    return False, f"{ver}, сервер вернул ошибку {status_line}"
-                return True, f"{ver}, {status_line}"
+                    return False, f"{ver}, сервер вернул ошибку {status_line}", days_left
+                return True, f"{ver}, {status_line}", days_left
     except ssl.SSLCertVerificationError as exc:
-        return False, f"сертификат не подходит для SNI {sni}: {exc}"
+        return False, f"сертификат не подходит для SNI {sni}: {exc}", None
     except Exception as exc:
-        return False, str(exc)
+        return False, str(exc), None
+
+
+def probe_local_https_get(host: str, port: int, sni: str, timeout_s: float = 5.0) -> tuple[bool, str]:
+    """Perform a real HTTPS GET with SNI and certificate validation against host:port."""
+    ok, detail, _days = probe_cover_status(host, port, sni, timeout_s=timeout_s)
+    return ok, detail
 
 
 def prompt_masking_config(
@@ -2617,6 +2631,9 @@ def run_status_command(deploy_dir: Path) -> int:
         print(me_line)
     for diag_line in format_handshake_diag_lines(role, rstats):
         print(diag_line)
+    if running:
+        for cov_line in format_cover_status_lines(role, saved_cfg, bind_val, port_val):
+            print(cov_line)
     if role == "egress":
         accept_legacy = saved_cfg.get("egress_accept_legacy", True) is not False
         proto_mode = "MTV4 + MTV3 + legacy MTV2 (переходный)" if accept_legacy else "MTV4 + MTV3 (строгий)"
@@ -3265,6 +3282,36 @@ def format_handshake_diag_lines(
         exp = int(sample.get("expected_bytes") or 0)
         reason_lbl = "таймаут" if sample.get("timeout") else "закрытие сокета"
         lines.append(f"  Последний обрыв:   ClientHello: получено {rx} из {exp} байт ({reason_lbl})")
+    return lines
+
+
+def format_cover_status_lines(
+    role: str,
+    saved_cfg: dict[str, object],
+    bind_val: str,
+    port_val: str,
+) -> list[str]:
+    if role not in ("direct", "edge"):
+        return []
+    sni = str(saved_cfg.get("sni") or "").strip()
+    if not sni or not port_val:
+        return []
+    try:
+        port = int(port_val)
+    except ValueError:
+        return []
+    local_host = "127.0.0.1" if bind_val in ("", "0.0.0.0", "::", "127.0.0.1") else bind_val
+    ok, detail, days_left = probe_cover_status(local_host, port, sni, timeout_s=3.0)
+    if not ok:
+        return [f"  Проверка cover:    {err_text(f'ошибка ({detail})')}"]
+    cert_note = f", сертификат: {days_left} дн." if days_left is not None else ""
+    lines = [f"  Проверка cover:    {ok_text(f'HTTPS GET OK ({detail}{cert_note})')}"]
+    if days_left is not None and days_left < 14:
+        lines.append(
+            warn_text(
+                f"  Предупреждение:    до окончания сертификата cover осталось {days_left} дн. (< 14) — проверьте автопродление."
+            )
+        )
     return lines
 
 

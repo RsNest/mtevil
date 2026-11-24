@@ -3194,6 +3194,25 @@ class SetupValidationTests(unittest.TestCase):
                 setup.run(base + ["down", "-v", "--remove-orphans"], check=False)
                 setup.run(["docker", "rmi", "-f", shared_tag, f"mtevil:rollback-{proj}"], check=False)
 
+    def test_format_cover_status_lines(self):
+        cfg = {"role": "direct", "sni": "site.example.org", "cover": "127.0.0.1:8443"}
+        with mock.patch.object(setup, "probe_cover_status", return_value=(True, "TLSv1.3, HTTP/1.1 200 OK", 45)):
+            lines_ok = setup.format_cover_status_lines("direct", cfg, "0.0.0.0", "443")
+        self.assertEqual(len(lines_ok), 1)
+        self.assertIn("HTTPS GET OK", lines_ok[0])
+        self.assertIn("45 дн.", lines_ok[0])
+
+        with mock.patch.object(setup, "probe_cover_status", return_value=(True, "TLSv1.3, HTTP/1.1 200 OK", 10)):
+            lines_warn = setup.format_cover_status_lines("direct", cfg, "0.0.0.0", "443")
+        self.assertEqual(len(lines_warn), 2)
+        self.assertIn("10 дн.", lines_warn[1])
+        self.assertIn("< 14", lines_warn[1])
+
+        with mock.patch.object(setup, "probe_cover_status", return_value=(False, "502 Bad Gateway", None)):
+            lines_err = setup.format_cover_status_lines("direct", cfg, "0.0.0.0", "443")
+        self.assertEqual(len(lines_err), 1)
+        self.assertIn("ошибка (502 Bad Gateway)", lines_err[0])
+
 
 if __name__ == "__main__":
     prog = unittest.main(verbosity=2, exit=False)
