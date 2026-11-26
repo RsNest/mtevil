@@ -167,6 +167,33 @@ def send_telegram(token, chat, thread_id, text, release_url):
     return "unknown", "Unexpected Telegram response"
 
 
+def pin_telegram_message(token, chat, message_id):
+    """Pin an announced release message silently in the Telegram chat."""
+    payload = {
+        "chat_id": chat,
+        "message_id": int(message_id),
+        "disable_notification": True,
+    }
+    request = Request(
+        f"https://api.telegram.org/bot{token}/pinChatMessage",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            result = json.load(response)
+    except HTTPError as error:
+        return False, f"Telegram HTTP {error.code}"
+    except (URLError, OSError, ValueError):
+        return False, "Telegram transport or response error"
+    if isinstance(result, dict) and result.get("ok") is True:
+        return True, "pinned"
+    if isinstance(result, dict) and result.get("ok") is False:
+        return False, f"Telegram API {result.get('error_code', 'error')}"
+    return False, "Unexpected Telegram response"
+
+
 def main(tag):
     if not RELEASE_TAG.fullmatch(tag):
         print("Telegram announcements cover SemVer release and pre-release tags only.")
@@ -198,6 +225,12 @@ def main(tag):
     delivery, detail = send_telegram(token, chat, thread_id, text, release["html_url"])
     if delivery == "sent":
         print(f"Announced {tag} in Telegram topic {thread_id} (message {detail}).")
+        if "-" not in tag:
+            pinned, pin_detail = pin_telegram_message(token, chat, detail)
+            if pinned:
+                print(f"Pinned release message {detail} in {chat}.")
+            else:
+                print(f"::warning::Failed to pin release message {detail}: {pin_detail}. Check bot pin permissions.")
         return 0
     if delivery == "rejected":
         github_api(release_endpoint, {"body": body})

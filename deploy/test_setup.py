@@ -3229,6 +3229,73 @@ class SetupValidationTests(unittest.TestCase):
         for invalid in ("0.3.3", "v01.2.3", "v1.2", "main", "v1.0.0-"):
             self.assertIsNone(mod.RELEASE_TAG.fullmatch(invalid), invalid)
 
+    def test_announce_release_pins_only_stable_releases(self):
+        import importlib.util
+        import os
+
+        spec = importlib.util.spec_from_file_location(
+            "announce_release",
+            Path(__file__).resolve().parent.parent / ".github" / "announce_release.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        for tag, expect_pin in (("v0.3.4", True), ("v0.3.4-rc.1", False)):
+            pinned_calls = []
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "TELEGRAM_BOT_TOKEN": "123:abc",
+                    "TELEGRAM_CHAT_ID": "@mtevil_chat",
+                    "TELEGRAM_MESSAGE_THREAD_ID": "22",
+                    "GITHUB_REPOSITORY": "RsNest/mtevil",
+                },
+                clear=False,
+            ), mock.patch.object(
+                mod,
+                "github_api",
+                side_effect=[
+                    {"id": 99, "draft": False, "body": "", "html_url": f"https://github.com/RsNest/mtevil/releases/tag/{tag}"},
+                    {},
+                ],
+            ), mock.patch.object(
+                mod, "send_telegram", return_value=("sent", "777")
+            ), mock.patch.object(
+                mod,
+                "pin_telegram_message",
+                side_effect=lambda tok, ch, mid: pinned_calls.append((tok, ch, mid)) or (True, "pinned"),
+            ):
+                rc = mod.main(tag)
+            self.assertEqual(rc, 0)
+            if expect_pin:
+                self.assertEqual(pinned_calls, [("123:abc", "@mtevil_chat", "777")])
+            else:
+                self.assertEqual(pinned_calls, [])
+
+        # Pin failure must warn without failing the announcement job.
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_BOT_TOKEN": "123:abc",
+                "TELEGRAM_CHAT_ID": "@mtevil_chat",
+                "TELEGRAM_MESSAGE_THREAD_ID": "22",
+                "GITHUB_REPOSITORY": "RsNest/mtevil",
+            },
+            clear=False,
+        ), mock.patch.object(
+            mod,
+            "github_api",
+            side_effect=[
+                {"id": 99, "draft": False, "body": "", "html_url": "https://github.com/RsNest/mtevil/releases/tag/v0.3.4"},
+                {},
+            ],
+        ), mock.patch.object(
+            mod, "send_telegram", return_value=("sent", "778")
+        ), mock.patch.object(
+            mod, "pin_telegram_message", return_value=(False, "Telegram HTTP 403")
+        ):
+            self.assertEqual(mod.main("v0.3.4"), 0)
+
     def test_webproxy_vectors_validators_and_link_derivation(self):
         # Normative bridge capability vectors from telegramdesktop/tproxy-server (PROTOCOL.md & BASE_PATH.md)
         self.assertEqual(
