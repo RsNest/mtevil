@@ -270,6 +270,39 @@ impl AcceptLoopState {
     }
 }
 
+pub(crate) type DrainRx = tokio::sync::watch::Receiver<bool>;
+
+pub(crate) fn inactive_drain_rx() -> DrainRx {
+    tokio::sync::watch::channel(false).1
+}
+
+pub(crate) async fn wait_for_drain(rx: &mut DrainRx) {
+    if *rx.borrow_and_update() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await
+}
+
+/// Initiate a live TCP close (`FIN` via `SHUT_WR`) and briefly drain unread
+/// inbound bytes so dropping the socket does not emit a kernel `RST`.
+pub(crate) async fn graceful_fin_close(stream: &mut TcpStream, drain_window: Duration) {
+    let budget = drain_window.min(DC_EOF_SHUTDOWN_TIMEOUT);
+    if budget.is_zero() {
+        let _ = stream.shutdown().await;
+        return;
+    }
+    let _ = timeout(budget, async {
+        let _ = stream.shutdown().await;
+        let _ = tokio::io::copy(stream, &mut tokio::io::sink()).await;
+    })
+    .await;
+}
+
 pub(crate) async fn serve(
     mut listener: impl Acceptor,
     state: Arc<State>,
@@ -277,6 +310,7 @@ pub(crate) async fn serve(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let permits = Arc::new(Semaphore::new(max_connections));
+    let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
     let mut tasks = tokio::task::JoinSet::new();
     let mut accept_state = AcceptLoopState::default();
     tokio::pin!(shutdown);
@@ -302,14 +336,16 @@ pub(crate) async fn serve(
             AcceptDecision::Shutdown => break,
         };
         let state = state.clone();
+        let conn_drain = drain_rx.clone();
         tasks.spawn(async move {
             let _permit = permit;
             // Deliberately do not log client addresses, secrets or payload bytes.
-            let _ = connection(socket, state).await;
+            let _ = connection_with_drain(socket, state, conn_drain).await;
         });
     }
-    // Stop admission immediately. Drain has its own deadline, independent of a stalled handshake.
+    // Stop admission immediately and notify active sessions to close with FIN.
     drop(listener);
+    let _ = drain_tx.send(true);
     telemetry::event(
         "drain_started",
         0,
@@ -407,9 +443,18 @@ pub(crate) fn hello_record_count(raw: &[u8]) -> usize {
     count
 }
 
-pub(crate) async fn connection(mut client: TcpStream, state: Arc<State>) -> Result<()> {
+#[cfg(test)]
+pub(crate) async fn connection(client: TcpStream, state: Arc<State>) -> Result<()> {
+    connection_with_drain(client, state, inactive_drain_rx()).await
+}
+
+pub(crate) async fn connection_with_drain(
+    mut client: TcpStream,
+    state: Arc<State>,
+    drain_rx: DrainRx,
+) -> Result<()> {
     let mut session = telemetry::Session::new(&state.counters);
-    let result = connection_inner(&mut client, &state, session.id).await;
+    let result = connection_inner(&mut client, &state, session.id, drain_rx).await;
     session.finish(&result);
     result
 }
@@ -487,13 +532,22 @@ pub(crate) async fn connection_inner(
     client: &mut TcpStream,
     state: &State,
     session_id: u64,
+    mut drain_rx: DrainRx,
 ) -> Result<()> {
     configure_tcp_socket(client)?;
     let t0 = Instant::now();
     let us = || t0.elapsed().as_micros() as u64;
     let mut proxy_v2_client_addr: Option<SocketAddr> = None;
     if state.proxy_protocol {
-        match read_proxy_v2(client, state.client_hello).await {
+        let proxy_v2 = tokio::select! {
+            biased;
+            () = wait_for_drain(&mut drain_rx) => {
+                graceful_fin_close(client, state.drain / 2).await;
+                return Ok(());
+            }
+            res = read_proxy_v2(client, state.client_hello) => res,
+        };
+        match proxy_v2 {
             Ok(ProxyV2Outcome::Header(addr)) => {
                 proxy_v2_client_addr = addr;
             }
@@ -516,17 +570,23 @@ pub(crate) async fn connection_inner(
         }
     }
     let mut raw = Vec::with_capacity(wire::MAX_HELLO + 84);
-    let received = timeout(state.client_hello, async {
-        if state.enable_dd {
-            saved_read(client, &mut raw, 3).await?;
-            if !matches!(raw.as_slice(), [0x16, 3, 1..=3]) {
-                saved_read(client, &mut raw, 64).await?;
-                return Ok(None);
-            }
+    let received = tokio::select! {
+        biased;
+        () = wait_for_drain(&mut drain_rx) => {
+            graceful_fin_close(client, state.drain / 2).await;
+            return Ok(());
         }
-        read_hello(client, &mut raw).await.map(Some)
-    })
-    .await;
+        res = timeout(state.client_hello, async {
+            if state.enable_dd {
+                saved_read(client, &mut raw, 3).await?;
+                if !matches!(raw.as_slice(), [0x16, 3, 1..=3]) {
+                    saved_read(client, &mut raw, 64).await?;
+                    return Ok(None);
+                }
+            }
+            read_hello(client, &mut raw).await.map(Some)
+        }) => res,
+    };
     if !raw.is_empty() {
         state
             .counters
@@ -626,6 +686,7 @@ pub(crate) async fn connection_inner(
                         ..HelloDiag::default()
                     },
                 },
+                drain_rx,
             )
             .await;
         }
@@ -683,7 +744,7 @@ pub(crate) async fn connection_inner(
                 "record_version":record_version,
             }),
         );
-        return bounded_cover(client, raw, state, session_id).await;
+        return bounded_cover(client, raw, state, session_id, drain_rx).await;
     };
     let decision = {
         let mut cache = state.replay.lock().await;
@@ -701,7 +762,7 @@ pub(crate) async fn connection_inner(
             session_id,
             json!({"reason":"replay_or_cache_full"}),
         );
-        return bounded_cover(client, raw, state, session_id).await;
+        return bounded_cover(client, raw, state, session_id, drain_rx).await;
     }
     let flight_profile = state.flight_profile();
     let flight = wire::server_flight(
@@ -720,16 +781,22 @@ pub(crate) async fn connection_inner(
     let flight_written_us = us();
     let mut tls = TlsReader::default();
     let mut frame = [0u8; 64];
-    let inner = timeout(state.handshake, async {
-        let mut off = 0;
-        while off < frame.len() {
-            let n = tls.read_into(client, &mut frame[off..]).await?;
-            ensure!(n > 0, "EOF before inner header");
-            off += n;
+    let inner = tokio::select! {
+        biased;
+        () = wait_for_drain(&mut drain_rx) => {
+            graceful_fin_close(client, state.drain / 2).await;
+            return Ok(());
         }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await;
+        res = timeout(state.handshake, async {
+            let mut off = 0;
+            while off < frame.len() {
+                let n = tls.read_into(client, &mut frame[off..]).await?;
+                ensure!(n > 0, "EOF before inner header");
+                off += n;
+            }
+            Ok::<_, anyhow::Error>(())
+        }) => res,
+    };
     state
         .counters
         .downstream_rx_bytes
@@ -788,6 +855,7 @@ pub(crate) async fn connection_inner(
                 fake_tls_cert_bytes: flight_profile.cert_bytes,
             },
         },
+        drain_rx,
     )
     .await
 }

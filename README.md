@@ -48,6 +48,10 @@ python3 deploy/setup.py
 - **Компромиссы и ограничения:** свой домен и IP можно заблокировать без коллатерального ущерба для цензора (в отличие от популярного чужого домена); режимы белых списков и репутация нового домена могут не пройти; домен привязан к вам, в журналах веб-сервера виден `127.0.0.1` (а не адрес посетителя), сайт и сертификат нужно поддерживать самостоятельно; срез клиентского `ClientHello` до ответа сервера `self-steal` не устраняет.
 - Подробная инструкция (`nginx`-конфиг на `127.0.0.1:8443`, получение/мониторинг сертификата и откат) — в [deploy/README.md](deploy/README.md#режим-self-steal-маскировка-под-собственный-локальный-https-сайт).
 
+### Режим `webproxy` (Telegram WEB Proxy через `tproxy-server`)
+
+Если ваш домен уже обслуживается внешним `Caddy` или `nginx` на порту `443`, мастер поддерживает режим **`webproxy`** (`mtevilctl setup --webproxy` или пункт **4**): рядом с `mtevil` поднимается sidecar-контейнер `telegramdesktop/tproxy-server`, а поддерживающие протокол клиенты Telegram подключаются по ссылкам `https://t.me/webproxy?...` / `tg://webproxy?...` через встроенный браузерный движок (настоящий `TLS 1.3`, `HTTP/2` и `WebSocket`) с маршрутизацией потока в `mtevil` (`direct`, `edge → egress` или `ME`). Неаутентифицированные запросы получают ваш реальный сайт (`./site` или локальный HTTP-бэкенд). Инструкция и ограничения — в [deploy/README.md](deploy/README.md#режим-webproxy-telegram-web-proxy-через-tproxy-server-за-caddynginx) и [ADR-004](docs/adr/004-webproxy-and-live-sessions.md).
+
 ## Как обновиться и управлять прокси
 
 В каталог установки (`~/mtevil/mtevilctl`, а также в `~/.local/bin/mtevilctl` или `/usr/local/bin/mtevilctl`) устанавливается утилита `mtevilctl`. Обновление запускается вручную; сам выход нового релиза не перезапускает работающие VPS. При замене контейнера активные звонки и загрузки могут прерваться.
@@ -144,7 +148,8 @@ flowchart LR
   - Сквозная работа по IPv6 не проверялась (поддерживается и проверен IPv4 на Linux `x86_64`).
   - Режим ME проверен на тестовом Linux VPS (волны до 100 сессий, все 3 транспорта, split `MTV4` и ручная сессия на ПК и телефоне с реальным `ad_tag`), но **не** под массовой пользовательской нагрузкой; режим `me.send_client_ip = false` (`0.0.0.0:0`) с реальным клиентом Telegram не проверялся и остаётся экспериментальным. Показ спонсорского канала у клиентов может появляться не сразу. Инструкция для самостоятельной проверки — [docs/me-manual-test.md](docs/me-manual-test.md).
 
-## Документация
+## Документация и лицензия
 
 - [Развёртывание, диагностика, обновление и откат](deploy/README.md)
-- [Архитектура и решения](docs/adr/000-architecture-baseline.md) · [ADR-002: ME-режим и `ad_tag`](docs/adr/002-me-mode.md) · [Реализация ядра](docs/specs/prototype.md) · [Журнал проверок](docs/evidence-log.md)
+- [Архитектура и решения](docs/adr/000-architecture-baseline.md) · [ADR-002: ME-режим и `ad_tag`](docs/adr/002-me-mode.md) · [ADR-003: Маскировка FakeTLS](docs/adr/003-masking-improvements.md) · [ADR-004: WEB Proxy и живые сессии](docs/adr/004-webproxy-and-live-sessions.md) · [Реализация ядра](docs/specs/prototype.md) · [Журнал проверок](docs/evidence-log.md)
+- Лицензия: двойная `MIT OR Apache-2.0` ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)).

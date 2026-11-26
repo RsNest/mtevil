@@ -138,6 +138,7 @@ pub(crate) async fn relay_client(
     session_id: u64,
     t0: Instant,
     session: ClientSession,
+    drain_rx: DrainRx,
 ) -> Result<()> {
     let ClientSession {
         user,
@@ -172,6 +173,7 @@ pub(crate) async fn relay_client(
                     diag,
                     me_session,
                     ad_tag_configured,
+                    drain_rx,
                 )
                 .await;
             }
@@ -206,6 +208,7 @@ pub(crate) async fn relay_client(
                     hello_read_us,
                     flight_written_us,
                     diag,
+                    drain_rx,
                 )
                 .await;
             }
@@ -254,8 +257,7 @@ pub(crate) async fn relay_client(
     );
     let client_fd = stream_raw_fd(client);
     let upstream_fd = stream_raw_fd(&upstream);
-    let (cr, cw) = client.split();
-    let (ur, uw) = upstream.into_split();
+    let (ur, mut uw) = upstream.into_split();
     let relay = RelayStats {
         counters: Some(state.counters.clone()),
         client_fd,
@@ -264,54 +266,73 @@ pub(crate) async fn relay_client(
         ..RelayStats::default()
     };
     let relay_start_us = us();
-    let result = relay_until_end(
-        &relay,
-        state.idle,
-        async {
-            upload(
-                cr,
-                uw,
-                tls,
-                transport.decrypt,
-                dc.encrypt,
-                RELAY_WRITE_TIMEOUT,
-                &relay,
-            )
-            .await
-            .context("client_to_dc_relay_failed")
-        },
-        async {
-            download(
-                ur,
-                cw,
-                dc.decrypt,
-                transport.encrypt,
-                framed,
-                RELAY_WRITE_TIMEOUT,
-                &relay,
-            )
-            .await
-            .context("dc_to_client_relay_failed")
-        },
-    )
-    .await;
-    let dc_close_reason = if result.is_ok() {
-        // Download already sent FIN. Give the peer a short window to close
-        // its write half and consume late bytes without forwarding them.
-        Some(
-            match timeout(
-                DC_EOF_SHUTDOWN_TIMEOUT,
-                tokio::io::copy(client, &mut tokio::io::sink()),
-            )
-            .await
-            {
-                Ok(Ok(_)) => "dc_eof",
-                Ok(Err(_)) => "client_drain_read_error",
-                Err(_) => "client_drain_timeout",
+    let result = {
+        let (cr, cw) = client.split();
+        relay_until_end_with_drain(
+            &relay,
+            state.idle,
+            drain_rx,
+            async {
+                upload(
+                    cr,
+                    &mut uw,
+                    tls,
+                    transport.decrypt,
+                    dc.encrypt,
+                    RELAY_WRITE_TIMEOUT,
+                    &relay,
+                )
+                .await
+                .context("client_to_dc_relay_failed")
+            },
+            async {
+                download(
+                    ur,
+                    cw,
+                    dc.decrypt,
+                    transport.encrypt,
+                    framed,
+                    RELAY_WRITE_TIMEOUT,
+                    &relay,
+                )
+                .await
+                .context("dc_to_client_relay_failed")
             },
         )
-    } else {
-        None
+        .await
+    };
+    let dc_close_reason = match &result {
+        Ok(RelayOutcome::Completed) => {
+            // Download already sent FIN. Give the peer a short window to close
+            // its write half and consume late bytes without forwarding them.
+            Some(
+                match timeout(
+                    DC_EOF_SHUTDOWN_TIMEOUT,
+                    tokio::io::copy(client, &mut tokio::io::sink()),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => "dc_eof",
+                    Ok(Err(_)) => "client_drain_read_error",
+                    Err(_) => "client_drain_timeout",
+                },
+            )
+        }
+        Ok(RelayOutcome::Drained) => {
+            let _ = timeout(Duration::from_millis(150), uw.shutdown()).await;
+            graceful_fin_close(client, state.drain / 2).await;
+            Some("server_drain")
+        }
+        Err(_) => {
+            if relay
+                .idle_timed_out
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                let _ = timeout(Duration::from_millis(150), uw.shutdown()).await;
+                graceful_fin_close(client, DC_EOF_SHUTDOWN_TIMEOUT).await;
+            }
+            None
+        }
     };
     let mut summary = relay.summary();
     if let Some(reason) = dc_close_reason {
@@ -319,8 +340,7 @@ pub(crate) async fn relay_client(
     }
     summary["relay_start_us"] = json!(relay_start_us);
     telemetry::event("relay_summary", session_id, summary);
-    result?;
-    Ok(())
+    result.map(|_| ())
 }
 
 pub(crate) const NONE_US: u64 = u64::MAX;
@@ -328,12 +348,31 @@ pub(crate) const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DC_EOF_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) const CLIENT_EOF_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RelayOutcome {
+    Completed,
+    Drained,
+}
+
+#[allow(dead_code)]
 pub(crate) async fn relay_until_end(
     stats: &RelayStats,
     idle: Duration,
     upload: impl std::future::Future<Output = Result<()>>,
     download: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
+    relay_until_end_with_drain(stats, idle, inactive_drain_rx(), upload, download)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn relay_until_end_with_drain(
+    stats: &RelayStats,
+    idle: Duration,
+    mut drain_rx: DrainRx,
+    upload: impl std::future::Future<Output = Result<()>>,
+    download: impl std::future::Future<Output = Result<()>>,
+) -> Result<RelayOutcome> {
     tokio::pin!(upload, download);
     let transfer = async {
         tokio::select! {
@@ -353,8 +392,13 @@ pub(crate) async fn relay_until_end(
     };
     tokio::select! {
         biased;
-        result = transfer => result,
+        result = transfer => result.map(|()| RelayOutcome::Completed),
+        () = wait_for_drain(&mut drain_rx) => {
+            stats.timeline.close("server_drain", "fin");
+            Ok(RelayOutcome::Drained)
+        }
         () = stats.wait_for_idle(idle) => {
+            stats.idle_timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
             stats.timeline.close("session_idle", "timed_out");
             bail!("session idle timeout")
         }
@@ -386,11 +430,12 @@ pub(crate) struct RelayStats {
     pub(crate) client_fd: Option<i32>,
     pub(crate) upstream_fd: Option<i32>,
     pub(crate) diagnostics: bool,
+    pub(crate) idle_timed_out: std::sync::atomic::AtomicBool,
 }
 
 impl Default for RelayStats {
     fn default() -> Self {
-        use std::sync::atomic::{AtomicI32, AtomicU64};
+        use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64};
         Self {
             uploaded: AtomicU64::new(0),
             downloaded: AtomicU64::new(0),
@@ -414,6 +459,7 @@ impl Default for RelayStats {
             client_fd: None,
             upstream_fd: None,
             diagnostics: false,
+            idle_timed_out: AtomicBool::new(false),
         }
     }
 }

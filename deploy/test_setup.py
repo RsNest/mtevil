@@ -3215,6 +3215,246 @@ class SetupValidationTests(unittest.TestCase):
         self.assertEqual(len(lines_err), 1)
         self.assertIn("ошибка (502 Bad Gateway)", lines_err[0])
 
+    def test_announce_release_regex_accepts_alpha_beta_rc_and_stable(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "announce_release",
+            Path(__file__).resolve().parent.parent / ".github" / "announce_release.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for valid in ("v0.3.3", "v1.0.0", "v0.1.0-alpha.12", "v0.4.0-beta.1", "v0.3.3-rc.2"):
+            self.assertIsNotNone(mod.RELEASE_TAG.fullmatch(valid), valid)
+        for invalid in ("0.3.3", "v01.2.3", "v1.2", "main", "v1.0.0-"):
+            self.assertIsNone(mod.RELEASE_TAG.fullmatch(invalid), invalid)
+
+    def test_webproxy_vectors_validators_and_link_derivation(self):
+        # Normative bridge capability vectors from telegramdesktop/tproxy-server (PROTOCOL.md & BASE_PATH.md)
+        self.assertEqual(
+            setup.derive_webproxy_capability(
+                "proxy.example.com", "", "000102030405060708090a0b0c0d0e0f"
+            ),
+            "MHLEY5PmW1GWqJkSrlmJpvJUiLhBH_QKy6yKg8a0JPk",
+        )
+        self.assertEqual(
+            setup.derive_webproxy_capability(
+                "proxy.example.com", "", "dd000102030405060708090a0b0c0d0e0f"
+            ),
+            "IpJrt3e7sKtzPyoXy6w-Zj6GGEvsvclN66JzQEfPYLA",
+        )
+        self.assertEqual(
+            setup.derive_webproxy_capability(
+                "proxy.example.com", "dobry-cola-super-app", "000102030405060708090a0b0c0d0e0f"
+            ),
+            "hHz99Xs93EN1j91G9gpNepXwGNNt5YdAFkEVk_LlqdQ",
+        )
+        self.assertEqual(
+            setup.derive_webproxy_capability(
+                "proxy.example.com", "dobry-cola-super-app", "dd000102030405060708090a0b0c0d0e0f"
+            ),
+            "TGUkZaevsavLbHvlNWipnRoYxgzZ51ioWvbxgGT3wHo",
+        )
+
+        # Normative link format vectors from tproxy-server README.md
+        root_links = setup.format_webproxy_links(
+            "proxy.example.com", "", "000102030405060708090a0b0c0d0e0f"
+        )
+        self.assertEqual(
+            root_links["tme"],
+            "https://t.me/webproxy?server=proxy.example.com&secret=000102030405060708090a0b0c0d0e0f",
+        )
+        self.assertEqual(
+            root_links["tg"],
+            "tg://webproxy?server=proxy.example.com&secret=000102030405060708090a0b0c0d0e0f",
+        )
+        pref_links = setup.format_webproxy_links(
+            "proxy.example.com", "phcf2vfe7zgbrslg", "8561944064fc730cbfa4473562d8ec59"
+        )
+        self.assertEqual(pref_links["secret"], "cIVhlEBk_HMMv6RHNWLY7Fk")
+        self.assertEqual(
+            pref_links["tme"],
+            "https://t.me/webproxy?server=proxy.example.com%2Fphcf2vfe7zgbrslg&secret=cIVhlEBk_HMMv6RHNWLY7Fk",
+        )
+
+        # Validators & IDNA Punycode normalization
+        self.assertEqual(setup.validate_webproxy_hostname("пример.рф"), "xn--e1afmkfd.xn--p1ai")
+        with self.assertRaises(ValueError):
+            setup.validate_webproxy_hostname("203.0.113.10")
+        with self.assertRaises(ValueError):
+            setup.validate_webproxy_hostname("https://proxy.example.com")
+        with self.assertRaises(ValueError):
+            setup.validate_webproxy_base_path("/leading")
+        self.assertEqual(setup.validate_webproxy_base_path("App_1/bridge-v2"), "App_1/bridge-v2")
+        self.assertEqual(setup.validate_webproxy_upstream("http://127.0.0.1:3000/"), "http://127.0.0.1:3000")
+        with self.assertRaises(ValueError):
+            setup.validate_webproxy_upstream("https://127.0.0.1:3000")
+        with self.assertRaises(ValueError):
+            setup.validate_loopback_endpoint("0.0.0.0:8080")
+
+        df = setup.render_tproxy_dockerfile()
+        self.assertIn(setup.TPROXY_SERVER_COMMIT, df)
+        self.assertIn(setup.TPROXY_SERVER_TARBALL_SHA256, df)
+        self.assertIn("USER 10001:10001", df)
+        caddy_s, nginx_s = setup.render_webproxy_reverse_proxy_snippets("proxy.example.com", "t7k2xw", "127.0.0.1:8080")
+        self.assertIn("handle /t7k2xw/*", caddy_s)
+        self.assertIn("access_log off;", nginx_s)
+        self.assertIn("location /t7k2xw/", nginx_s)
+
+    def test_webproxy_wizard_reconfigure_link_status_and_rollback(self):
+        import json
+
+        with mock.patch.object(setup, "ask", return_value="4"), mock.patch("builtins.print"):
+            self.assertEqual(setup.choose_wizard_mode(), "webproxy")
+        with mock.patch.object(setup, "ask", return_value="4"), mock.patch("builtins.print"):
+            self.assertEqual(setup.choose_wizard_mode(default="webproxy"), "webproxy")
+
+        sec_default = "8561944064fc730cbfa4473562d8ec59"
+        sec_alice = "000102030405060708090a0b0c0d0e0f"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            # Seed existing edge installation with custom settings to verify preservation + rollback
+            orig_cfg = {
+                "role": "edge",
+                "listen": "0.0.0.0:443",
+                "secret_file": "/var/lib/mtevil/proxy-secret",
+                "users_file": "/var/lib/mtevil/users.json",
+                "replay_file": "/var/lib/mtevil-replay/replay.bin",
+                "sni": "mozilla.org",
+                "cover": "mozilla.org:443",
+                "egress_upstreams": ["10.99.0.2:29443"],
+                "egress_strategy": "ordered",
+                "egress_token_file": "/var/lib/mtevil/custom-tok",
+                "max_connections": 512,
+                "me": {"enabled": True, "fallback_to_direct": True},
+            }
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: mtevil:local\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_PROJECT=mtevil-edge\nMTEVIL_IMAGE=mtevil:local\nMTEVIL_BIND=0.0.0.0\nMTEVIL_PORT=443\n", encoding="utf-8")
+            (d / "config.json").write_text(json.dumps(orig_cfg), encoding="utf-8")
+
+            def run_wp_attempt(*, tp_check_rc=0, readyz_ok=(True, "ok")):
+                stdin_lines = "\n".join(
+                    [
+                        "y",                     # confirm reconfigure
+                        "proxy.example.com",     # public_hostname
+                        "phcf2vfe7zgbrslg",      # base_path
+                        "websocket",             # carrier_mode
+                        "127.0.0.1:8080",        # listen
+                        "127.0.0.1:8081",        # admin_listen
+                        "static",                # site mode
+                        "127.0.0.1",             # mtevil bind_ip
+                        "2398",                  # mtevil port
+                        "10.99.0.2:29443",       # egress upstream
+                        "y",                     # keep existing MTV2 token
+                    ]
+                ) + "\n"
+
+                def fake_run(cmd, **_kw):
+                    cmd_l = list(cmd)
+                    if "-check" in cmd_l:
+                        return mock.Mock(returncode=tp_check_rc, stdout="", stderr="bad tproxy cfg" if tp_check_rc else "")
+                    return mock.Mock(returncode=0, stdout="ok", stderr="")
+
+                def fake_read_vol(_base, path):
+                    if path.endswith("proxy-secret"):
+                        return sec_default
+                    if path.endswith("users.json"):
+                        return json.dumps({"alice": sec_alice})
+                    return "00" * 16
+
+                import contextlib
+
+                out_b, err_b = io.StringIO(), io.StringIO()
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(mock.patch.object(sys, "argv", ["mtevilctl", "setup", "--webproxy", "--no-build", "--dir", str(d)]))
+                    stack.enter_context(mock.patch.object(setup, "check_prerequisites"))
+                    stack.enter_context(mock.patch.object(setup, "deployment_owns_port", return_value=True))
+                    stack.enter_context(mock.patch.object(setup, "is_port_available", return_value=True))
+                    stack.enter_context(mock.patch.object(setup, "read_unprivileged_port_start", return_value=0))
+                    stack.enter_context(mock.patch.object(setup, "inspect_current_deployment", return_value=("sha256:prev", None, "0.3.2")))
+                    stack.enter_context(mock.patch.object(setup, "save_rollback_snapshot", return_value="mtevil:rollback-mtevil-edge"))
+                    stack.enter_context(mock.patch.object(setup, "volume_file_exists", side_effect=lambda _b, p: not p.endswith(("tproxy-token.key", "tproxy-profiles.json"))))
+                    stack.enter_context(mock.patch.object(setup, "ensure_generated_secret", return_value=False))
+                    stack.enter_context(mock.patch.object(setup, "ensure_tproxy_token_key", return_value=True))
+                    stack.enter_context(mock.patch.object(setup, "read_volume_secret", side_effect=fake_read_vol))
+                    stack.enter_context(mock.patch.object(setup, "read_allowed_snis_from_volume", return_value=["mozilla.org"]))
+                    stack.enter_context(mock.patch.object(setup, "record_allowed_snis_in_volume"))
+                    stack.enter_context(mock.patch.object(setup, "write_volume_secret_stdin"))
+                    rem_vol = stack.enter_context(mock.patch.object(setup, "remove_volume_file"))
+                    stack.enter_context(mock.patch.object(setup, "wait_healthy"))
+                    stack.enter_context(mock.patch.object(setup, "wait_service_healthy"))
+                    stack.enter_context(mock.patch.object(setup, "probe_tproxy_readyz", return_value=readyz_ok))
+                    stack.enter_context(mock.patch.object(setup, "verify_telegram_e2e", return_value=(True, "DC2 ping OK")))
+                    stack.enter_context(mock.patch.object(setup, "probe_local_https_get", return_value=(False, "Connection refused")))
+                    stack.enter_context(mock.patch.object(setup, "check_public_port_reachable", return_value=("unreachable", "closed")))
+                    stack.enter_context(mock.patch.object(setup, "run", side_effect=fake_run))
+                    stack.enter_context(mock.patch.object(sys, "stdin", io.StringIO(stdin_lines)))
+                    stack.enter_context(mock.patch.object(sys, "stdout", out_b))
+                    stack.enter_context(mock.patch.object(sys, "stderr", err_b))
+                    rc = setup.main()
+                return rc, out_b.getvalue(), err_b.getvalue(), rem_vol
+
+            # 1) Failed tproxy -check preflight leaves live files untouched & removes candidate token key
+            rc1, _o1, e1, rem1 = run_wp_attempt(tp_check_rc=1)
+            self.assertEqual(rc1, 1)
+            self.assertIn("Конфигурация tproxy-server не прошла проверку", e1)
+            self.assertFalse((d / "tproxy.json").exists())
+            self.assertEqual(json.loads((d / "config.json").read_text(encoding="utf-8"))["sni"], "mozilla.org")
+            self.assertTrue(any("/var/lib/mtevil/tproxy-token.key" in c.args for c in rem1.call_args_list))
+
+            # 2) Failed post-start /readyz rolls back live files & cleans newly created tproxy.json / tproxy.Dockerfile
+            rc2, _o2, e2, rem2 = run_wp_attempt(readyz_ok=(False, "503 backend down"))
+            self.assertEqual(rc2, 1)
+            self.assertIn("Проверка готовности tproxy-server", e2)
+            self.assertFalse((d / "tproxy.json").exists())
+            self.assertFalse((d / "tproxy.Dockerfile").exists())
+            self.assertEqual(json.loads((d / "config.json").read_text(encoding="utf-8"))["sni"], "mozilla.org")
+
+            # 3) Successful webproxy setup preserves edge settings, enables dd, writes sidecar & prints links
+            rc3, o3, e3, _rem3 = run_wp_attempt()
+            self.assertEqual(rc3, 0, e3)
+            new_cfg = json.loads((d / "config.json").read_text(encoding="utf-8"))
+            self.assertTrue(new_cfg["enable_dd"])
+            self.assertEqual(new_cfg["max_connections"], 512)
+            self.assertEqual(new_cfg["egress_token_file"], "/var/lib/mtevil/custom-tok")
+            self.assertTrue(new_cfg["me"]["enabled"])
+            self.assertEqual(new_cfg["listen"], "127.0.0.1:2398")
+            self.assertTrue((d / "tproxy.json").is_file())
+            self.assertTrue((d / "tproxy.Dockerfile").is_file())
+            self.assertTrue((d / "Caddyfile.webproxy.example").is_file())
+            self.assertTrue((d / "nginx.webproxy.example").is_file())
+            self.assertIn("tproxy:", (d / "compose.yaml").read_text(encoding="utf-8"))
+            self.assertIn(
+                "https://t.me/webproxy?server=proxy.example.com%2Fphcf2vfe7zgbrslg&secret=cIVhlEBk_HMMv6RHNWLY7Fk",
+                o3,
+            )
+
+            # 4) mtevilctl link --all and status work on the webproxy deployment
+            link_out = io.StringIO()
+            with (
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "volume_file_exists", return_value=True),
+                mock.patch.object(
+                    setup,
+                    "read_volume_secret",
+                    side_effect=lambda _b, p: sec_default if p.endswith("proxy-secret") else json.dumps({"alice": sec_alice}),
+                ),
+                mock.patch.object(sys, "stdout", link_out),
+            ):
+                self.assertEqual(setup.run_link_command(d, all_users=True), 0)
+            self.assertIn("[default] https://t.me/webproxy?", link_out.getvalue())
+            self.assertIn("[alice] tg://webproxy?", link_out.getvalue())
+
+            saved_post = setup.load_existing_defaults(d)
+            with (
+                mock.patch.object(setup, "run", return_value=mock.Mock(returncode=0, stdout="cid123\n", stderr="")),
+                mock.patch.object(setup, "probe_tproxy_readyz", return_value=(True, "ok")),
+            ):
+                wp_stat = setup.format_webproxy_status_lines(["docker", "compose"], saved_post)
+            self.assertEqual(len(wp_stat), 1)
+            self.assertIn("ready (proxy.example.com/phcf2vfe7zgbrslg", wp_stat[0])
+
 
 if __name__ == "__main__":
     prog = unittest.main(verbosity=2, exit=False)

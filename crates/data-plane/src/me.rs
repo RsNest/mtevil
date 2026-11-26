@@ -652,6 +652,7 @@ pub(crate) async fn relay_edge_mtv4_session(
     hello_read_us: u64,
     flight_written_us: Option<u64>,
     diag: HelloDiag,
+    drain_rx: DrainRx,
 ) -> Result<()> {
     struct MeActiveGuard(Arc<telemetry::Counters>);
     impl Drop for MeActiveGuard {
@@ -696,8 +697,6 @@ pub(crate) async fn relay_edge_mtv4_session(
 
     let client_fd = stream_raw_fd(client);
     let upstream_fd = stream_raw_fd(&upstream);
-    let (mut cr, mut cw) = client.split();
-    let (mut ur, mut uw) = upstream.split();
     let relay = RelayStats {
         counters: Some(state.counters.clone()),
         client_fd,
@@ -708,104 +707,115 @@ pub(crate) async fn relay_edge_mtv4_session(
     let relay_start_us = us();
     let max_dec_buf = wire::MAX_MTPROTO_FRAME_LEN + 64;
 
-    let result = relay_until_end(
-        &relay,
-        state.idle,
-        async {
-            let mut tls = tls;
-            let mut raw = [0u8; 16 * 1024];
-            let mut dec_buf = Vec::with_capacity(16 * 1024);
-            loop {
-                let n = match tls.as_mut() {
-                    Some(reader) => reader.read_into(&mut cr, &mut raw).await?,
-                    None => cr.read(&mut raw).await?,
-                };
-                if n == 0 {
-                    break;
-                }
-                relay.uploaded.fetch_add(n as u64, Ordering::Relaxed);
-                relay.client_reads.fetch_add(1, Ordering::Relaxed);
-                relay.stamp(&relay.first_up_us, &relay.last_up_us);
-                if let Some(c) = &relay.counters {
-                    c.downstream_rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                }
-                let chunk = &mut raw[..n];
-                wire::crypt(&mut client_decrypt, chunk);
-                ensure!(
-                    dec_buf.len().saturating_add(n) <= max_dec_buf,
-                    "edge MTV4 decode buffer exceeded bound"
-                );
-                dec_buf.extend_from_slice(chunk);
-                while let Some(frame) = wire::decode_client_frame(kind, &mut dec_buf)? {
-                    let mtv4_frame = if frame.quick_ack {
-                        wire::Mtv4Frame::PayloadQuickAck(frame.payload)
-                    } else {
-                        wire::Mtv4Frame::Payload(frame.payload)
+    let result = {
+        let (mut cr, mut cw) = client.split();
+        let (mut ur, mut uw) = upstream.split();
+        relay_until_end_with_drain(
+            &relay,
+            state.idle,
+            drain_rx,
+            async {
+                let mut tls = tls;
+                let mut raw = [0u8; 16 * 1024];
+                let mut dec_buf = Vec::with_capacity(16 * 1024);
+                loop {
+                    let n = match tls.as_mut() {
+                        Some(reader) => reader.read_into(&mut cr, &mut raw).await?,
+                        None => cr.read(&mut raw).await?,
                     };
-                    let wire_frame = wire::encode_mtv4_frame(&mtv4_frame)?;
-                    timeout(RELAY_WRITE_TIMEOUT, uw.write_all(&wire_frame))
-                        .await
-                        .context("edge_mtv4_upload_timeout")?
-                        .context("edge_mtv4_upload_failed")?;
-                    relay.dc_writes.fetch_add(1, Ordering::Relaxed);
+                    if n == 0 {
+                        break;
+                    }
+                    relay.uploaded.fetch_add(n as u64, Ordering::Relaxed);
+                    relay.client_reads.fetch_add(1, Ordering::Relaxed);
                     relay.stamp(&relay.first_up_us, &relay.last_up_us);
                     if let Some(c) = &relay.counters {
-                        c.upstream_tx_bytes
-                            .fetch_add(wire_frame.len() as u64, Ordering::Relaxed);
+                        c.downstream_rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
                     }
-                }
-            }
-            if let Ok(eof_frame) = wire::encode_mtv4_frame(&wire::Mtv4Frame::Eof) {
-                let _ = timeout(RELAY_WRITE_TIMEOUT, uw.write_all(&eof_frame)).await;
-            }
-            let _ = timeout(RELAY_WRITE_TIMEOUT, uw.shutdown()).await;
-            Ok::<_, anyhow::Error>(())
-        },
-        async {
-            while let Some(frame) = read_mtv4_frame(&mut ur).await? {
-                match frame {
-                    wire::Mtv4Frame::Payload(payload)
-                    | wire::Mtv4Frame::PayloadQuickAck(payload) => {
-                        if let Some(c) = &relay.counters {
-                            c.upstream_rx_bytes.fetch_add(
-                                (wire::MTV4_FRAME_HEADER_LEN + payload.len()) as u64,
-                                Ordering::Relaxed,
-                            );
-                        }
-                        let mut pad = [0u8; 15];
-                        let pad_len = if kind == wire::ClientProtoKind::PaddedIntermediate {
-                            let n = rand::rngs::OsRng.gen_range(0..=15);
-                            rand::rngs::OsRng.fill_bytes(&mut pad[..n]);
-                            n
+                    let chunk = &mut raw[..n];
+                    wire::crypt(&mut client_decrypt, chunk);
+                    ensure!(
+                        dec_buf.len().saturating_add(n) <= max_dec_buf,
+                        "edge MTV4 decode buffer exceeded bound"
+                    );
+                    dec_buf.extend_from_slice(chunk);
+                    while let Some(frame) = wire::decode_client_frame(kind, &mut dec_buf)? {
+                        let mtv4_frame = if frame.quick_ack {
+                            wire::Mtv4Frame::PayloadQuickAck(frame.payload)
                         } else {
-                            0
+                            wire::Mtv4Frame::Payload(frame.payload)
                         };
-                        let mut encoded =
-                            wire::encode_client_frame(kind, &payload, &pad[..pad_len])?;
-                        wire::crypt(&mut client_encrypt, &mut encoded);
-                        write_client_encrypted(
-                            &mut cw,
-                            &encoded,
-                            framed,
-                            RELAY_WRITE_TIMEOUT,
-                            &relay,
-                        )
-                        .await?;
+                        let wire_frame = wire::encode_mtv4_frame(&mtv4_frame)?;
+                        timeout(RELAY_WRITE_TIMEOUT, uw.write_all(&wire_frame))
+                            .await
+                            .context("edge_mtv4_upload_timeout")?
+                            .context("edge_mtv4_upload_failed")?;
+                        relay.dc_writes.fetch_add(1, Ordering::Relaxed);
+                        relay.stamp(&relay.first_up_us, &relay.last_up_us);
+                        if let Some(c) = &relay.counters {
+                            c.upstream_tx_bytes
+                                .fetch_add(wire_frame.len() as u64, Ordering::Relaxed);
+                        }
                     }
-                    wire::Mtv4Frame::QuickAck(confirm_key) => {
-                        let mut ack = wire::encode_quick_ack(kind, confirm_key);
-                        wire::crypt(&mut client_encrypt, &mut ack);
-                        write_client_encrypted(&mut cw, &ack, framed, RELAY_WRITE_TIMEOUT, &relay)
-                            .await?;
-                    }
-                    wire::Mtv4Frame::Eof => break,
                 }
-            }
-            let _ = timeout(RELAY_WRITE_TIMEOUT, cw.shutdown()).await;
-            Ok::<_, anyhow::Error>(())
-        },
-    )
-    .await;
+                if let Ok(eof_frame) = wire::encode_mtv4_frame(&wire::Mtv4Frame::Eof) {
+                    let _ = timeout(RELAY_WRITE_TIMEOUT, uw.write_all(&eof_frame)).await;
+                }
+                let _ = timeout(RELAY_WRITE_TIMEOUT, uw.shutdown()).await;
+                Ok::<_, anyhow::Error>(())
+            },
+            async {
+                while let Some(frame) = read_mtv4_frame(&mut ur).await? {
+                    match frame {
+                        wire::Mtv4Frame::Payload(payload)
+                        | wire::Mtv4Frame::PayloadQuickAck(payload) => {
+                            if let Some(c) = &relay.counters {
+                                c.upstream_rx_bytes.fetch_add(
+                                    (wire::MTV4_FRAME_HEADER_LEN + payload.len()) as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                            let mut pad = [0u8; 15];
+                            let pad_len = if kind == wire::ClientProtoKind::PaddedIntermediate {
+                                let n = rand::rngs::OsRng.gen_range(0..=15);
+                                rand::rngs::OsRng.fill_bytes(&mut pad[..n]);
+                                n
+                            } else {
+                                0
+                            };
+                            let mut encoded =
+                                wire::encode_client_frame(kind, &payload, &pad[..pad_len])?;
+                            wire::crypt(&mut client_encrypt, &mut encoded);
+                            write_client_encrypted(
+                                &mut cw,
+                                &encoded,
+                                framed,
+                                RELAY_WRITE_TIMEOUT,
+                                &relay,
+                            )
+                            .await?;
+                        }
+                        wire::Mtv4Frame::QuickAck(confirm_key) => {
+                            let mut ack = wire::encode_quick_ack(kind, confirm_key);
+                            wire::crypt(&mut client_encrypt, &mut ack);
+                            write_client_encrypted(
+                                &mut cw,
+                                &ack,
+                                framed,
+                                RELAY_WRITE_TIMEOUT,
+                                &relay,
+                            )
+                            .await?;
+                        }
+                        wire::Mtv4Frame::Eof => break,
+                    }
+                }
+                let _ = timeout(RELAY_WRITE_TIMEOUT, cw.shutdown()).await;
+                Ok::<_, anyhow::Error>(())
+            },
+        )
+        .await
+    };
 
     let mut summary = relay.summary();
     summary["relay_start_us"] = json!(relay_start_us);
@@ -814,11 +824,25 @@ pub(crate) async fn relay_edge_mtv4_session(
     summary["protocol"] = json!("mtv4");
     summary["transport"] = json!(kind.as_str());
     match result {
-        Ok(()) => {
+        Ok(RelayOutcome::Completed) => {
+            telemetry::event("relay_closed", session_id, summary);
+            Ok(())
+        }
+        Ok(RelayOutcome::Drained) => {
+            if let Ok(eof_frame) = wire::encode_mtv4_frame(&wire::Mtv4Frame::Eof) {
+                let _ = timeout(Duration::from_millis(150), upstream.write_all(&eof_frame)).await;
+            }
+            let _ = timeout(Duration::from_millis(150), upstream.shutdown()).await;
+            graceful_fin_close(client, state.drain / 2).await;
+            summary["final_reason"] = json!("server_drain");
             telemetry::event("relay_closed", session_id, summary);
             Ok(())
         }
         Err(err) => {
+            if relay.idle_timed_out.load(Ordering::Relaxed) {
+                let _ = timeout(Duration::from_millis(150), upstream.shutdown()).await;
+                graceful_fin_close(client, DC_EOF_SHUTDOWN_TIMEOUT).await;
+            }
             summary["error"] = json!(format!("{err:#}"));
             telemetry::event("relay_failed", session_id, summary);
             Err(err)
@@ -948,6 +972,7 @@ pub(crate) async fn relay_me_session(
     diag: HelloDiag,
     me_session: MeSession,
     ad_tag_configured: bool,
+    drain_rx: DrainRx,
 ) -> Result<()> {
     struct MeActiveGuard(Arc<telemetry::Counters>);
     impl Drop for MeActiveGuard {
@@ -991,7 +1016,6 @@ pub(crate) async fn relay_me_session(
     );
 
     let client_fd = stream_raw_fd(client);
-    let (mut cr, mut cw) = client.split();
     let relay = RelayStats {
         counters: Some(state.counters.clone()),
         client_fd,
@@ -1004,94 +1028,104 @@ pub(crate) async fn relay_me_session(
     let (mut me_rx_sess, me_tx_sess) = split_me_session_handles(me_session);
     let max_dec_buf = wire::MAX_MTPROTO_FRAME_LEN + 64;
 
-    let result = relay_until_end(
-        &relay,
-        state.idle,
-        async {
-            let mut tls = tls;
-            let mut raw = [0u8; 16 * 1024];
-            let mut dec_buf = Vec::with_capacity(16 * 1024);
-            loop {
-                let n = match tls.as_mut() {
-                    Some(reader) => reader.read_into(&mut cr, &mut raw).await?,
-                    None => cr.read(&mut raw).await?,
-                };
-                if n == 0 {
-                    break;
-                }
-                relay.uploaded.fetch_add(n as u64, Ordering::Relaxed);
-                relay.client_reads.fetch_add(1, Ordering::Relaxed);
-                relay.stamp(&relay.first_up_us, &relay.last_up_us);
-                if let Some(c) = &relay.counters {
-                    c.downstream_rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                }
-                let chunk = &mut raw[..n];
-                wire::crypt(&mut client_decrypt, chunk);
-                ensure!(
-                    dec_buf.len().saturating_add(n) <= max_dec_buf,
-                    "client ME decode buffer exceeded bound"
-                );
-                dec_buf.extend_from_slice(chunk);
-                while let Some(frame) = wire::decode_client_frame(kind, &mut dec_buf)? {
-                    let payload_len = frame.payload.len();
-                    timeout(
-                        RELAY_WRITE_TIMEOUT,
-                        me_tx_sess.send_frame_with_flags(&frame.payload, frame.quick_ack),
-                    )
-                    .await
-                    .context("me_upload_send_timeout")??;
-                    relay.dc_writes.fetch_add(1, Ordering::Relaxed);
+    let result = {
+        let (mut cr, mut cw) = client.split();
+        relay_until_end_with_drain(
+            &relay,
+            state.idle,
+            drain_rx,
+            async {
+                let mut tls = tls;
+                let mut raw = [0u8; 16 * 1024];
+                let mut dec_buf = Vec::with_capacity(16 * 1024);
+                loop {
+                    let n = match tls.as_mut() {
+                        Some(reader) => reader.read_into(&mut cr, &mut raw).await?,
+                        None => cr.read(&mut raw).await?,
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    relay.uploaded.fetch_add(n as u64, Ordering::Relaxed);
+                    relay.client_reads.fetch_add(1, Ordering::Relaxed);
                     relay.stamp(&relay.first_up_us, &relay.last_up_us);
                     if let Some(c) = &relay.counters {
-                        c.upstream_tx_bytes
-                            .fetch_add(payload_len as u64, Ordering::Relaxed);
+                        c.downstream_rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
                     }
-                }
-            }
-            me_tx_sess.close();
-            Ok::<_, anyhow::Error>(())
-        },
-        async {
-            while let Some(ev) = me_rx_sess.recv_event().await {
-                match ev {
-                    MeInboundEvent::Payload(payload) => {
-                        if let Some(c) = &relay.counters {
-                            c.upstream_rx_bytes
-                                .fetch_add(payload.len() as u64, Ordering::Relaxed);
-                        }
-                        let mut pad = [0u8; 15];
-                        let pad_len = if kind == wire::ClientProtoKind::PaddedIntermediate {
-                            let n = rand::rngs::OsRng.gen_range(0..=15);
-                            rand::rngs::OsRng.fill_bytes(&mut pad[..n]);
-                            n
-                        } else {
-                            0
-                        };
-                        let mut encoded =
-                            wire::encode_client_frame(kind, &payload, &pad[..pad_len])?;
-                        wire::crypt(&mut client_encrypt, &mut encoded);
-                        write_client_encrypted(
-                            &mut cw,
-                            &encoded,
-                            framed,
+                    let chunk = &mut raw[..n];
+                    wire::crypt(&mut client_decrypt, chunk);
+                    ensure!(
+                        dec_buf.len().saturating_add(n) <= max_dec_buf,
+                        "client ME decode buffer exceeded bound"
+                    );
+                    dec_buf.extend_from_slice(chunk);
+                    while let Some(frame) = wire::decode_client_frame(kind, &mut dec_buf)? {
+                        let payload_len = frame.payload.len();
+                        timeout(
                             RELAY_WRITE_TIMEOUT,
-                            &relay,
+                            me_tx_sess.send_frame_with_flags(&frame.payload, frame.quick_ack),
                         )
-                        .await?;
-                    }
-                    MeInboundEvent::QuickAck(confirm_key) => {
-                        let mut ack = wire::encode_quick_ack(kind, confirm_key);
-                        wire::crypt(&mut client_encrypt, &mut ack);
-                        write_client_encrypted(&mut cw, &ack, framed, RELAY_WRITE_TIMEOUT, &relay)
-                            .await?;
+                        .await
+                        .context("me_upload_send_timeout")??;
+                        relay.dc_writes.fetch_add(1, Ordering::Relaxed);
+                        relay.stamp(&relay.first_up_us, &relay.last_up_us);
+                        if let Some(c) = &relay.counters {
+                            c.upstream_tx_bytes
+                                .fetch_add(payload_len as u64, Ordering::Relaxed);
+                        }
                     }
                 }
-            }
-            let _ = timeout(RELAY_WRITE_TIMEOUT, cw.shutdown()).await;
-            Ok::<_, anyhow::Error>(())
-        },
-    )
-    .await;
+                me_tx_sess.close();
+                Ok::<_, anyhow::Error>(())
+            },
+            async {
+                while let Some(ev) = me_rx_sess.recv_event().await {
+                    match ev {
+                        MeInboundEvent::Payload(payload) => {
+                            if let Some(c) = &relay.counters {
+                                c.upstream_rx_bytes
+                                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                            }
+                            let mut pad = [0u8; 15];
+                            let pad_len = if kind == wire::ClientProtoKind::PaddedIntermediate {
+                                let n = rand::rngs::OsRng.gen_range(0..=15);
+                                rand::rngs::OsRng.fill_bytes(&mut pad[..n]);
+                                n
+                            } else {
+                                0
+                            };
+                            let mut encoded =
+                                wire::encode_client_frame(kind, &payload, &pad[..pad_len])?;
+                            wire::crypt(&mut client_encrypt, &mut encoded);
+                            write_client_encrypted(
+                                &mut cw,
+                                &encoded,
+                                framed,
+                                RELAY_WRITE_TIMEOUT,
+                                &relay,
+                            )
+                            .await?;
+                        }
+                        MeInboundEvent::QuickAck(confirm_key) => {
+                            let mut ack = wire::encode_quick_ack(kind, confirm_key);
+                            wire::crypt(&mut client_encrypt, &mut ack);
+                            write_client_encrypted(
+                                &mut cw,
+                                &ack,
+                                framed,
+                                RELAY_WRITE_TIMEOUT,
+                                &relay,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                let _ = timeout(RELAY_WRITE_TIMEOUT, cw.shutdown()).await;
+                Ok::<_, anyhow::Error>(())
+            },
+        )
+        .await
+    };
 
     let mut summary = relay.summary();
     summary["relay_start_us"] = json!(relay_start_us);
@@ -1099,11 +1133,20 @@ pub(crate) async fn relay_me_session(
     summary["route"] = json!("me");
     summary["transport"] = json!(kind.as_str());
     match result {
-        Ok(()) => {
+        Ok(RelayOutcome::Completed) => {
+            telemetry::event("relay_closed", session_id, summary);
+            Ok(())
+        }
+        Ok(RelayOutcome::Drained) => {
+            graceful_fin_close(client, state.drain / 2).await;
+            summary["final_reason"] = json!("server_drain");
             telemetry::event("relay_closed", session_id, summary);
             Ok(())
         }
         Err(err) => {
+            if relay.idle_timed_out.load(Ordering::Relaxed) {
+                graceful_fin_close(client, DC_EOF_SHUTDOWN_TIMEOUT).await;
+            }
             summary["error"] = json!(format!("{err:#}"));
             telemetry::event("relay_failed", session_id, summary);
             Err(err)

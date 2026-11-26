@@ -607,7 +607,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn chaos_stalled_me_under_load_times_out_eof_and_reconnects() -> Result<()> {
         let secret = vec![0xaa; 128];
         let srv = spawn_mock_me_server(secret.clone()).await?;
@@ -615,9 +615,9 @@ mod tests {
         // subsequent connections behave normally.
         srv.freeze_first_n.store(1, Ordering::Relaxed);
 
-        let write_timeout = Duration::from_secs(2);
-        let ping_interval = Duration::from_secs(1);
-        let ping_timeout = Duration::from_secs(2);
+        let write_timeout = Duration::from_millis(350);
+        let ping_interval = Duration::from_millis(200);
+        let ping_timeout = Duration::from_millis(350);
 
         let conf = format!("default 2;\nproxy_for 2 {};\n", srv.addr);
         let bundle = MeConfigBundle::from_raw(secret.clone(), &conf)?;
@@ -625,8 +625,8 @@ mod tests {
             bundle,
             MePoolConfig {
                 conns_per_dc: 1,
-                reconnect_base: Duration::from_millis(100),
-                reconnect_max: Duration::from_millis(500),
+                reconnect_base: Duration::from_millis(50),
+                reconnect_max: Duration::from_millis(250),
                 conn_opts: MeConnOptions {
                     handshake_timeout: Duration::from_secs(2),
                     ping_interval,
@@ -639,7 +639,7 @@ mod tests {
         );
 
         // Wait until first (soon-to-freeze) connection finishes handshake.
-        for _ in 0..50 {
+        for _ in 0..200 {
             if !pool.health().degraded {
                 break;
             }
@@ -665,7 +665,7 @@ mod tests {
         });
 
         // Give flood task time to fill the TCP send buffer and out_tx channel.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
         // Closing a session while out_tx is saturated must count dropped RPC_CLOSE_EXT (never block).
         close_sess.close();
         assert!(
@@ -674,7 +674,7 @@ mod tests {
         );
 
         // Active session must receive EOF within write/ping timeout bound.
-        let eof = timeout(Duration::from_secs(6), active_sess.recv_frame())
+        let eof = timeout(Duration::from_secs(5), active_sess.recv_frame())
             .await
             .context("stalled ME did not close active session within timeout")?;
         assert!(
@@ -682,8 +682,7 @@ mod tests {
             "active session must receive EOF when stalled ME socket times out"
         );
         let elapsed = t0.elapsed();
-        let max_expected =
-            write_timeout.max(ping_interval + ping_timeout) + Duration::from_millis(500);
+        let max_expected = write_timeout.max(ping_interval + ping_timeout) + Duration::from_secs(2);
         assert!(
             elapsed <= max_expected,
             "stalled ME detection took {elapsed:?}, expected <= {max_expected:?}"
@@ -691,11 +690,11 @@ mod tests {
         let _ = flood_handle.await;
 
         // Pool must reconnect to the healthy 2nd connection and serve new sessions.
-        for _ in 0..80 {
+        for _ in 0..100 {
             if srv.accepts.load(Ordering::Relaxed) >= 2 && !pool.health().degraded {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
         }
         assert!(
             srv.accepts.load(Ordering::Relaxed) >= 2 && !pool.health().degraded,
@@ -712,7 +711,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn chaos_all_me_sockets_down_no_tight_loop_and_no_task_leaks() -> Result<()> {
         let secret = vec![0xbb; 128];
         let srv = spawn_mock_me_server(secret.clone()).await?;
@@ -727,10 +726,10 @@ mod tests {
             bundle,
             MePoolConfig {
                 conns_per_dc: 2,
-                reconnect_base: Duration::from_millis(200),
-                reconnect_max: Duration::from_secs(2),
+                reconnect_base: Duration::from_millis(60),
+                reconnect_max: Duration::from_millis(300),
                 conn_opts: MeConnOptions {
-                    handshake_timeout: Duration::from_millis(200),
+                    handshake_timeout: Duration::from_millis(100),
                     ping_interval: Duration::ZERO,
                     ..MeConnOptions::default()
                 },
@@ -739,10 +738,8 @@ mod tests {
         );
         assert_eq!(pool.active_workers(), 4);
 
-        // Advance 5 seconds of virtual time across 4 workers; backoff must prevent tight-looping.
-        for _ in 0..20 {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
+        // Observe 800ms of real time across 4 workers; backoff must prevent tight-looping.
+        tokio::time::sleep(Duration::from_millis(800)).await;
         let health = pool.health();
         assert!(health.degraded);
         assert_eq!(health.alive_connections, 0);
@@ -754,7 +751,7 @@ mod tests {
         let attempts = srv.accepts.load(Ordering::Relaxed);
         assert!(
             (4..=40).contains(&attempts),
-            "expected bounded backoff attempts across 4 workers over 5s, got {attempts}"
+            "expected bounded backoff attempts across 4 workers over 800ms, got {attempts}"
         );
 
         pool.shutdown();
