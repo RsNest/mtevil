@@ -2678,6 +2678,543 @@ class SetupValidationTests(unittest.TestCase):
         )
         self.assertEqual(setup.format_handshake_diag_lines("egress", {"client_hello_incomplete_timeout": 1}), [])
 
+    def test_self_steal_wizard_port_owner_loop_check_host_mode_and_reconfigure_preserve(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            # 1. Busy 443 prints owner + self-steal hint, and non-443 prints soft note.
+            with (
+                mock.patch.object(setup, "deployment_owns_port", return_value=False),
+                mock.patch.object(setup, "is_port_available", side_effect=[False, True]),
+                mock.patch.object(setup, "describe_port_owner", return_value="nginx (pid 4321)"),
+                mock.patch.object(setup, "find_free_port", return_value=24443),
+                mock.patch.object(sys, "stdin", io.StringIO("24443\n")),
+                mock.patch.object(sys, "stdout", new_callable=io.StringIO) as out_buf,
+            ):
+                chosen_port = setup.ensure_available_port(d, "mtevil-direct", "0.0.0.0", 443)
+            self.assertEqual(chosen_port, 24443)
+            self.assertIn("nginx (pid 4321)", out_buf.getvalue())
+            self.assertIn("self-steal", out_buf.getvalue())
+            self.assertIn("нестандартный порт 24443", out_buf.getvalue())
+
+            # 2. Loop detection prevents cover from pointing back to mtevil's own entry port.
+            self.assertTrue(setup.cover_loops_to_public_entry("127.0.0.1:443", "0.0.0.0", 443, "site.example.org", "site.example.org"))
+            self.assertTrue(setup.cover_loops_to_public_entry("site.example.org:443", "0.0.0.0", 443, "site.example.org", "site.example.org"))
+            self.assertFalse(setup.cover_loops_to_public_entry("127.0.0.1:8443", "0.0.0.0", 443, "site.example.org", "site.example.org"))
+
+            # 3. resolve_network_host_port with allow_bridge_fallback=False never offers bridge for loopback-cover.
+            with (
+                mock.patch.object(setup, "read_unprivileged_port_start", return_value=1024),
+                mock.patch.object(setup, "find_free_port", return_value=24443),
+                mock.patch.object(setup, "deployment_owns_port", return_value=False),
+                mock.patch.object(setup, "is_port_available", return_value=True),
+                mock.patch.object(sys, "stdin", io.StringIO("24443\n")),
+                mock.patch.object(sys, "stdout", new_callable=io.StringIO) as host_out,
+            ):
+                port_out, net_host_out = setup.resolve_network_host_port(
+                    d,
+                    "mtevil-direct",
+                    "0.0.0.0",
+                    443,
+                    True,
+                    explicit_network_host=True,
+                    allow_bridge_fallback=False,
+                )
+            self.assertEqual((port_out, net_host_out), (24443, True))
+            self.assertIn("автоматический переход в bridge недоступен", host_out.getvalue())
+
+            # 4. choose_wizard_mode supports self-steal (option 3 and default="self-steal").
+            with mock.patch.object(sys, "stdin", io.StringIO("3\n")), mock.patch.object(sys, "stdout", io.StringIO()):
+                self.assertEqual(setup.choose_wizard_mode(), "self-steal")
+            with mock.patch.object(sys, "stdin", io.StringIO("\n")), mock.patch.object(sys, "stdout", io.StringIO()):
+                self.assertEqual(setup.choose_wizard_mode(default="self-steal"), "self-steal")
+
+            # 5. Failing check_cover_from_container in --self-steal aborts BEFORE touching live config.json.
+            (d / "config.json").write_text('{"role":"direct","sni":"old.example.org","cover":"127.0.0.1:8443"}\n', encoding="utf-8")
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: old\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_PORT=443\n", encoding="utf-8")
+            with (
+                mock.patch.object(sys, "argv", ["mtevilctl", "--self-steal", "--no-build", "--dir", str(d)]),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "prompt_client_address", return_value=("site.example.org", None)),
+                mock.patch.object(setup, "deployment_owns_port", return_value=True),
+                mock.patch.object(setup, "read_unprivileged_port_start", return_value=0),
+                mock.patch.object(setup, "ensure_generated_secret", return_value=False),
+                mock.patch.object(setup, "volume_file_exists", return_value=True),
+                mock.patch.object(setup, "record_allowed_snis_in_volume"),
+                mock.patch.object(setup, "check_cover_from_container", return_value=(False, "verify error:self-signed")),
+                mock.patch.object(setup, "run", return_value=mock.Mock(returncode=0, stdout="", stderr="")),
+                mock.patch.object(sys, "stdin", io.StringIO("y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n")),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+                mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err_buf,
+            ):
+                rc = setup.main()
+            self.assertEqual(rc, 1)
+            self.assertIn("Проверка cover перед развёртыванием не пройдена", err_buf.getvalue())
+            self.assertIn("old.example.org", (d / "config.json").read_text(encoding="utf-8"))
+
+    def _run_self_steal_wizard(
+        self,
+        deploy_dir: Path,
+        stdin_text: str,
+        *,
+        role_arg: str | None = None,
+        local_https_ok: tuple[bool, str] = (True, "TLSv1.3, HTTP/1.1 200 OK"),
+        public_https_ok: tuple[bool, str] = (True, "TLSv1.3, HTTP/1.1 200 OK"),
+        telegram_ok: tuple[bool, str] = (True, "DC2 ping OK"),
+        public_port_status: tuple[str, str] = ("ok", "open"),
+        cover_check_ok: tuple[bool, str] = (True, "Verify return code: 0 (ok)"),
+        prev_image_id: str | None = None,
+        restored_image_id: str | None = None,
+        had_allowed_sni: bool = True,
+        had_users_json: bool = True,
+        created_proxy_secret: bool = False,
+        existing_token: str | None = None,
+        check_config_rc: int = 0,
+    ):
+        argv = ["mtevilctl", "--self-steal", "--no-build", "--dir", str(deploy_dir)]
+        if role_arg:
+            argv.extend(["--role", role_arg])
+        run_calls: list[list[str]] = []
+
+        def fake_run(cmd, **_kw):
+            cmd_l = list(cmd)
+            run_calls.append(cmd_l)
+            if "--check-config" in cmd_l:
+                return mock.Mock(returncode=check_config_rc, stdout="", stderr="bad config" if check_config_rc else "")
+            return mock.Mock(returncode=0, stdout="ok", stderr="")
+
+        def fake_https_get(host, port, sni, timeout_s=5.0):
+            if host in ("127.0.0.1", "localhost", "::1"):
+                return local_https_ok
+            return public_https_ok
+
+        def fake_vol_exists(_base, path):
+            if path == "/var/lib/mtevil/allowed-sni.txt":
+                return had_allowed_sni
+            if path == "/var/lib/mtevil/users.json":
+                return had_users_json
+            if path == "/var/lib/mtevil/proxy-secret":
+                return not created_proxy_secret
+            if existing_token is not None and "egress-token" in path or (existing_token is not None and path.endswith("custom-edge-tok")):
+                return True
+            return True
+
+        inspect_seq = [(prev_image_id, None, "0.3.1")]
+        if restored_image_id is not None or prev_image_id is not None:
+            inspect_seq.append((restored_image_id if restored_image_id is not None else prev_image_id, None, "0.3.1"))
+
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(sys, "argv", argv))
+            stack.enter_context(mock.patch.object(setup, "check_prerequisites"))
+            stack.enter_context(mock.patch.object(setup, "prompt_client_address", return_value=("site.example.org", None)))
+            stack.enter_context(mock.patch.object(setup, "deployment_owns_port", return_value=True))
+            stack.enter_context(mock.patch.object(setup, "is_port_available", return_value=True))
+            stack.enter_context(mock.patch.object(setup, "read_unprivileged_port_start", return_value=0))
+            stack.enter_context(mock.patch.object(setup, "inspect_current_deployment", side_effect=inspect_seq))
+            save_rb = stack.enter_context(mock.patch.object(setup, "save_rollback_snapshot", return_value="mtevil:rollback-mtevil-direct"))
+            stack.enter_context(mock.patch.object(setup, "ensure_generated_secret", return_value=created_proxy_secret))
+            stack.enter_context(mock.patch.object(setup, "volume_file_exists", side_effect=fake_vol_exists))
+            stack.enter_context(mock.patch.object(setup, "read_volume_secret", return_value=existing_token or "oldtok"))
+            stack.enter_context(mock.patch.object(setup, "read_allowed_snis_from_volume", return_value=["old.example.org"] if had_allowed_sni else []))
+            rec_snis = stack.enter_context(mock.patch.object(setup, "record_allowed_snis_in_volume"))
+            write_vol = stack.enter_context(mock.patch.object(setup, "write_volume_secret_stdin"))
+            rem_vol = stack.enter_context(mock.patch.object(setup, "remove_volume_file"))
+            stack.enter_context(mock.patch.object(setup, "check_cover_from_container", return_value=cover_check_ok))
+            wait_h = stack.enter_context(mock.patch.object(setup, "wait_healthy"))
+            stack.enter_context(mock.patch.object(setup, "probe_local_https_get", side_effect=fake_https_get))
+            stack.enter_context(mock.patch.object(setup, "verify_telegram_e2e", return_value=telegram_ok))
+            stack.enter_context(mock.patch.object(setup, "check_public_port_reachable", return_value=public_port_status))
+            stack.enter_context(mock.patch.object(setup, "run", side_effect=fake_run))
+            stack.enter_context(mock.patch.object(sys, "stdin", io.StringIO(stdin_text)))
+            stack.enter_context(mock.patch.object(sys, "stdout", out_buf))
+            stack.enter_context(mock.patch.object(sys, "stderr", err_buf))
+            rc = setup.main()
+        return rc, out_buf.getvalue(), err_buf.getvalue(), run_calls, rec_snis, write_vol, wait_h, rem_vol, save_rb
+
+    def test_self_steal_reconfigure_preserves_direct_and_edge_settings(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            # 1. Direct reconfigure preserves me, client_mss, max_connections, fake_tls_cert_bytes.
+            (d / "config.json").write_text(
+                setup.json.dumps(
+                    {
+                        "role": "direct",
+                        "listen": "0.0.0.0:443",
+                        "secret_file": "/var/lib/mtevil/proxy-secret",
+                        "users_file": "/var/lib/mtevil/users.json",
+                        "replay_file": "/var/lib/mtevil-replay/replay.bin",
+                        "sni": "old.example.org",
+                        "cover": "127.0.0.1:8443",
+                        "max_connections": 777,
+                        "client_mss": 1200,
+                        "fake_tls_cert_bytes": 4320,
+                        "me": {"enabled": True, "public_ipv4": "1.2.3.4", "pool_size": 4},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: old\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_PORT=443\nMTEVIL_PUBLIC_HOST=old.example.org\n", encoding="utf-8")
+
+            rc, _out, err, _calls, _rec, _wv, _wh, _rv, _sb = self._run_self_steal_wizard(
+                d,
+                "y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n",
+            )
+            self.assertEqual(rc, 0, msg=err)
+            cfg = setup.json.loads((d / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(cfg["sni"], "site.example.org")
+            self.assertEqual(cfg["cover"], "127.0.0.1:8443")
+            self.assertEqual(cfg["max_connections"], 777)
+            self.assertEqual(cfg["client_mss"], 1200)
+            self.assertEqual(cfg["fake_tls_cert_bytes"], 4320)
+            self.assertEqual(cfg["me"], {"enabled": True, "public_ipv4": "1.2.3.4", "pool_size": 4})
+
+            # 2. Edge reconfigure preserves egress_strategy and egress_token_file.
+            (d / "config.json").write_text(
+                setup.json.dumps(
+                    {
+                        "role": "direct",
+                        "listen": "0.0.0.0:443",
+                        "sni": "old.example.org",
+                        "cover": "127.0.0.1:8443",
+                        "max_connections": 512,
+                        "egress_upstreams": ["10.0.0.2:29443"],
+                        "egress_strategy": "ordered",
+                        "egress_token_file": "/var/lib/mtevil/custom-token",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rc, _out, err, _calls, _rec, _wv, _wh, _rv, _sb = self._run_self_steal_wizard(
+                d,
+                "y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n10.0.0.2:29443\ny\n",
+                role_arg="edge",
+            )
+            self.assertEqual(rc, 0, msg=err)
+            edge_cfg = setup.json.loads((d / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(edge_cfg["egress_strategy"], "ordered")
+            self.assertEqual(edge_cfg["egress_token_file"], "/var/lib/mtevil/custom-token")
+            self.assertEqual(edge_cfg["max_connections"], 512)
+
+            # 3. Explicit role change (edge -> direct) does NOT carry over egress settings.
+            rc, _out, err, _calls, _rec, _wv, _wh, _rv, _sb = self._run_self_steal_wizard(
+                d,
+                "y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n",
+                role_arg="direct",
+            )
+            self.assertEqual(rc, 0, msg=err)
+            switched_cfg = setup.json.loads((d / "config.json").read_text(encoding="utf-8"))
+            self.assertNotIn("egress_upstreams", switched_cfg)
+            self.assertNotIn("egress_strategy", switched_cfg)
+
+    def test_self_steal_preflight_failure_leaves_config_and_allowed_snis_untouched(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            orig_cfg = '{"role":"direct","sni":"old.example.org","cover":"127.0.0.1:8443"}\n'
+            (d / "config.json").write_text(orig_cfg, encoding="utf-8")
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: old\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_PORT=443\n", encoding="utf-8")
+
+            rc, _out, err, _calls, rec_snis, _wv, _wh, _rv, _sb = self._run_self_steal_wizard(
+                d,
+                "y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n",
+                cover_check_ok=(False, "verify error:self-signed"),
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("Проверка cover перед развёртыванием не пройдена", err)
+            self.assertEqual((d / "config.json").read_text(encoding="utf-8"), orig_cfg)
+            rec_snis.assert_not_called()
+
+    def test_self_steal_rollback_on_broken_https_and_failed_telegram_and_fresh_stop(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            orig_cfg = '{"role":"direct","sni":"old.example.org","cover":"127.0.0.1:8443"}\n'
+            (d / "config.json").write_text(orig_cfg, encoding="utf-8")
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: old\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_PORT=443\n", encoding="utf-8")
+
+            # 1. Healthy container with broken HTTPS fallback triggers rollback.
+            rc, _out, err, calls, _rec, write_vol, wait_h, _rv, _sb = self._run_self_steal_wizard(
+                d,
+                "y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n",
+                local_https_ok=(False, "connection reset"),
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("Проверка локального HTTPS GET", err)
+            self.assertEqual((d / "config.json").read_text(encoding="utf-8"), orig_cfg)
+            self.assertTrue(any("--force-recreate" in c for c in calls))
+            self.assertEqual(wait_h.call_count, 2)
+            self.assertTrue(any("allowed-sni.txt" in str(c) for c in write_vol.call_args_list))
+
+            # 2. Failed Telegram probe after HTTPS succeeds triggers rollback.
+            rc2, _out2, err2, calls2, _rec2, _wv2, wait_h2, _rv2, _sb2 = self._run_self_steal_wizard(
+                d,
+                "y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n",
+                telegram_ok=(False, "dc_timeout"),
+            )
+            self.assertEqual(rc2, 1)
+            self.assertIn("Сквозная проверка Telegram через self-steal не пройдена", err2)
+            self.assertEqual((d / "config.json").read_text(encoding="utf-8"), orig_cfg)
+            self.assertTrue(any("--force-recreate" in c for c in calls2))
+            self.assertEqual(wait_h2.call_count, 2)
+
+        # 3. Fresh install failure stops & removes failed candidate and cleans newly created state files.
+        with tempfile.TemporaryDirectory() as td_fresh:
+            d_fresh = Path(td_fresh)
+            rc3, _out3, err3, calls3, _rec3, _wv3, _wh3, rem_vol, _sb3 = self._run_self_steal_wizard(
+                d_fresh,
+                "site.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n",
+                telegram_ok=(False, "dc_timeout"),
+                had_allowed_sni=False,
+                had_users_json=False,
+                created_proxy_secret=True,
+            )
+            self.assertEqual(rc3, 1)
+            self.assertIn("Неудачный кандидат остановлен", err3)
+            self.assertTrue(any("stop" in c for c in calls3))
+            self.assertTrue(any("rm" in c for c in calls3))
+            removed_paths = [c[0][1] for c in rem_vol.call_args_list]
+            self.assertIn("/var/lib/mtevil/allowed-sni.txt", removed_paths)
+            self.assertIn("/var/lib/mtevil/proxy-secret", removed_paths)
+            self.assertIn("/var/lib/mtevil/users.json", removed_paths)
+
+    def test_self_steal_success_when_public_address_is_unreachable(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            rc, out, err, _calls, _rec, _wv, _wh, _rv, _sb = self._run_self_steal_wizard(
+                d,
+                "site.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n",
+                public_https_ok=(False, "timed out"),
+                public_port_status=("unreachable", "timed out"),
+            )
+            self.assertEqual(rc, 0, msg=err)
+            self.assertIn("Локальный вход: HTTPS GET", out)
+            self.assertIn("Публичный HTTPS GET", err)
+            self.assertIn("откат не требуется", err)
+            self.assertTrue((d / "config.json").is_file())
+
+    def test_self_steal_failed_check_config_skips_allowed_sni_and_image_pin_verified(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "config.json").write_text('{"role":"direct","sni":"old.example.org","cover":"127.0.0.1:8443"}\n', encoding="utf-8")
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: mtevil:local\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_IMAGE=mtevil:local\nMTEVIL_PORT=443\n", encoding="utf-8")
+
+            # 1. Failed --check-config never writes allowed-sni.txt.
+            rc, _out, err, _calls, rec_snis, _wv, _wh, _rv, save_rb = self._run_self_steal_wizard(
+                d,
+                "y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n",
+                check_config_rc=1,
+                prev_image_id="sha256:old111",
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("Конфигурация не прошла проверку", err)
+            rec_snis.assert_not_called()
+            save_rb.assert_called_once()
+
+            # 2. Failed probe with mismatched restored image ID flags mismatch.
+            rc2, _out2, err2, _calls2, _rec2, _wv2, _wh2, _rv2, _sb2 = self._run_self_steal_wizard(
+                d,
+                "y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n",
+                local_https_ok=(False, "502 Bad Gateway"),
+                prev_image_id="sha256:old111",
+                restored_image_id="sha256:wrong222",
+            )
+            self.assertEqual(rc2, 1)
+            self.assertIn("другим image ID", err2)
+
+    def test_edge_nondefault_egress_token_file_rotation_and_rollback(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            custom_path = "/var/lib/mtevil/custom-edge-tok"
+            (d / "config.json").write_text(
+                setup.json.dumps(
+                    {
+                        "role": "direct",
+                        "listen": "0.0.0.0:443",
+                        "sni": "old.example.org",
+                        "cover": "127.0.0.1:8443",
+                        "egress_upstreams": ["10.0.0.2:29443"],
+                        "egress_token_file": custom_path,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: old\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_PORT=443\n", encoding="utf-8")
+
+            new_tok = "b" * 32
+            rc, _out, err, _calls, _rec, write_vol, _wh, rem_vol, _sb = self._run_self_steal_wizard(
+                d,
+                f"y\nsite.example.org\n443\n0.0.0.0\n127.0.0.1:8443\n10.0.0.2:29443\nn\n{new_tok}\n",
+                role_arg="edge",
+                existing_token="a" * 32,
+                telegram_ok=(False, "dc_timeout"),
+            )
+            self.assertEqual(rc, 1, msg=err)
+            write_calls = [(c[0][1], c[0][2]) for c in write_vol.call_args_list]
+            self.assertIn((f"{custom_path}.candidate", new_tok), write_calls)
+            self.assertIn((custom_path, new_tok), write_calls)
+            self.assertIn((custom_path, "a" * 32), write_calls)
+            self.assertIn(f"{custom_path}.candidate", [c[0][1] for c in rem_vol.call_args_list])
+
+    def test_probe_local_https_get_split_reads_truncated_redirects_and_502(self):
+        import ssl
+
+        class FakeTlsSock:
+            def __init__(self, chunks: list[bytes]):
+                self._chunks = list(chunks)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def version(self):
+                return "TLSv1.3"
+
+            def getpeercert(self):
+                return {"subject": ((("commonName", "site.example.org"),),)}
+
+            def sendall(self, _data):
+                return None
+
+            def recv(self, _n):
+                return self._chunks.pop(0) if self._chunks else b""
+
+        class FakeCtx:
+            def __init__(self, chunks):
+                self._chunks = chunks
+
+            def wrap_socket(self, _sock, server_hostname=None):
+                return FakeTlsSock(self._chunks)
+
+        def run_probe(chunks):
+            with (
+                mock.patch("socket.create_connection", return_value=mock.MagicMock()),
+                mock.patch.object(ssl, "create_default_context", return_value=FakeCtx(chunks)),
+            ):
+                return setup.probe_local_https_get("127.0.0.1", 443, "site.example.org")
+
+        ok_split, msg_split = run_probe([b"HTTP/1.1 ", b"302 Found", b"\r\nLocation: /ok\r\n\r\n"])
+        self.assertTrue(ok_split, msg=msg_split)
+        self.assertIn("302 Found", msg_split)
+
+        ok_404, msg_404 = run_probe([b"HTTP/1.1 404 Not Found\r\n\r\n"])
+        self.assertTrue(ok_404, msg=msg_404)
+
+        ok_trunc, msg_trunc = run_probe([b"HTTP/"])
+        self.assertFalse(ok_trunc)
+        self.assertIn("неполный", msg_trunc)
+
+        ok_502, msg_502 = run_probe([b"HTTP/1.1 502 Bad Gateway\r\n\r\n"])
+        self.assertFalse(ok_502)
+        self.assertIn("502 Bad Gateway", msg_502)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux Docker host")
+    def test_linux_real_two_image_rollback_restores_image_id_and_telegram(self):
+        image = self._local_image()
+        if image is None:
+            self.skipTest("no local mtevil image available")
+
+        port = self._free_port()
+        proj = f"mtevil-twoimg-{port}"
+        shared_tag = f"mtevil:test-two-img-{port}"
+        dc = _MockTelegramDcServer()
+        setup.run(["docker", "image", "tag", image, shared_tag])
+
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as bad_ctx:
+            d = Path(td)
+            base = setup.compose_cmd(d, proj)
+            try:
+                # 1. Deploy good image under shared_tag and verify Telegram E2E.
+                stdin_good = f"{port}\n0.0.0.0\nmozilla.org\nmozilla.org:443\ny\n"
+                err_good = io.StringIO()
+                with (
+                    mock.patch.object(sys, "argv", ["setup.py", "--mode", "advanced", "--role", "direct", "--dir", str(d), "--project", proj, "--image", shared_tag, "--no-build", "--network-host"]),
+                    mock.patch.object(setup, "prompt_client_address", return_value=("127.0.0.1", None)),
+                    mock.patch.object(setup, "check_cover_from_container", return_value=(True, "ok")),
+                    mock.patch.object(setup, "probe_cover_reachable", return_value=(True, "TLSv1.3")),
+                    mock.patch.object(setup, "verify_telegram_e2e", return_value=(True, "mock")),
+                    mock.patch.object(sys, "stdin", io.StringIO(stdin_good)),
+                    mock.patch.object(sys, "stdout", io.StringIO()),
+                    mock.patch.object(sys, "stderr", err_good),
+                ):
+                    self.assertEqual(setup.main(), 0, msg=err_good.getvalue())
+
+                cfg = setup.json.loads((d / "config.json").read_text(encoding="utf-8"))
+                cfg["dc"] = [f"{i}=127.0.0.1:{dc.port}" for i in range(1, 6)]
+                (d / "config.json").write_text(setup.json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+                setup.run(base + ["up", "-d", "--force-recreate", setup.compose_service(base)])
+                setup.wait_healthy(base)
+                orig_img_id, _, _ = setup.inspect_current_deployment(d, proj, shared_tag)
+                self.assertIsNotNone(orig_img_id)
+                ok_before, detail_before = setup.verify_telegram_e2e(base, attempts=2, delay_s=0.5, dc=2)
+                self.assertTrue(ok_before, msg=detail_before)
+
+                # 2. Build a distinct failing candidate image under the exact same shared_tag.
+                (Path(bad_ctx) / "Dockerfile").write_text(
+                    f'FROM {shared_tag}\nENTRYPOINT ["/bin/sh", "-c", "sleep 300"]\n',
+                    encoding="utf-8",
+                )
+                setup.run(["docker", "build", "-t", shared_tag, bad_ctx])
+                bad_img_id, _, _ = setup.inspect_image_metadata(shared_tag)
+                self.assertIsNotNone(bad_img_id)
+                self.assertNotEqual(bad_img_id, orig_img_id)
+
+                # 3. Reconfigure with --self-steal using shared_tag: pins orig_img_id, fails healthcheck/HTTPS, rolls back.
+                orig_wait = setup.wait_healthy
+
+                def fast_wait(b, timeout_s=45):
+                    return orig_wait(b, timeout_s=6)
+
+                with (
+                    mock.patch.object(sys, "argv", ["setup.py", "--self-steal", "--no-build", "--dir", str(d), "--project", proj, "--image", shared_tag]),
+                    mock.patch.object(setup, "prompt_client_address", return_value=("127.0.0.1", None)),
+                    mock.patch.object(setup, "check_cover_from_container", return_value=(True, "ok")),
+                    mock.patch.object(setup, "wait_healthy", side_effect=fast_wait),
+                    mock.patch.object(sys, "stdin", io.StringIO(f"y\nmozilla.org\n{port}\n0.0.0.0\n127.0.0.1:8443\n")),
+                    mock.patch.object(sys, "stdout", io.StringIO()),
+                    mock.patch.object(sys, "stderr", io.StringIO()),
+                ):
+                    rc = setup.main()
+                self.assertEqual(rc, 1)
+
+                restored_id, _, _ = setup.inspect_current_deployment(d, proj, f"mtevil:rollback-{proj}")
+                self.assertEqual(restored_id, orig_img_id)
+                ok_after, detail_after = setup.verify_telegram_e2e(base, attempts=2, delay_s=0.5, dc=2)
+                self.assertTrue(ok_after, msg=detail_after)
+            finally:
+                dc.close()
+                setup.run(base + ["down", "-v", "--remove-orphans"], check=False)
+                setup.run(["docker", "rmi", "-f", shared_tag, f"mtevil:rollback-{proj}"], check=False)
+
+    def test_format_cover_status_lines(self):
+        cfg = {"role": "direct", "sni": "site.example.org", "cover": "127.0.0.1:8443"}
+        with mock.patch.object(setup, "probe_cover_status", return_value=(True, "TLSv1.3, HTTP/1.1 200 OK", 45)):
+            lines_ok = setup.format_cover_status_lines("direct", cfg, "0.0.0.0", "443")
+        self.assertEqual(len(lines_ok), 1)
+        self.assertIn("HTTPS GET OK", lines_ok[0])
+        self.assertIn("45 дн.", lines_ok[0])
+
+        with mock.patch.object(setup, "probe_cover_status", return_value=(True, "TLSv1.3, HTTP/1.1 200 OK", 10)):
+            lines_warn = setup.format_cover_status_lines("direct", cfg, "0.0.0.0", "443")
+        self.assertEqual(len(lines_warn), 2)
+        self.assertIn("10 дн.", lines_warn[1])
+        self.assertIn("< 14", lines_warn[1])
+
+        with mock.patch.object(setup, "probe_cover_status", return_value=(False, "502 Bad Gateway", None)):
+            lines_err = setup.format_cover_status_lines("direct", cfg, "0.0.0.0", "443")
+        self.assertEqual(len(lines_err), 1)
+        self.assertIn("ошибка (502 Bad Gateway)", lines_err[0])
+
 
 if __name__ == "__main__":
     prog = unittest.main(verbosity=2, exit=False)

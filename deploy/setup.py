@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Interactive Docker Compose setup wizard for mtevil (Direct, Egress, Edge)."""
 import argparse
+import copy
 import datetime
 import errno
 import getpass
@@ -688,6 +689,41 @@ def find_free_port(bind_ip: str, exclude_port: int) -> int | None:
     return None
 
 
+def describe_port_owner(port: int) -> str | None:
+    """Best-effort identification of the process or Docker container holding `port`."""
+    owners: list[str] = []
+    if shutil.which("ss"):
+        proc = subprocess.run(
+            ["ss", "-tulpnH", f"sport = :{int(port)}"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            for line in proc.stdout.splitlines():
+                m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', line)
+                if m:
+                    entry = f"{m.group(1)} (pid {m.group(2)})"
+                    if entry not in owners:
+                        owners.append(entry)
+    if shutil.which("docker"):
+        proc = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}\t{{.Ports}}"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            needle = f":{int(port)}->"
+            for line in proc.stdout.splitlines():
+                name, _, ports_str = line.partition("\t")
+                if needle in ports_str and name.strip():
+                    entry = f"контейнер {name.strip()}"
+                    if entry not in owners:
+                        owners.append(entry)
+    return ", ".join(owners) if owners else None
+
+
 def ensure_available_port(
     deploy_dir: Path,
     project: str,
@@ -698,8 +734,22 @@ def ensure_available_port(
 ) -> int:
     while True:
         if deployment_owns_port(deploy_dir, project, bind_ip, pub_port) or is_port_available(bind_ip, pub_port):
+            if show_link_note and pub_port != 443:
+                print(
+                    warn_text(
+                        f"Примечание: нестандартный порт {pub_port} (отличный от 443) может чаще попадать под фильтрацию."
+                    )
+                )
             return pub_port
+        owner = describe_port_owner(pub_port)
         print(warn_text(f"\nПорт {pub_port} уже занят на этом сервере."))
+        if owner:
+            print(f"  Занято процессом/контейнером: {owner}")
+        if pub_port == 443 and show_link_note:
+            print(
+                "  Подсказка (self-steal): для маскировки под свой сайт освободите 443 "
+                "(перенесите nginx/caddy на 127.0.0.1:8443) или выберите другой порт."
+            )
         alt = find_free_port(bind_ip, pub_port)
         if alt is not None:
             if show_link_note:
@@ -750,6 +800,7 @@ def render_compose(
     include_build: bool = True,
     extra_volumes: list[str] | None = None,
     max_connections: int | None = None,
+    extra_hosts: list[str] | None = None,
 ) -> str:
     try:
         rel_context = os.path.relpath(repo_root, deploy_dir).replace("\\", "/")
@@ -769,6 +820,9 @@ def render_compose(
         if network_host
         else f'    ports:\n      - "${{MTEVIL_BIND:-127.0.0.1}}:${{MTEVIL_PORT:-{internal_port}}}:{internal_port}/tcp"'
     )
+    extra_hosts_block = ""
+    if not network_host and extra_hosts:
+        extra_hosts_block = "\n    extra_hosts:\n" + "".join(f'      - "{h}"\n' for h in extra_hosts).rstrip("\n")
     extra_vol_lines = "".join(f"\n      - {v}" for v in (extra_volumes or []))
     return f"""name: ${{MTEVIL_PROJECT:-mtevil-{role}}}
 
@@ -780,7 +834,7 @@ services:
     <<: *image
     init: true
     restart: unless-stopped
-{net_block}
+{net_block}{extra_hosts_block}
     volumes:
       - ./{config_name}:/etc/mtevil/config.json:ro
       - state:/var/lib/mtevil:ro
@@ -917,6 +971,23 @@ def write_volume_secret_stdin(base: list[str], path_in_container: str, hex_secre
     )
 
 
+def remove_volume_file(base: list[str], path_in_container: str) -> None:
+    run(
+        base
+        + [
+            "run",
+            "--rm",
+            "--no-deps",
+            "--entrypoint",
+            "/bin/rm",
+            compose_write_service(base),
+            "-f",
+            path_in_container,
+        ],
+        check=False,
+    )
+
+
 def read_volume_secret(base: list[str], path_in_container: str) -> str:
     return run(
         base
@@ -1014,6 +1085,7 @@ def resolve_network_host_port(
     *,
     explicit_network_host: bool = False,
     show_link_note: bool = True,
+    allow_bridge_fallback: bool = True,
 ) -> tuple[int, bool]:
     if not use_network_host:
         return pub_port, False
@@ -1038,6 +1110,26 @@ def resolve_network_host_port(
         )
     )
     print(f"В режиме host контейнер запускается без привилегий и не сможет открыть порт {pub_port}.")
+    if not allow_bridge_fallback:
+        print(
+            "Для loopback-cover (127.0.0.1 / localhost) нужен режим host, поэтому автоматический переход в bridge недоступен."
+        )
+        print(
+            f"Выберите другой порт (>= {min_port}) или поднимите локальный HTTPS-бэкенд на не-loopback адресе (например, docker0 / IP сервера)."
+        )
+
+        def validate_unpriv_port_only(val: str) -> int:
+            p = validate_port(val)
+            if p < min_port:
+                raise ValueError(f"для режима host требуется порт >= {min_port}")
+            return p
+
+        alt = find_free_port(bind_ip, pub_port)
+        default_alt = str(alt) if (alt is not None and alt >= min_port) else (str(min_port) if is_port_available(bind_ip, min_port) else None)
+        new_port = ask_validated(f"Другой порт (>= {min_port})", validate_unpriv_port_only, default_alt)
+        new_port = ensure_available_port(deploy_dir, project, bind_ip, new_port, show_link_note=show_link_note)
+        return new_port, True
+
     print(f"  1. Оставить порт {pub_port} и перейти в сетевой режим bridge")
     print(f"  2. Остаться в режиме host и выбрать другой порт (>= {min_port})")
     while True:
@@ -1095,11 +1187,12 @@ def check_public_port_reachable(host: str, port: int, timeout_s: float = 3.0) ->
 
 
 def choose_wizard_mode(default: str = "simple") -> str:
-    default_num = "2" if default == "advanced" else "1"
+    default_num = {"simple": "1", "advanced": "2", "self-steal": "3"}.get(default, "1")
     print()
     print(heading("Выберите режим установки"))
     print("  1. Простая установка · один VPS [по умолчанию]")
     print("  2. Расширенная настройка · ручные параметры и несколько серверов")
+    print("  3. self-steal · маскировка под свой локальный HTTPS-сайт (nginx/Caddy)")
     print()
     while True:
         choice = ask("Ваш выбор", default_num).lower()
@@ -1107,7 +1200,9 @@ def choose_wizard_mode(default: str = "simple") -> str:
             return "simple"
         if choice in ("2", "advanced", "a", "adv", "расширенная"):
             return "advanced"
-        print("Некорректный выбор: введите 1 (простая установка) или 2 (расширенная настройка).")
+        if choice in ("3", "self-steal", "self_steal", "selfsteal"):
+            return "self-steal"
+        print("Некорректный выбор: введите 1 (простая установка), 2 (расширенная) или 3 (self-steal).")
 
 
 def ask_simple_confirm() -> str:
@@ -1130,27 +1225,162 @@ def ask_simple_confirm() -> str:
         print("Некорректный выбор: введите y (установить), s (сменить SNI), a (расширенная настройка) или n (отмена).")
 
 
+def parse_cover_host_port(cover: str) -> tuple[str, int] | None:
+    raw = (cover or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("["):
+        host, _, port_str = raw.rpartition(":")
+        if not host.endswith("]"):
+            return None
+        host = host[1:-1]
+    else:
+        host, sep, port_str = raw.rpartition(":")
+        if not sep:
+            return raw, 443
+    try:
+        port = validate_port(port_str)
+    except Exception:
+        return None
+    return host, port
+
+
+def is_loopback_cover_addr(cover: str) -> bool:
+    parsed = parse_cover_host_port(cover)
+    if parsed is None:
+        return False
+    host = parsed[0].strip().lower()
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def is_local_cover_addr(cover: str) -> bool:
+    parsed = parse_cover_host_port(cover)
+    if parsed is None:
+        return False
+    host = parsed[0].strip().lower()
+    return host in ("127.0.0.1", "localhost", "::1", "host.docker.internal")
+
+
+def cover_loops_to_public_entry(
+    cover: str,
+    bind_ip: str,
+    pub_port: int,
+    public_host: str,
+    sni: str,
+) -> bool:
+    parsed = parse_cover_host_port(cover)
+    if parsed is None:
+        return False
+    host, port = parsed
+    if int(port) != int(pub_port):
+        return False
+    h = host.strip().lower()
+    b = (bind_ip or "").strip().lower()
+    pub = (public_host or "").strip().lower()
+    sni_l = (sni or "").strip().lower()
+    if h in (b, pub, sni_l):
+        return True
+    if b in ("0.0.0.0", "::") and h in ("127.0.0.1", "localhost", "::1", "0.0.0.0", "::", "host.docker.internal"):
+        return True
+    return False
+
+
 def probe_cover_reachable(cover: str, sni: str, timeout_s: float = 4.0) -> tuple[bool, str]:
-    """Quickly verify TLS reachability of `cover` from this VPS before writing config."""
+    """Verify TLS reachability, SNI, and certificate validity of `cover` from this VPS."""
     import ssl
 
-    host, _, port_str = cover.rpartition(":")
-    if not host:
-        host, port = cover, 443
-    else:
-        host = host.strip("[]")
-        try:
-            port = int(port_str)
-        except ValueError:
-            return False, f"некорректный порт в адресе cover: {cover}"
+    parsed = parse_cover_host_port(cover)
+    if parsed is None:
+        return False, f"некорректный адрес cover: {cover}"
+    host, port = parsed
+    if host.lower() == "host.docker.internal":
+        host = "127.0.0.1"
     ctx = ssl.create_default_context()
     try:
         with socket.create_connection((host, port), timeout=timeout_s) as raw_sock:
             with ctx.wrap_socket(raw_sock, server_hostname=sni) as tls_sock:
                 ver = tls_sock.version() or "TLS"
-                return True, ver
+                cert = tls_sock.getpeercert()
+                if not cert:
+                    return False, f"{ver}, но сервер не предъявил сертификат для SNI {sni}"
+                return True, f"{ver}, сертификат OK"
+    except ssl.SSLCertVerificationError as exc:
+        return False, f"сертификат не подходит для SNI {sni}: {exc}"
     except Exception as exc:
         return False, str(exc)
+
+
+def probe_cover_status(host: str, port: int, sni: str, timeout_s: float = 5.0) -> tuple[bool, str, int | None]:
+    """Perform a real HTTPS GET with SNI/cert validation and return (ok, detail, cert_days_left)."""
+    import ssl
+
+    ctx = ssl.create_default_context()
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout_s) as raw_sock:
+            with ctx.wrap_socket(raw_sock, server_hostname=sni) as tls_sock:
+                ver = tls_sock.version() or "TLS"
+                cert = tls_sock.getpeercert()
+                if not cert:
+                    return False, f"{ver}, но сервер не предъявил сертификат для SNI {sni}", None
+                days_left: int | None = None
+                not_after = cert.get("notAfter")
+                if isinstance(not_after, str) and not_after:
+                    try:
+                        exp_ts = ssl.cert_time_to_seconds(not_after)
+                        days_left = int((exp_ts - time.time()) // 86400)
+                    except Exception:
+                        days_left = None
+                req = (
+                    f"GET / HTTP/1.1\r\n"
+                    f"Host: {sni}\r\n"
+                    f"User-Agent: mtevilctl-check/1.0\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("ascii", errors="ignore")
+                tls_sock.sendall(req)
+                buf = bytearray()
+                while b"\r\n" not in buf and len(buf) < 8192:
+                    chunk = tls_sock.recv(1024)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                if not buf:
+                    return False, f"{ver}, пустой ответ на HTTPS GET /", days_left
+                if b"\r\n" not in buf:
+                    preview = bytes(buf[:80]).decode("latin-1", errors="replace").strip()
+                    return False, f"{ver}, неполный HTTP-ответ: {preview}", days_left
+                status_line = bytes(buf).split(b"\r\n", 1)[0].decode("latin-1", errors="replace").strip()
+                m = re.match(r"^HTTP/(?:1\.[01]|2(?:\.0)?)\s+(\d{3})(?:\s.*)?$", status_line)
+                if not m:
+                    return False, f"{ver}, некорректная строка статуса HTTP: {status_line[:80]}", days_left
+                status_code = int(m.group(1))
+                if status_code >= 500 or status_code < 100:
+                    return False, f"{ver}, сервер вернул ошибку {status_line}", days_left
+                return True, f"{ver}, {status_line}", days_left
+    except ssl.SSLCertVerificationError as exc:
+        return False, f"сертификат не подходит для SNI {sni}: {exc}", None
+    except Exception as exc:
+        return False, str(exc), None
+
+
+def probe_local_https_get(host: str, port: int, sni: str, timeout_s: float = 5.0) -> tuple[bool, str]:
+    """Perform a real HTTPS GET with SNI and certificate validation against host:port."""
+    ok, detail, _days = probe_cover_status(host, port, sni, timeout_s=timeout_s)
+    return ok, detail
+
+
+def prompt_masking_config(
+    default_sni: str,
+    default_cover: str,
+) -> tuple[str, str]:
+    print("\n" + heading("Шаг 3. Маскировка (HTTPS-cover)"))
+    print("Подсказка: после настройки можно уточнить fake_tls_cert_bytes в config.json под размер цепочки сертификата выбранного домена.")
+    sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, default_sni)
+    cover_default = default_cover if sni == default_sni else f"{sni}:443"
+    cover = ask("Адрес HTTPS-cover (host:port)", cover_default)
+    cover_ok_host, cover_detail_host = probe_cover_reachable(cover, sni)
+    if not cover_ok_host:
+        print(f"Предупреждение: cover {cover} (SNI {sni}) не отвечает с этого VPS ({cover_detail_host}).")
+    return sni, cover
 
 
 def prompt_sni_choice(default_sni: str = DEFAULT_SNI) -> str:
@@ -2401,6 +2631,9 @@ def run_status_command(deploy_dir: Path) -> int:
         print(me_line)
     for diag_line in format_handshake_diag_lines(role, rstats):
         print(diag_line)
+    if running:
+        for cov_line in format_cover_status_lines(role, saved_cfg, bind_val, port_val):
+            print(cov_line)
     if role == "egress":
         accept_legacy = saved_cfg.get("egress_accept_legacy", True) is not False
         proto_mode = "MTV4 + MTV3 + legacy MTV2 (переходный)" if accept_legacy else "MTV4 + MTV3 (строгий)"
@@ -3052,6 +3285,36 @@ def format_handshake_diag_lines(
     return lines
 
 
+def format_cover_status_lines(
+    role: str,
+    saved_cfg: dict[str, object],
+    bind_val: str,
+    port_val: str,
+) -> list[str]:
+    if role not in ("direct", "edge"):
+        return []
+    sni = str(saved_cfg.get("sni") or "").strip()
+    if not sni or not port_val:
+        return []
+    try:
+        port = int(port_val)
+    except ValueError:
+        return []
+    local_host = "127.0.0.1" if bind_val in ("", "0.0.0.0", "::", "127.0.0.1") else bind_val
+    ok, detail, days_left = probe_cover_status(local_host, port, sni, timeout_s=3.0)
+    if not ok:
+        return [f"  Проверка cover:    {err_text(f'ошибка ({detail})')}"]
+    cert_note = f", сертификат: {days_left} дн." if days_left is not None else ""
+    lines = [f"  Проверка cover:    {ok_text(f'HTTPS GET OK ({detail}{cert_note})')}"]
+    if days_left is not None and days_left < 14:
+        lines.append(
+            warn_text(
+                f"  Предупреждение:    до окончания сертификата cover осталось {days_left} дн. (< 14) — проверьте автопродление."
+            )
+        )
+    return lines
+
+
 def prompt_me_config(
     role: str,
     *,
@@ -3326,9 +3589,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-build", action="store_true", help="Skip docker compose build")
     parser.add_argument(
         "--mode",
-        choices=("simple", "advanced"),
+        choices=("simple", "advanced", "self-steal"),
         default=None,
-        help="Wizard mode: simple (single VPS direct) or advanced (manual settings & edge/egress)",
+        help="Wizard mode: simple (single VPS direct), advanced (manual settings & edge/egress), or self-steal",
+    )
+    parser.add_argument(
+        "--self-steal",
+        action="store_true",
+        help="Configure mtevil in self-steal mode against an existing local HTTPS server (nginx/Caddy)",
     )
     parser.add_argument("--role", choices=("direct", "egress", "edge"), default=None, help="Deployment role (non-interactive override)")
     parser.add_argument(
@@ -3398,6 +3666,14 @@ def main(argv: list[str] | None = None) -> int:
         deploy_dir = (args.dir or (repo_root / "deploy" / "wizard")).resolve()
 
     # Resolve conflicting CLI flags explicitly before prompting.
+    if args.self_steal:
+        if args.mode in ("simple", "advanced"):
+            print(err_text("Конфликт параметров: не сочетайте --self-steal с --mode simple/advanced."), file=sys.stderr)
+            return 1
+        args.mode = "self-steal"
+    if args.mode == "self-steal" and args.role == "egress":
+        print(err_text("Конфликт параметров: режим self-steal несовместим с ролью egress."), file=sys.stderr)
+        return 1
     if args.mode == "simple" and args.role in ("edge", "egress"):
         print(
             err_text(
@@ -3453,6 +3729,8 @@ def main(argv: list[str] | None = None) -> int:
         mode = "advanced"
     elif args.role == "direct":
         mode = "simple"
+    elif existing_cfg.exists() and is_local_cover_addr(str(saved_cfg.get("cover") or "")):
+        mode = choose_wizard_mode(default="self-steal")
     elif existing_cfg.exists() and existing_role in ("edge", "egress"):
         mode = "advanced"
     else:
@@ -3499,7 +3777,10 @@ def main(argv: list[str] | None = None) -> int:
             print(heading("Параметры простой установки (direct)"))
             print(f"  Публичный адрес:  {public_host} ({host_source})")
             print(f"  Порт:             {pub_port} (свободен)")
-            print(f"  Маскировка (SNI): {sni}")
+            if cover != f"{sni}:443":
+                print(f"  Маскировка (SNI): {sni} (cover: {cover})")
+            else:
+                print(f"  Маскировка (SNI): {sni}")
             print(f"  Каталог:          {deploy_dir}")
             print()
             action = ask_simple_confirm()
@@ -3536,6 +3817,109 @@ def main(argv: list[str] | None = None) -> int:
                 "flight_shaping": True,
             }
 
+    if mode == "self-steal":
+        role = args.role if args.role in ("direct", "edge") else (existing_role if existing_role in ("direct", "edge") else "direct")
+        project = args.project or str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
+        print("\n" + heading("Настройка self-steal (маскировка под свой локальный HTTPS-сайт)"))
+        print("  MTEvil примет клиентов на внешнем порту (обычно 443), а обычный HTTPS-трафик")
+        print("  передаст уже работающему на сервере nginx/Caddy (например, на 127.0.0.1:8443).")
+
+        sni_seed = default_sni if (is_local_cover_addr(default_cover) or default_sni not in ("mozilla.org", "example.com")) else None
+        sni = ask_validated("Публичный домен сайта (SNI)", validate_sni, sni_seed)
+        default_host = str(saved.get("MTEVIL_PUBLIC_HOST") or "") or sni
+        public_host, dns_records = prompt_client_address(default_host)
+
+        default_port_str = str(saved.get("MTEVIL_PORT") or "443")
+        pub_port = ask_validated("Публичный TCP-порт входа mtevil", validate_port, default_port_str)
+        bind_ip = ask_validated("IP интерфейса для привязки на хосте", validate_ip, default_bind)
+        pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=True)
+
+        local_default = default_cover if is_local_cover_addr(default_cover) else "127.0.0.1:8443"
+        while True:
+            cover = ask("Адрес локального HTTPS-сайта (cover, host:port)", local_default).strip()
+            parsed_cover = parse_cover_host_port(cover)
+            if parsed_cover is None:
+                print(warn_text("Укажите адрес в формате host:port (например, 127.0.0.1:8443)."))
+                continue
+            if cover_loops_to_public_entry(cover, bind_ip, pub_port, public_host, sni):
+                print(
+                    err_text(
+                        f"Ошибка: cover {cover} указывает обратно на публичный вход mtevil ({bind_ip}:{pub_port}) — "
+                        "обычный HTTPS-трафик зациклится. Укажите другой порт для бэкенда (например, 127.0.0.1:8443)."
+                    )
+                )
+                continue
+            break
+
+        if is_loopback_cover_addr(cover):
+            if not use_network_host:
+                print(
+                    "Для loopback-cover (127.0.0.1 / localhost) требуется сетевой режим Docker host "
+                    "(в bridge 127.0.0.1 указывает внутрь контейнера)."
+                )
+            use_network_host = True
+            pub_port, use_network_host = resolve_network_host_port(
+                deploy_dir,
+                project,
+                bind_ip,
+                pub_port,
+                True,
+                explicit_network_host=True,
+                show_link_note=True,
+                allow_bridge_fallback=False,
+            )
+        else:
+            if not args.network_host:
+                use_network_host = ask_yes_no("Использовать сетевой режим host (--network-host)?", default=existing_network_host)
+            pub_port, use_network_host = resolve_network_host_port(
+                deploy_dir,
+                project,
+                bind_ip,
+                pub_port,
+                use_network_host,
+                explicit_network_host=args.network_host,
+                show_link_note=True,
+            )
+
+        if dns_records is not None:
+            check_domain_expected_ips(dns_records)
+
+        same_role_reconfigure = existing_cfg.exists() and existing_role == role
+        if same_role_reconfigure:
+            config_data = copy.deepcopy(saved_cfg)
+            config_data["role"] = "direct"
+            config_data.setdefault("secret_file", "/var/lib/mtevil/proxy-secret")
+            config_data.setdefault("users_file", "/var/lib/mtevil/users.json")
+            config_data.setdefault("replay_file", "/var/lib/mtevil-replay/replay.bin")
+            config_data["sni"] = sni
+            config_data["cover"] = cover
+            if not use_network_host:
+                config_data["listen"] = "0.0.0.0:24443"
+        else:
+            config_data = {
+                "role": "direct",
+                "listen": "0.0.0.0:24443",
+                "secret_file": "/var/lib/mtevil/proxy-secret",
+                "users_file": "/var/lib/mtevil/users.json",
+                "replay_file": "/var/lib/mtevil-replay/replay.bin",
+                "sni": sni,
+                "cover": cover,
+                "dc": DEFAULT_DCS,
+                "max_connections": 256,
+                "client_hello_timeout_secs": 5,
+                "handshake_timeout_secs": 10,
+                "idle_timeout_secs": 300,
+                "drain_timeout_secs": 5,
+                "fake_tls_cert_jitter": 16,
+                "flight_shaping": True,
+            }
+        if role == "edge":
+            saved_upstreams = saved_cfg.get("egress_upstreams") if isinstance(saved_cfg.get("egress_upstreams"), list) else []
+            default_upstreams = ",".join(str(x) for x in saved_upstreams) if saved_upstreams else None
+            upstreams = ask_egress_upstreams(default_upstreams)
+            config_data["egress_upstreams"] = upstreams
+            config_data.setdefault("egress_token_file", "/var/lib/mtevil/egress-token")
+
     if mode == "advanced":
         default_role = existing_role if existing_role in ("direct", "edge", "egress") else "direct"
         role = args.role or choose_advanced_role(default_role)
@@ -3561,14 +3945,7 @@ def main(argv: list[str] | None = None) -> int:
                 show_link_note=True,
             )
 
-            print("\n" + heading("Шаг 3. Маскировка (HTTPS-cover)"))
-            print("Подсказка: после настройки можно уточнить fake_tls_cert_bytes в config.json под размер цепочки сертификата выбранного домена.")
-            sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, default_sni)
-            cover_default = default_cover if sni == default_sni else f"{sni}:443"
-            cover = ask("Адрес HTTPS-cover (host:port)", cover_default)
-            cover_ok_host, cover_detail_host = probe_cover_reachable(cover, sni)
-            if not cover_ok_host:
-                print(f"Предупреждение: cover {cover} (SNI {sni}) не отвечает с этого VPS ({cover_detail_host}).")
+            sni, cover = prompt_masking_config(default_sni, default_cover)
             if dns_records is not None:
                 check_domain_expected_ips(dns_records)
             if bind_ip != "0.0.0.0":
@@ -3642,14 +4019,7 @@ def main(argv: list[str] | None = None) -> int:
                 show_link_note=True,
             )
 
-            print("\n" + heading("Шаг 3. Маскировка (HTTPS-cover)"))
-            print("Подсказка: после настройки можно уточнить fake_tls_cert_bytes в config.json под размер цепочки сертификата выбранного домена.")
-            sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, default_sni)
-            cover_default = default_cover if sni == default_sni else f"{sni}:443"
-            cover = ask("Адрес HTTPS-cover (host:port)", cover_default)
-            cover_ok_host, cover_detail_host = probe_cover_reachable(cover, sni)
-            if not cover_ok_host:
-                print(f"Предупреждение: cover {cover} (SNI {sni}) не отвечает с этого VPS ({cover_detail_host}).")
+            sni, cover = prompt_masking_config(default_sni, default_cover)
             if dns_records is not None:
                 check_domain_expected_ips(dns_records)
             if bind_ip != "0.0.0.0":
@@ -3770,6 +4140,45 @@ def main(argv: list[str] | None = None) -> int:
     abs_compose = str((deploy_dir / "compose.yaml").resolve())
     compose_ref = f'--env-file "{abs_env}" -f "{abs_compose}"'
     include_build = not args.no_build and (repo_root / "Dockerfile").is_file()
+    cover_val = str(config_data.get("cover") or "")
+    effective_egress_token_file = str(config_data.get("egress_token_file") or "/var/lib/mtevil/egress-token")
+    if role in ("edge", "egress"):
+        config_data["egress_token_file"] = effective_egress_token_file
+    cand_token_path = f"{effective_egress_token_file}.candidate"
+    compose_extra_hosts = (
+        ["host.docker.internal:host-gateway"]
+        if (not use_network_host and "host.docker.internal" in cover_val.lower())
+        else None
+    )
+
+    prev_image_id: str | None = None
+    pinned_rollback_tag: str | None = None
+    if existing_cfg.exists():
+        prev_image_ref = str(saved.get("MTEVIL_IMAGE") or args.image).strip()
+        try:
+            prev_image_id, prev_digest, prev_version = inspect_current_deployment(
+                deploy_dir, project, prev_image_ref
+            )
+            if prev_image_id:
+                pinned_rollback_tag = save_rollback_snapshot(
+                    deploy_dir,
+                    project,
+                    prev_version,
+                    prev_image_ref,
+                    prev_image_id,
+                    prev_digest,
+                )
+        except Exception as exc:
+            print(err_text(f"Не удалось зафиксировать текущий образ для отката: {exc}"), file=sys.stderr)
+            return 1
+
+    had_proxy_secret = False
+    created_proxy_secret = False
+    had_users_json = False
+    created_users_json = False
+    had_allowed_sni = False
+    prev_allowed_snis: list[str] | None = None
+    allowed_snis_modified = False
     try:
         max_conn_val = int(config_data.get("max_connections", 512 if role == "egress" else 256))
         cand_compose.write_text(
@@ -3783,6 +4192,7 @@ def main(argv: list[str] | None = None) -> int:
                 health_port=pub_port,
                 include_build=include_build,
                 max_connections=max_conn_val,
+                extra_hosts=compose_extra_hosts,
             ),
             encoding="utf-8",
         )
@@ -3804,26 +4214,48 @@ def main(argv: list[str] | None = None) -> int:
 
         # Ensure secrets / tokens in the state volume without overwriting existing ones.
         if role in ("direct", "edge"):
+            if mode == "self-steal":
+                print(f"Проверка локального HTTPS-сайта {cover_val} (SNI {sni}) из временного контейнера...")
+                cov_ok, cov_out = check_cover_from_container(cand_base, cover_val, sni)
+                if not cov_ok:
+                    print(
+                        err_text(
+                            f"Проверка cover перед развёртыванием не пройдена: {cover_val} (SNI {sni})."
+                        ),
+                        file=sys.stderr,
+                    )
+                    if cov_out:
+                        print(f"Детали: {cov_out}", file=sys.stderr)
+                    print(
+                        "Текущая конфигурация и allowed-sni.txt не затронуты. Проверьте, что nginx/Caddy запущен и отдаёт валидный сертификат для этого SNI.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                print(ok_text(f"Сертификат и доступность {cover_val} из контейнера подтверждены."))
             try:
-                created = ensure_generated_secret(cand_base, "/var/lib/mtevil/proxy-secret")
-                if not volume_file_exists(cand_base, "/var/lib/mtevil/users.json"):
+                had_proxy_secret = volume_file_exists(cand_base, "/var/lib/mtevil/proxy-secret")
+                created_proxy_secret = ensure_generated_secret(cand_base, "/var/lib/mtevil/proxy-secret")
+                had_users_json = volume_file_exists(cand_base, "/var/lib/mtevil/users.json")
+                if not had_users_json:
                     write_volume_secret_stdin(cand_base, "/var/lib/mtevil/users.json", "{}")
-                prev_sni = str(saved_cfg.get("sni") or "").strip()
-                snis_to_record = [sni] + ([prev_sni] if prev_sni and prev_sni != sni else [])
-                record_allowed_snis_in_volume(cand_base, snis_to_record)
+                    created_users_json = True
             except RuntimeError as exc:
                 summary, action = diagnose_docker_error(str(exc), args.image)
                 print(f"{err_text(summary)}\nДальше: {action}", file=sys.stderr)
                 return 1
-            print("Секрет клиента: создан в томе state." if created else "Секрет клиента: сохранён прежний из тома state.")
+            print(
+                "Секрет клиента: создан в томе state."
+                if created_proxy_secret
+                else "Секрет клиента: сохранён прежний из тома state."
+            )
 
         if role == "egress":
-            has_egress_tok = volume_file_exists(cand_base, "/var/lib/mtevil/egress-token")
+            has_egress_tok = volume_file_exists(cand_base, effective_egress_token_file)
             if has_egress_tok and ask_yes_no("Использовать существующий токен MTV2 из тома state?", default=True):
                 print("Токен MTV2: сохранён прежний из тома state.")
             else:
                 if has_egress_tok:
-                    previous_token = read_volume_secret(cand_base, "/var/lib/mtevil/egress-token")
+                    previous_token = read_volume_secret(cand_base, effective_egress_token_file)
                 is_first = ask_yes_no("Это первый узел egress (сгенерировать новый токен MTV2)?", default=True)
                 if is_first:
                     pending_token = secrets.token_hex(16)
@@ -3834,22 +4266,22 @@ def main(argv: list[str] | None = None) -> int:
                     pending_token = ask_hidden_token("Введите токен MTV2 с основного egress")
                     print("Токен MTV2 подготовлен для проверки (рабочий том state пока не изменён).")
         elif role == "edge":
-            has_edge_tok = volume_file_exists(cand_base, "/var/lib/mtevil/egress-token")
+            has_edge_tok = volume_file_exists(cand_base, effective_egress_token_file)
             if has_edge_tok and ask_yes_no(
                 "Использовать существующий токен MTV2 из тома state?", default=True
             ):
                 print("Токен MTV2: сохранён прежний из тома state.")
             else:
                 if has_edge_tok:
-                    previous_token = read_volume_secret(cand_base, "/var/lib/mtevil/egress-token")
+                    previous_token = read_volume_secret(cand_base, effective_egress_token_file)
                 pending_token = ask_hidden_token("Введите общий токен MTV2")
                 print("Токен MTV2 подготовлен для проверки (рабочий том state пока не изменён).")
 
         if pending_token is not None:
-            write_volume_secret_stdin(cand_base, "/var/lib/mtevil/egress-token.candidate", pending_token)
+            write_volume_secret_stdin(cand_base, cand_token_path, pending_token)
             cand_token_in_volume = True
             cand_cfg_data = dict(config_data)
-            cand_cfg_data["egress_token_file"] = "/var/lib/mtevil/egress-token.candidate"
+            cand_cfg_data["egress_token_file"] = cand_token_path
             cand_config.write_text(json.dumps(cand_cfg_data, indent=2) + "\n", encoding="utf-8")
 
         cfg_check = run(
@@ -3864,7 +4296,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(ok_text("Конфигурация проверена"))
 
-        if role in ("direct", "edge"):
+        if role in ("direct", "edge") and mode != "self-steal":
             cover_ok, cover_out = check_cover_from_container(cand_base, cover, sni)
             if cover_ok:
                 print(ok_text("HTTPS-сайт для маскировки доступен"))
@@ -3909,26 +4341,11 @@ def main(argv: list[str] | None = None) -> int:
             health_port=pub_port,
             include_build=include_build,
             max_connections=max_conn_val,
+            extra_hosts=compose_extra_hosts,
         )
     finally:
         if cand_token_in_volume:
-            try:
-                run(
-                    cand_base
-                    + [
-                        "run",
-                        "--rm",
-                        "--no-deps",
-                        "--entrypoint",
-                        "/bin/rm",
-                        compose_write_service(cand_base),
-                        "-f",
-                        "/var/lib/mtevil/egress-token.candidate",
-                    ],
-                    check=False,
-                )
-            except Exception:
-                pass
+            remove_volume_file(cand_base, cand_token_path)
         for p in (cand_compose, cand_env, cand_config):
             if p.exists():
                 p.unlink()
@@ -3948,8 +4365,15 @@ def main(argv: list[str] | None = None) -> int:
         (deploy_dir / "compose.yaml").write_text(live_compose, encoding="utf-8")
         (deploy_dir / ".env").write_text(env_text, encoding="utf-8")
         (deploy_dir / "config.json").write_text(cfg_text, encoding="utf-8")
+        if role in ("direct", "edge"):
+            had_allowed_sni = volume_file_exists(base, "/var/lib/mtevil/allowed-sni.txt")
+            prev_allowed_snis = read_allowed_snis_from_volume(base) if had_allowed_sni else []
+            prev_sni = str(saved_cfg.get("sni") or "").strip()
+            snis_to_record = [sni] + ([prev_sni] if prev_sni and prev_sni != sni else [])
+            record_allowed_snis_in_volume(base, snis_to_record)
+            allowed_snis_modified = True
         if pending_token is not None:
-            write_volume_secret_stdin(base, "/var/lib/mtevil/egress-token", pending_token)
+            write_volume_secret_stdin(base, effective_egress_token_file, pending_token)
             token_written_to_volume = True
             print("Токен MTV2 сохранён в томе state.")
         run(base + ["config", "--quiet"])
@@ -4009,6 +4433,7 @@ def main(argv: list[str] | None = None) -> int:
                         health_port=pub_port,
                         include_build=include_build,
                         max_connections=max_conn_val,
+                        extra_hosts=compose_extra_hosts,
                     ),
                     encoding="utf-8",
                 )
@@ -4021,28 +4446,95 @@ def main(argv: list[str] | None = None) -> int:
             print_failed_container_logs(base)
             print(f"Проверьте логи этой установки: docker compose {compose_ref} logs --tail=100 {compose_service(base)}", file=sys.stderr)
             return 1
+
+        self_steal_probe_ok: bool | None = None
+        self_steal_probe_detail = ""
+        self_steal_local_https_detail = ""
+        if mode == "self-steal":
+            local_https_host = "127.0.0.1" if bind_ip in ("0.0.0.0", "::", "127.0.0.1") else bind_ip
+            https_ok, https_detail = probe_local_https_get(local_https_host, int(pub_port), sni)
+            if not https_ok:
+                print(
+                    err_text(
+                        f"Проверка локального HTTPS GET через вход mtevil ({local_https_host}:{pub_port}, SNI {sni}) не пройдена: {https_detail}"
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            self_steal_local_https_detail = https_detail
+            print(ok_text(f"Локальный HTTPS GET через вход mtevil ({local_https_host}:{pub_port}): {https_detail}."))
+
+            self_steal_probe_ok, self_steal_probe_detail = verify_telegram_e2e(base, attempts=3, delay_s=2.0)
+            if not self_steal_probe_ok:
+                print(
+                    err_text(
+                        f"Сквозная проверка Telegram через self-steal не пройдена: {self_steal_probe_detail or 'нет ответа'}"
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            print(ok_text(f"Локальная проверка Telegram: {self_steal_probe_detail}."))
+
         deployment_committed = True
     finally:
         if not deployment_committed:
             if backed_up_files:
                 restore_backup_files(deploy_dir, backed_up_files)
                 print("Прежние файлы конфигурации восстановлены.", file=sys.stderr)
-            if token_written_to_volume and previous_token is not None:
+            if pinned_rollback_tag and (deploy_dir / ".env.rollback").is_file():
                 try:
-                    write_volume_secret_stdin(base, "/var/lib/mtevil/egress-token", previous_token)
+                    shutil.copyfile(deploy_dir / ".env.rollback", deploy_dir / ".env")
+                except OSError:
+                    pass
+            if token_written_to_volume:
+                try:
+                    if previous_token is not None:
+                        write_volume_secret_stdin(base, effective_egress_token_file, previous_token)
+                    else:
+                        remove_volume_file(base, effective_egress_token_file)
                 except Exception as exc:
                     print(err_text(f"Не удалось вернуть прежний токен MTV2 в том state: {exc}"), file=sys.stderr)
+            if allowed_snis_modified:
+                try:
+                    if had_allowed_sni and prev_allowed_snis:
+                        write_volume_secret_stdin(base, "/var/lib/mtevil/allowed-sni.txt", "\n".join(prev_allowed_snis))
+                    elif not had_allowed_sni:
+                        remove_volume_file(base, "/var/lib/mtevil/allowed-sni.txt")
+                except Exception as exc:
+                    print(err_text(f"Не удалось восстановить allowed-sni.txt в томе state: {exc}"), file=sys.stderr)
+            if created_proxy_secret:
+                remove_volume_file(base, "/var/lib/mtevil/proxy-secret")
+            if created_users_json:
+                remove_volume_file(base, "/var/lib/mtevil/users.json")
             if had_backup and up_attempted:
                 rb_up = run(base + ["up", "-d", "--force-recreate", compose_service(base)], check=False)
                 if rb_up.returncode == 0:
                     try:
                         wait_healthy(base)
-                        print("Прежний контейнер снова работает.", file=sys.stderr)
+                        if prev_image_id:
+                            restored_ref = pinned_rollback_tag or str(saved.get("MTEVIL_IMAGE") or args.image)
+                            restored_id, _, _ = inspect_current_deployment(deploy_dir, project, restored_ref)
+                            if restored_id and restored_id != prev_image_id:
+                                print(
+                                    err_text(
+                                        f"Откат перезапустил контейнер с другим image ID ({restored_id} вместо {prev_image_id})."
+                                    ),
+                                    file=sys.stderr,
+                                )
+                            else:
+                                print("Прежний контейнер снова работает.", file=sys.stderr)
+                        else:
+                            print("Прежний контейнер снова работает.", file=sys.stderr)
                     except Exception as exc:
                         print(err_text(f"Прежний контейнер запущен, но не подтвердил статус healthy: {exc}"), file=sys.stderr)
                 else:
                     rb_err = (rb_up.stderr or rb_up.stdout or "").strip()
                     print(err_text(f"Не удалось перезапустить прежний контейнер после отката: {rb_err}"), file=sys.stderr)
+            elif not had_backup and up_attempted:
+                svc_name = compose_service(base)
+                run(base + ["stop", svc_name], check=False)
+                run(base + ["rm", "-f", svc_name], check=False)
+                print("Неудачный кандидат остановлен.", file=sys.stderr)
 
     print(ok_text("Контейнер исправен (Docker healthcheck: локальный порт отвечает)"))
     status_cmd = format_status_command(deploy_dir)
@@ -4052,19 +4544,36 @@ def main(argv: list[str] | None = None) -> int:
     port_status = "skipped"
     port_detail = ""
     if role in ("direct", "edge"):
-        print_step(3, total_steps, "Сквозная проверка связи с Telegram")
-        probe_ok, probe_detail = verify_telegram_e2e(base, attempts=3, delay_s=2.0)
-        if probe_ok:
-            print(ok_text(f"Проверено: прокси отвечает как Telegram ({probe_detail})."))
+        if mode == "self-steal":
+            probe_ok = self_steal_probe_ok
+            probe_detail = self_steal_probe_detail
+            print_step(3, total_steps, "Проверка self-steal (локально подтверждено, публичный адрес — справочно)")
+            print(ok_text(f"Локальный вход: HTTPS GET ({self_steal_local_https_detail}) и Telegram ({probe_detail}) работают."))
+            pub_target = f"{public_host}:{pub_port}"
+            pub_https_ok, pub_https_detail = probe_local_https_get(public_host, int(pub_port), sni)
+            if pub_https_ok:
+                print(ok_text(f"Публичный HTTPS GET ({pub_target}): {pub_https_detail}."))
+            else:
+                print(
+                    warn_text(
+                        f"Публичный HTTPS GET ({pub_target}) с самого сервера не подтверждён (справочно, откат не требуется): {pub_https_detail}."
+                    ),
+                    file=sys.stderr,
+                )
         else:
-            print(warn_text("Не удалось получить ответ Telegram через прокси."), file=sys.stderr)
-            if probe_detail:
-                print(f"  Причина: {probe_detail}", file=sys.stderr)
-            print(
-                "  Прокси запущен, но доступ к Telegram DC с этого сервера не подтверждён. "
-                "Проверьте исходящий доступ к Telegram и логи контейнера (см. deploy/README.md).",
-                file=sys.stderr,
-            )
+            print_step(3, total_steps, "Сквозная проверка связи с Telegram")
+            probe_ok, probe_detail = verify_telegram_e2e(base, attempts=3, delay_s=2.0)
+            if probe_ok:
+                print(ok_text(f"Проверено: прокси отвечает как Telegram ({probe_detail})."))
+            else:
+                print(warn_text("Не удалось получить ответ Telegram через прокси."), file=sys.stderr)
+                if probe_detail:
+                    print(f"  Причина: {probe_detail}", file=sys.stderr)
+                print(
+                    "  Прокси запущен, но доступ к Telegram DC с этого сервера не подтверждён. "
+                    "Проверьте исходящий доступ к Telegram и логи контейнера (см. deploy/README.md).",
+                    file=sys.stderr,
+                )
         print_step(4, total_steps, "Проверка порта на публичном адресе")
         port_status, port_detail = check_public_port_reachable(public_host, int(pub_port))
         if port_status == "ok":
@@ -4116,7 +4625,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\n" + heading("Что указать на входном сервере (edge)"))
         print(f"  Адрес выхода: {bind_ip}:{pub_port}")
         print("  Режим в мастере на edge: 2 (Расширенная настройка) -> 2 (edge)")
-        print(f"  Получить токен безопасно: docker compose {compose_ref} exec -T {compose_service(base)} cat /var/lib/mtevil/egress-token")
+        print(f"  Получить токен безопасно: docker compose {compose_ref} exec -T {compose_service(base)} cat {effective_egress_token_file}")
         print("  Миграция на MTV3: сначала обновите egress, затем все edge; после этого выставите \"egress_accept_legacy\": false в config.json egress.")
         print()
         print(f"Каталог установки: {deploy_dir}")
