@@ -4259,6 +4259,7 @@ def main(argv: list[str] | None = None) -> int:
             return run_adtag_command(deploy_dir, sub_action, sub_val)
         return run_traffic_command(deploy_dir, live=args.live, max_iterations=args.iterations)
 
+    explicit_no_build = bool(args.no_build)
     if args.command in ("setup", "reconfigure"):
         deploy_dir = (args.dir or default_deploy_dir(repo_root)).resolve()
         saved_pre = load_existing_defaults(deploy_dir)
@@ -4588,7 +4589,7 @@ def main(argv: list[str] | None = None) -> int:
             config_data["egress_upstreams"] = upstreams
             config_data.setdefault("egress_token_file", "/var/lib/mtevil/egress-token")
 
-        tproxy_include_build = not args.no_build and tproxy_image_override is None
+        tproxy_include_build = not explicit_no_build and tproxy_image_override is None
         tproxy_config_data = render_tproxy_config(
             webproxy_hostname,
             webproxy_base_path,
@@ -5036,9 +5037,11 @@ def main(argv: list[str] | None = None) -> int:
         cand_config.write_text(cfg_text, encoding="utf-8")
 
         run(cand_base + ["config", "--quiet"])
-        if not args.no_build:
-            print("\nСборка Docker-образа mtevil...")
-            build_proc = run(cand_base + ["build"], capture=True, check=False)
+        need_tproxy_build = bool(mode == "webproxy" and tproxy_sidecar_cand and tproxy_sidecar_cand.get("include_build"))
+        if not args.no_build or need_tproxy_build:
+            build_targets = [] if not args.no_build else ["tproxy"]
+            print("\nСборка Docker-образа...")
+            build_proc = run(cand_base + ["build", *build_targets], capture=True, check=False)
             if build_proc.returncode != 0:
                 detail = (build_proc.stderr or build_proc.stdout or "").strip()
                 summary, action = diagnose_docker_error(detail, args.image)

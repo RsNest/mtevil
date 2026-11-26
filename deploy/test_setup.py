@@ -3455,6 +3455,142 @@ class SetupValidationTests(unittest.TestCase):
             self.assertEqual(len(wp_stat), 1)
             self.assertIn("ready (proxy.example.com/phcf2vfe7zgbrslg", wp_stat[0])
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux Docker host")
+    def test_linux_real_webproxy_tproxy_sidecar_bridge_site_and_user_sync(self):
+        image = self._local_image()
+        if image is None:
+            self.skipTest("no local mtevil image available")
+
+        used_ports: set[int] = set()
+
+        def next_distinct_port() -> int:
+            for _ in range(20):
+                cand = self._free_port()
+                if cand not in used_ports:
+                    used_ports.add(cand)
+                    return cand
+            self.fail("could not allocate distinct free port")
+
+        mtevil_port = next_distinct_port()
+        tp_listen_port = next_distinct_port()
+        tp_admin_port = next_distinct_port()
+        proj = f"mtevil-wp-{mtevil_port}"
+        tp_tag = f"mtevil-tproxy:test-{mtevil_port}"
+        dc = _MockTelegramDcServer()
+
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as tp_ctx:
+            d = Path(td)
+            base = setup.compose_cmd(d, proj)
+            try:
+                # 1. Build the real pinned telegramdesktop/tproxy-server sidecar image.
+                (Path(tp_ctx) / "Dockerfile").write_text(setup.render_tproxy_dockerfile(), encoding="utf-8")
+                setup.run(["docker", "build", "-t", tp_tag, tp_ctx])
+
+                # 2. Deploy mtevil + tproxy via setup --webproxy.
+                stdin_wp = "\n".join(
+                    [
+                        "proxy.example.com",
+                        "t7k2xw",
+                        "websocket",
+                        f"127.0.0.1:{tp_listen_port}",
+                        f"127.0.0.1:{tp_admin_port}",
+                        "static",
+                        "127.0.0.1",
+                        str(mtevil_port),
+                    ]
+                ) + "\n"
+                err_wp = io.StringIO()
+                out_wp = io.StringIO()
+                with (
+                    mock.patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "setup.py",
+                            "setup",
+                            "--webproxy",
+                            "--no-build",
+                            "--dir",
+                            str(d),
+                            "--project",
+                            proj,
+                            "--image",
+                            image,
+                            "--tproxy-image",
+                            tp_tag,
+                        ],
+                    ),
+                    mock.patch.object(setup, "verify_telegram_e2e", return_value=(True, "mock-initial")),
+                    mock.patch.object(setup, "probe_local_https_get", return_value=(False, "not-bound-443")),
+                    mock.patch.object(setup, "check_public_port_reachable", return_value=("unreachable", "not-bound-443")),
+                    mock.patch.object(sys, "stdin", io.StringIO(stdin_wp)),
+                    mock.patch.object(sys, "stdout", out_wp),
+                    mock.patch.object(sys, "stderr", err_wp),
+                ):
+                    self.assertEqual(setup.main(), 0, msg=err_wp.getvalue())
+
+                # Point mtevil DCs to our local mock DC and verify real E2E + /readyz.
+                cfg = setup.json.loads((d / "config.json").read_text(encoding="utf-8"))
+                cfg["dc"] = [f"{i}=127.0.0.1:{dc.port}" for i in range(1, 6)]
+                (d / "config.json").write_text(setup.json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+                setup.run(base + ["up", "-d", "--force-recreate", setup.compose_service(base), "tproxy"])
+                setup.wait_healthy(base)
+                setup.wait_service_healthy(base, "tproxy")
+
+                ok_e2e, detail_e2e = setup.verify_telegram_e2e(base, attempts=2, delay_s=0.5, dc=2)
+                self.assertTrue(ok_e2e, msg=detail_e2e)
+                rd_ok, rd_detail = setup.probe_tproxy_readyz(f"127.0.0.1:{tp_admin_port}")
+                self.assertTrue(rd_ok, msg=rd_detail)
+
+                def http_get(path: str):
+                    import urllib.error
+                    import urllib.request
+
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{tp_listen_port}{path}",
+                        headers={"Host": "proxy.example.com", "X-Forwarded-For": "203.0.113.7"},
+                        method="GET",
+                    )
+                    try:
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            return resp.status, dict(resp.headers.items()), resp.read().decode("utf-8", errors="replace")
+                    except urllib.error.HTTPError as exc:
+                        return exc.code, dict(exc.headers.items()), exc.read().decode("utf-8", errors="replace")
+
+                # 3. Unauthenticated GET / serves the static index.html; wrong bridge does NOT reveal bridge.
+                st_root, _hdr_root, body_root = http_get("/")
+                self.assertEqual(st_root, 200)
+                self.assertIn("Service online.", body_root)
+
+                st_bad, _hdr_bad, body_bad = http_get("/t7k2xw/?bridge=wrong")
+                self.assertNotIn("https://proxy.example.com/t7k2xw/", body_bad)
+                self.assertIn(st_bad, (200, 404))
+
+                # 4. Authentic derived bridge capability serves the tproxy-server JS bridge with CSP!
+                default_sec = setup.read_volume_secret(base, "/var/lib/mtevil/proxy-secret")
+                cap_default = setup.derive_webproxy_capability("proxy.example.com", "t7k2xw", default_sec)
+                st_br, hdr_br, body_br = http_get(f"/t7k2xw/?bridge={cap_default}")
+                self.assertEqual(st_br, 200, msg=body_br[:300])
+                hdr_lower = {k.lower(): v for k, v in hdr_br.items()}
+                self.assertIn("content-security-policy", hdr_lower)
+                self.assertIn("https://proxy.example.com/t7k2xw/", body_br)
+                self.assertIn("websocket", body_br)
+
+                # 5. mtevilctl user add bob syncs tproxy-profiles.json and activates bob's capability!
+                with mock.patch.object(sys, "stdout", io.StringIO()):
+                    self.assertEqual(setup.run_user_command(d, "add", "bob"), 0)
+                setup.wait_service_healthy(base, "tproxy")
+                users_map = setup.read_users_map_from_volume(base)
+                self.assertIn("bob", users_map)
+                cap_bob = setup.derive_webproxy_capability("proxy.example.com", "t7k2xw", users_map["bob"])
+                st_bob, _hdr_bob, body_bob = http_get(f"/t7k2xw/?bridge={cap_bob}")
+                self.assertEqual(st_bob, 200, msg=body_bob[:300])
+                self.assertIn("https://proxy.example.com/t7k2xw/", body_bob)
+            finally:
+                dc.close()
+                setup.run(base + ["down", "-v", "--remove-orphans"], check=False)
+                setup.run(["docker", "rmi", "-f", tp_tag], check=False)
+
 
 if __name__ == "__main__":
     prog = unittest.main(verbosity=2, exit=False)
