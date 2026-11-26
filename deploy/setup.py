@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Interactive Docker Compose setup wizard for mtevil (Direct, Egress, Edge)."""
 import argparse
+import base64
 import copy
 import datetime
 import errno
 import getpass
 import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -18,9 +20,17 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 
 DEFAULT_IMAGE = "mtevil:local"
+DEFAULT_TPROXY_IMAGE = "mtevil-tproxy:local"
+TPROXY_SERVER_COMMIT = "c8adb8b7c6b7fc46c12ae3acb68be9070c26a8e8"
+TPROXY_SERVER_TARBALL_SHA256 = "a78b48f536180143dd7005785ca397310c36ee0b132e19949a45d64f586ab549"
+DEFAULT_TPROXY_LISTEN = "127.0.0.1:8080"
+DEFAULT_TPROXY_ADMIN = "127.0.0.1:8081"
+DEFAULT_TPROXY_BACKEND_PORT = 2398
+TPROXY_CARRIER_MODES = ("websocket", "https", "https-lanes", "websocket-lanes")
 SEMVER_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:-(alpha|beta|rc)\.(\d+))?$")
 STAGE_RANKS = {"alpha": 1, "beta": 2, "rc": 3, None: 4}
 
@@ -558,6 +568,332 @@ def validate_sni(value: str) -> str:
     return v
 
 
+WEBPROXY_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def validate_webproxy_hostname(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw or any(ch in raw for ch in ":/@?#[]") or raw.endswith("."):
+        raise ValueError("укажите DNS-домен без https://, порта, пути и точки в конце")
+    if not raw.isascii():
+        try:
+            raw = raw.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise ValueError(f"некорректный IDN-домен ({exc})") from exc
+    host = raw.lower()
+    if len(host) > 253 or is_ip_literal(host) or "." not in host:
+        raise ValueError("IP-адрес и одноуровневые имена не допускаются для WEB Proxy")
+    for label in host.split("."):
+        if not label or len(label) > 63 or label.startswith("-") or label.endswith("-"):
+            raise ValueError(f"некорректная метка DNS '{label}'")
+        if not all(("a" <= ch <= "z") or ("0" <= ch <= "9") or ch == "-" for ch in label):
+            raise ValueError("домен должен быть в нижнем регистре ASCII / Punycode (xn--...)")
+    return host
+
+
+def validate_webproxy_base_path(value: str) -> str:
+    path = (value or "").strip()
+    if path == "":
+        return ""
+    if len(path) > 128:
+        raise ValueError("base_path не должен превышать 128 символов")
+    if path.startswith("/") or path.endswith("/"):
+        raise ValueError("указывайте base_path без начального и конечного '/' (например, app/bridge)")
+    for segment in path.split("/"):
+        if not segment or not WEBPROXY_SEGMENT_RE.match(segment):
+            raise ValueError("сегменты base_path должны соответствовать [A-Za-z0-9][A-Za-z0-9_-]*")
+    return path
+
+
+def validate_loopback_endpoint(value: str) -> str:
+    parsed = parse_cover_host_port(value)
+    if parsed is None:
+        raise ValueError("укажите числовой loopback-адрес с портом (например, 127.0.0.1:8080)")
+    host, port = parsed
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise ValueError("требуется числовой loopback IP (127.0.0.1 или ::1)") from exc
+    if not ip.is_loopback:
+        raise ValueError("адрес должен быть loopback (127.0.0.1 или ::1)")
+    if ":" in host:
+        return f"[{ip}]:{port}"
+    return f"{ip}:{port}"
+
+
+def validate_webproxy_upstream(value: str) -> str:
+    raw = (value or "").strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme != "http" or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment:
+        raise ValueError("укажите http://<loopback_ip>:<port> без пути и параметров (например, http://127.0.0.1:3000)")
+    endpoint = validate_loopback_endpoint(parsed.netloc)
+    return f"http://{endpoint}"
+
+
+def validate_webproxy_carrier_mode(value: str) -> str:
+    mode = (value or "").strip().lower()
+    if mode not in TPROXY_CARRIER_MODES:
+        raise ValueError(f"допустимые режимы: {', '.join(TPROXY_CARRIER_MODES)}")
+    return mode
+
+
+def _decode_webproxy_secret_bytes(secret_hex: str) -> bytes:
+    cleaned = (secret_hex or "").strip().lower()
+    if len(cleaned) not in (32, 34):
+        raise ValueError("secret must be 32 hex chars (or 34 with dd prefix)")
+    raw = bytes.fromhex(cleaned)
+    if len(raw) == 17 and raw[0] != 0xDD:
+        raise ValueError("17-byte secret must start with dd")
+    return raw
+
+
+def derive_webproxy_capability(hostname: str, base_path: str, secret_hex: str) -> str:
+    host = validate_webproxy_hostname(hostname)
+    prefix = validate_webproxy_base_path(base_path)
+    secret_bytes = _decode_webproxy_secret_bytes(secret_hex)
+    if prefix == "":
+        ctx = f"tdesktop-web-proxy-bridge-v1\n{host}".encode("utf-8")
+    else:
+        ctx = f"tdesktop-web-proxy-bridge-v2\n{host}\n{prefix}".encode("utf-8")
+    digest = hmac.new(secret_bytes, ctx, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def format_webproxy_links(hostname: str, base_path: str, secret_hex: str) -> dict[str, str]:
+    host = validate_webproxy_hostname(hostname)
+    prefix = validate_webproxy_base_path(base_path)
+    secret_bytes = _decode_webproxy_secret_bytes(secret_hex)
+    raw16 = secret_bytes[1:] if len(secret_bytes) == 17 else secret_bytes
+    if prefix == "":
+        server_val = host
+        link_secret = raw16.hex()
+        server_q = host
+    else:
+        server_val = f"{host}/{prefix}"
+        link_secret = base64.urlsafe_b64encode(b"\x70" + raw16).rstrip(b"=").decode("ascii")
+        server_q = urllib.parse.quote(server_val, safe=".-_")
+    return {
+        "server": server_val,
+        "secret": link_secret,
+        "tme": f"https://t.me/webproxy?server={server_q}&secret={link_secret}",
+        "tg": f"tg://webproxy?server={server_q}&secret={link_secret}",
+    }
+
+
+def render_tproxy_dockerfile() -> str:
+    return f"""# Reproducible build of telegramdesktop/tproxy-server pinned by commit & SHA-256
+FROM golang:1.22-alpine AS build
+ARG TPROXY_COMMIT={TPROXY_SERVER_COMMIT}
+ARG TPROXY_SHA256={TPROXY_SERVER_TARBALL_SHA256}
+WORKDIR /build
+RUN wget -qO tproxy.tar.gz "https://codeload.github.com/telegramdesktop/tproxy-server/tar.gz/${{TPROXY_COMMIT}}" \\
+    && echo "${{TPROXY_SHA256}}  tproxy.tar.gz" | sha256sum -c - \\
+    && tar -xzf tproxy.tar.gz --strip-components=1 \\
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/tproxy-server ./cmd/tproxy-server
+
+FROM alpine:3.20
+LABEL org.opencontainers.image.title="mtevil-tproxy-sidecar" \\
+      org.opencontainers.image.revision="{TPROXY_SERVER_COMMIT}"
+RUN apk add --no-cache ca-certificates \\
+    && addgroup -g 10001 -S mtevil \\
+    && adduser -u 10001 -G mtevil -S -D -H -s /sbin/nologin mtevil
+COPY --from=build /out/tproxy-server /usr/local/bin/tproxy-server
+USER 10001:10001
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/tproxy-server"]
+CMD ["-config", "/etc/tproxy-server/config.json"]
+"""
+
+
+def render_tproxy_config(
+    public_hostname: str,
+    base_path: str,
+    listen: str,
+    admin_listen: str,
+    *,
+    public_dir: str | None = None,
+    public_upstream: str | None = None,
+    token_key_file: str = "/var/lib/mtevil/tproxy-token.key",
+    profiles_file: str = "/var/lib/mtevil/tproxy-profiles.json",
+) -> dict[str, object]:
+    if bool(public_dir) == bool(public_upstream):
+        raise ValueError("ровно один из public_dir или public_upstream должен быть задан")
+    cfg: dict[str, object] = {
+        "public_hostname": validate_webproxy_hostname(public_hostname),
+        "base_path": validate_webproxy_base_path(base_path),
+        "listen": validate_loopback_endpoint(listen),
+        "admin_listen": validate_loopback_endpoint(admin_listen),
+        "static_routes": "exact",
+        "token_key_file": token_key_file,
+        "profiles_file": profiles_file,
+        "enable_pprof": False,
+        "limits": {
+            "max_header_bytes": 16384,
+            "max_body_bytes": 2097152,
+            "max_frame_payload": 1048576,
+            "carrier_batch_bytes": 2097152,
+            "max_streams_per_session": 128,
+            "max_closed_stream_ids": 4096,
+            "max_pending_per_session": 33554432,
+            "max_pending_global": 536870912,
+            "max_pending_items_per_session": 16384,
+            "max_pending_items_global": 262144,
+            "max_sessions_per_ip": 0,
+            "max_sessions_global": 128,
+            "max_streams_global": 4096,
+            "max_backend_dials_in_flight": 256,
+            "new_sessions_per_minute": 600,
+            "new_sessions_burst": 128,
+            "new_streams_per_minute": 6000,
+            "new_streams_burst": 512,
+            "max_bootstraps_per_ip": 0,
+            "max_bootstraps_global": 512,
+            "new_bootstraps_per_minute": 1200,
+            "new_bootstraps_burst": 256,
+            "max_profiles": 32,
+        },
+        "timeouts": {
+            "backend_dial": "5s",
+            "long_poll": "25s",
+            "reconnect_grace": "2m",
+            "bootstrap_lifetime": "2m",
+            "read_header": "10s",
+            "idle": "75s",
+            "shutdown": "15s",
+        },
+    }
+    if public_dir:
+        cfg["public_dir"] = public_dir
+    else:
+        cfg["public_upstream"] = validate_webproxy_upstream(str(public_upstream))
+    return cfg
+
+
+def build_tproxy_profiles_data(
+    default_secret_hex: str | None,
+    users_map: dict[str, str],
+    backend: str,
+    carrier_mode: str = "websocket",
+) -> dict[str, object]:
+    backend_ep = validate_loopback_endpoint(backend)
+    carrier = validate_webproxy_carrier_mode(carrier_mode)
+    profiles: list[dict[str, object]] = []
+    seen_secrets: set[str] = set()
+    if default_secret_hex:
+        sec_clean = default_secret_hex.strip().lower()
+        _decode_webproxy_secret_bytes(sec_clean)
+        profiles.append(
+            {
+                "name": "default",
+                "secret": sec_clean,
+                "backend": backend_ep,
+                "carrier_mode": carrier,
+            }
+        )
+        seen_secrets.add(sec_clean)
+    for name in sorted(users_map.keys()):
+        if name == "default":
+            continue
+        sec_clean = str(users_map[name]).strip().lower()
+        _decode_webproxy_secret_bytes(sec_clean)
+        if sec_clean in seen_secrets:
+            continue
+        profiles.append(
+            {
+                "name": name[:64],
+                "secret": sec_clean,
+                "backend": backend_ep,
+                "carrier_mode": carrier,
+            }
+        )
+        seen_secrets.add(sec_clean)
+    if not profiles:
+        raise ValueError("не найден ни один клиентский секрет для формирования profiles.json")
+    return {"profiles": profiles}
+
+
+def render_webproxy_reverse_proxy_snippets(
+    hostname: str,
+    base_path: str,
+    tproxy_listen: str,
+) -> tuple[str, str]:
+    host = validate_webproxy_hostname(hostname)
+    prefix = validate_webproxy_base_path(base_path)
+    listen_ep = validate_loopback_endpoint(tproxy_listen)
+    if prefix == "":
+        caddy = f"""# Caddyfile (рекомендуемый вариант: весь домен идёт через tproxy-server)
+{{
+    servers {{
+        protocols h1 h2
+        timeouts {{
+            read_header 10s
+            read_body 60s
+        }}
+    }}
+}}
+
+{host} {{
+    encode zstd gzip
+    header {{
+        -Via
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    }}
+    reverse_proxy {listen_ep} {{
+        transport http {{
+            response_header_timeout 40s
+        }}
+    }}
+}}
+"""
+        loc_path = "/"
+    else:
+        caddy = f"""# Caddyfile (режим сосуществования на существующем сайте по префиксу /{prefix}/)
+{host} {{
+    handle /{prefix}/* {{
+        encode zstd gzip
+        header -Via
+        reverse_proxy {listen_ep} {{
+            transport http {{
+                response_header_timeout 40s
+            }}
+        }}
+    }}
+    # Ниже — ваша обычная конфигурация сайта для остальных маршрутов
+}}
+"""
+        loc_path = f"/{prefix}/"
+
+    nginx = f"""# nginx (HTTPS 443 -> tproxy-server; НЕ включайте access_log с query-строкой!)
+map $http_upgrade $connection_upgrade {{
+    default upgrade;
+    ''      close;
+}}
+
+server {{
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name {host};
+
+    ssl_certificate     /etc/letsencrypt/live/{host}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{host}/privkey.pem;
+    access_log off;
+
+    location {loc_path} {{
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 65s;
+        proxy_send_timeout 65s;
+        proxy_pass http://{listen_ep};
+    }}
+}}
+"""
+    return caddy, nginx
+
+
 def validate_port(value: str) -> int:
     p = int(value)
     if not (1 <= p <= 65535):
@@ -801,6 +1137,7 @@ def render_compose(
     extra_volumes: list[str] | None = None,
     max_connections: int | None = None,
     extra_hosts: list[str] | None = None,
+    tproxy_sidecar: dict[str, object] | None = None,
 ) -> str:
     try:
         rel_context = os.path.relpath(repo_root, deploy_dir).replace("\\", "/")
@@ -824,6 +1161,55 @@ def render_compose(
     if not network_host and extra_hosts:
         extra_hosts_block = "\n    extra_hosts:\n" + "".join(f'      - "{h}"\n' for h in extra_hosts).rstrip("\n")
     extra_vol_lines = "".join(f"\n      - {v}" for v in (extra_volumes or []))
+    tproxy_block = ""
+    if tproxy_sidecar:
+        tp_cfg_name = str(tproxy_sidecar.get("config_name") or "tproxy.json")
+        tp_admin = str(tproxy_sidecar.get("admin_listen") or DEFAULT_TPROXY_ADMIN)
+        tp_build = bool(tproxy_sidecar.get("include_build", True))
+        tp_site_mount = str(tproxy_sidecar.get("site_host_dir") or "").strip()
+        tp_df_name = str(tproxy_sidecar.get("dockerfile_name") or "tproxy.Dockerfile")
+        tp_build_lines = (
+            f"\n    build:\n      context: .\n      dockerfile: {tp_df_name}"
+            if tp_build
+            else ""
+        )
+        tp_site_line = f"\n      - {tp_site_mount}:/srv/tproxy-site:ro" if tp_site_mount else ""
+        tproxy_block = f"""
+  tproxy:
+    image: ${{MTEVIL_TPROXY_IMAGE:-{DEFAULT_TPROXY_IMAGE}}}{tp_build_lines}
+    init: true
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      {deployment_service(deploy_dir)}:
+        condition: service_healthy
+    volumes:
+      - ./{tp_cfg_name}:/etc/tproxy-server/config.json:ro
+      - state:/var/lib/mtevil:ro{tp_site_line}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: "0.50"
+    pids_limit: 128
+    ulimits:
+      nofile:
+        soft: {nofile}
+        hard: {nofile}
+    stop_grace_period: 15s
+    healthcheck:
+      test: [CMD, /usr/bin/wget, -q, -O, /dev/null, "http://{tp_admin}/readyz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+"""
     return f"""name: ${{MTEVIL_PROJECT:-mtevil-{role}}}
 
 x-image: &image
@@ -862,7 +1248,7 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
+{tproxy_block}
   init:
     <<: *image
     profiles: [tools]
@@ -1042,10 +1428,66 @@ def record_allowed_snis_in_volume(base: list[str], snis: list[str]) -> list[str]
     return merged
 
 
-def wait_healthy(base: list[str], timeout_s: int = 45) -> None:
+def ensure_tproxy_token_key(
+    base: list[str],
+    path_in_container: str = "/var/lib/mtevil/tproxy-token.key",
+) -> bool:
+    """Ensure a 32-byte raw random signing key (mode 0600) exists in the state volume."""
+    if volume_file_exists(base, path_in_container):
+        return False
+    run(
+        base
+        + [
+            "run",
+            "--rm",
+            "-T",
+            "--no-deps",
+            "--entrypoint",
+            "/bin/sh",
+            compose_write_service(base),
+            "-c",
+            f'umask 077 && head -c 32 /dev/urandom > {path_in_container} && test "$(wc -c < {path_in_container})" -eq 32',
+        ],
+        capture=True,
+    )
+    return True
+
+
+def read_users_map_from_volume(
+    base: list[str],
+    users_path: str = "/var/lib/mtevil/users.json",
+) -> dict[str, str]:
+    if not volume_file_exists(base, users_path):
+        return {}
+    raw = read_volume_secret(base, users_path)
+    if not raw:
+        return {}
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(k): str(v).strip().lower() for k, v in parsed.items() if str(k).strip() and str(v).strip()}
+
+
+def sync_tproxy_profiles_in_volume(
+    base: list[str],
+    backend: str,
+    carrier_mode: str = "websocket",
+    *,
+    secret_path: str = "/var/lib/mtevil/proxy-secret",
+    users_path: str = "/var/lib/mtevil/users.json",
+    profiles_path: str = "/var/lib/mtevil/tproxy-profiles.json",
+) -> dict[str, object]:
+    default_sec = read_volume_secret(base, secret_path) if volume_file_exists(base, secret_path) else None
+    users_map = read_users_map_from_volume(base, users_path)
+    profiles_data = build_tproxy_profiles_data(default_sec, users_map, backend, carrier_mode)
+    write_volume_secret_stdin(base, profiles_path, json.dumps(profiles_data, indent=2))
+    return profiles_data
+
+
+def wait_service_healthy(base: list[str], service_name: str, timeout_s: int = 45) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        cid = run(base + ["ps", "-q", compose_service(base)]).stdout.strip()
+        cid = run(base + ["ps", "-q", service_name]).stdout.strip()
         if cid:
             raw = run(["docker", "inspect", cid]).stdout
             info = json.loads(raw)[0]
@@ -1053,7 +1495,11 @@ def wait_healthy(base: list[str], timeout_s: int = 45) -> None:
             if status == "healthy":
                 return
         time.sleep(1.0)
-    raise TimeoutError("mtevil container did not become healthy within 45s")
+    raise TimeoutError(f"{service_name} container did not become healthy within {timeout_s}s")
+
+
+def wait_healthy(base: list[str], timeout_s: int = 45) -> None:
+    wait_service_healthy(base, compose_service(base), timeout_s=timeout_s)
 
 
 def print_failed_container_logs(base: list[str]) -> None:
@@ -1187,12 +1633,18 @@ def check_public_port_reachable(host: str, port: int, timeout_s: float = 3.0) ->
 
 
 def choose_wizard_mode(default: str = "simple") -> str:
-    default_num = {"simple": "1", "advanced": "2", "self-steal": "3"}.get(default, "1")
+    default_num = {
+        "simple": "1",
+        "advanced": "2",
+        "self-steal": "3",
+        "webproxy": "4",
+    }.get(default, "1")
     print()
     print(heading("Выберите режим установки"))
     print("  1. Простая установка · один VPS [по умолчанию]")
     print("  2. Расширенная настройка · ручные параметры и несколько серверов")
     print("  3. self-steal · маскировка под свой локальный HTTPS-сайт (nginx/Caddy)")
+    print("  4. webproxy · Telegram WEB Proxy через tproxy-server за Caddy/nginx")
     print()
     while True:
         choice = ask("Ваш выбор", default_num).lower()
@@ -1202,7 +1654,9 @@ def choose_wizard_mode(default: str = "simple") -> str:
             return "advanced"
         if choice in ("3", "self-steal", "self_steal", "selfsteal"):
             return "self-steal"
-        print("Некорректный выбор: введите 1 (простая установка), 2 (расширенная) или 3 (self-steal).")
+        if choice in ("4", "webproxy", "web-proxy", "web_proxy", "tproxy"):
+            return "webproxy"
+        print("Некорректный выбор: введите 1 (простая), 2 (расширенная), 3 (self-steal) или 4 (webproxy).")
 
 
 def ask_simple_confirm() -> str:
@@ -1502,6 +1956,18 @@ def load_existing_defaults(deploy_dir: Path) -> dict[str, object]:
             defaults["network_host"] = "network_mode: host" in compose_txt
         except Exception:
             pass
+    tproxy_file = deploy_dir / "tproxy.json"
+    if tproxy_file.is_file():
+        try:
+            tp_cfg = json.loads(tproxy_file.read_text(encoding="utf-8"))
+            if isinstance(tp_cfg, dict):
+                defaults["tproxy_config"] = tp_cfg
+        except Exception:
+            pass
+    defaults["webproxy"] = bool(
+        str(defaults.get("MTEVIL_WEBPROXY") or "").strip() == "1"
+        or "tproxy_config" in defaults
+    )
     return defaults
 
 
@@ -2631,7 +3097,10 @@ def run_status_command(deploy_dir: Path) -> int:
         print(me_line)
     for diag_line in format_handshake_diag_lines(role, rstats):
         print(diag_line)
-    if running:
+    if saved.get("webproxy"):
+        for wp_line in format_webproxy_status_lines(base, saved):
+            print(wp_line)
+    if running and not (saved.get("webproxy") and bind_val in ("127.0.0.1", "::1")):
         for cov_line in format_cover_status_lines(role, saved_cfg, bind_val, port_val):
             print(cov_line)
     if role == "egress":
@@ -2922,6 +3391,92 @@ def resolve_client_server_and_port(saved: dict[str, object]) -> tuple[str, int]:
     return host, port
 
 
+def probe_tproxy_readyz(admin_listen: str, timeout_s: float = 3.0) -> tuple[bool, str]:
+    try:
+        req = urllib.request.Request(f"http://{admin_listen}/readyz", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            status = getattr(resp, "status", 200)
+            body = resp.read(256).decode("utf-8", errors="replace").strip()
+            if 200 <= status < 300:
+                return True, body or f"HTTP {status}"
+            return False, f"HTTP {status}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def format_webproxy_status_lines(base: list[str], saved: dict[str, object]) -> list[str]:
+    tp_cfg = saved.get("tproxy_config") if isinstance(saved.get("tproxy_config"), dict) else {}
+    host = str(tp_cfg.get("public_hostname") or saved.get("MTEVIL_WEBPROXY_HOST") or "").strip()
+    prefix = str(tp_cfg.get("base_path") or saved.get("MTEVIL_WEBPROXY_BASE_PATH") or "").strip()
+    carrier = str(saved.get("MTEVIL_WEBPROXY_CARRIER") or "websocket").strip()
+    admin_ep = str(tp_cfg.get("admin_listen") or saved.get("MTEVIL_TPROXY_ADMIN") or DEFAULT_TPROXY_ADMIN).strip()
+    route_desc = f"{host}/{prefix}" if (host and prefix) else (host or "не задан")
+    cid_proc = run(base + ["ps", "-q", "tproxy"], check=False)
+    cid = cid_proc.stdout.strip() if cid_proc.returncode == 0 else ""
+    if not cid:
+        return [f"  WEB Proxy:         {err_text(f'tproxy остановлен ({route_desc}, carrier={carrier})')}"]
+    ok, detail = probe_tproxy_readyz(admin_ep)
+    if ok:
+        listen_ep = tp_cfg.get("listen", DEFAULT_TPROXY_LISTEN)
+        return [f"  WEB Proxy:         {ok_text(f'ready ({route_desc}, carrier={carrier}, listen={listen_ep})')}"]
+    return [f"  WEB Proxy:         {warn_text(f'tproxy запущен, /readyz не готов ({detail})')}"]
+
+
+def render_webproxy_links_output(
+    base: list[str],
+    saved: dict[str, object],
+    *,
+    user: str | None = None,
+    all_users: bool = False,
+) -> list[str]:
+    tp_cfg = saved.get("tproxy_config") if isinstance(saved.get("tproxy_config"), dict) else {}
+    host = str(tp_cfg.get("public_hostname") or saved.get("MTEVIL_WEBPROXY_HOST") or "").strip()
+    prefix = str(tp_cfg.get("base_path") or saved.get("MTEVIL_WEBPROXY_BASE_PATH") or "").strip()
+    if not host:
+        raise ValueError("не найден public_hostname для WEB Proxy")
+    saved_cfg = saved.get("config") if isinstance(saved.get("config"), dict) else {}
+    sec_path = str(saved_cfg.get("secret_file") or "/var/lib/mtevil/proxy-secret")
+    users_path = str(saved_cfg.get("users_file") or "/var/lib/mtevil/users.json")
+    default_sec = read_volume_secret(base, sec_path) if volume_file_exists(base, sec_path) else None
+    users_map = read_users_map_from_volume(base, users_path)
+
+    entries: list[tuple[str, str]] = []
+    if user:
+        if user == "default":
+            if not default_sec:
+                raise ValueError("основной секрет default отсутствует")
+            entries.append(("default", default_sec))
+        elif user in users_map:
+            entries.append((user, users_map[user]))
+        else:
+            raise ValueError(f"пользователь '{user}' не найден")
+    elif all_users:
+        if default_sec:
+            entries.append(("default", default_sec))
+        for uname in sorted(users_map.keys()):
+            entries.append((uname, users_map[uname]))
+    else:
+        if default_sec:
+            entries.append(("default", default_sec))
+        elif users_map:
+            first_u = sorted(users_map.keys())[0]
+            entries.append((first_u, users_map[first_u]))
+    if not entries:
+        raise ValueError("не найдено ни одного секрета для генерации ссылки WEB Proxy")
+
+    lines: list[str] = []
+    multi = len(entries) > 1 or bool(user) or all_users
+    for uname, sec in entries:
+        info = format_webproxy_links(host, prefix, sec)
+        if multi:
+            lines.append(f"[{uname}] {info['tme']}")
+            lines.append(f"[{uname}] {info['tg']}")
+        else:
+            lines.append(info["tme"])
+            lines.append(info["tg"])
+    return lines
+
+
 def run_link_command(
     deploy_dir: Path,
     *,
@@ -2929,6 +3484,7 @@ def run_link_command(
     user: str | None = None,
     all_users: bool = False,
     dd: bool = False,
+    webproxy_only: bool = False,
 ) -> int:
     check_prerequisites()
     compose_file = deploy_dir / "compose.yaml"
@@ -2947,6 +3503,10 @@ def run_link_command(
         print(err_text("Команда link доступна только на сервере входа (direct или edge)."), file=sys.stderr)
         return 1
 
+    if webproxy_only and not saved.get("webproxy"):
+        print(err_text("Режим WEB Proxy не настроен для этой установки (запустите mtevilctl setup --webproxy)."), file=sys.stderr)
+        return 1
+
     if sni_override is not None:
         try:
             sni_override = validate_sni(sni_override)
@@ -2957,6 +3517,19 @@ def run_link_command(
     project = str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
     base = compose_cmd(deploy_dir, project)
     svc = compose_service(base)
+    bind_val = str(saved.get("MTEVIL_BIND") or "").strip()
+
+    if saved.get("webproxy") and not dd and sni_override is None:
+        try:
+            wp_lines = render_webproxy_links_output(base, saved, user=user, all_users=all_users)
+        except Exception as exc:
+            print(err_text(f"Не удалось сформировать ссылку WEB Proxy: {exc}"), file=sys.stderr)
+            return 1
+        print("\n".join(wp_lines))
+        if webproxy_only or bind_val in ("127.0.0.1", "::1"):
+            return 0
+        print()
+
     server_host, pub_port = resolve_client_server_and_port(saved)
 
     cid = run(base + ["ps", "-q", svc], check=False).stdout.strip()
@@ -3149,6 +3722,24 @@ def run_user_command(deploy_dir: Path, action: str, name: str | None = None, sni
                 print(f"  - {n}")
         return 0
 
+    def _sync_tproxy_users_if_enabled() -> None:
+        if not saved.get("webproxy"):
+            return
+        port_raw = str(saved.get("MTEVIL_PORT") or DEFAULT_TPROXY_BACKEND_PORT).strip()
+        backend_ep = f"127.0.0.1:{port_raw}"
+        carrier = str(saved.get("MTEVIL_WEBPROXY_CARRIER") or "websocket").strip()
+        sec_path = str(saved_cfg.get("secret_file") or "/var/lib/mtevil/proxy-secret")
+        sync_tproxy_profiles_in_volume(
+            base,
+            backend_ep,
+            carrier,
+            secret_path=sec_path,
+            users_path=users_file,
+        )
+        tp_cid = run(base + ["ps", "-q", "tproxy"], check=False).stdout.strip()
+        if tp_cid:
+            run(base + ["restart", "tproxy"], check=False)
+
     if act == "add":
         if not name:
             print(err_text("Укажите имя пользователя: mtevilctl user add <имя>"), file=sys.stderr)
@@ -3158,6 +3749,7 @@ def run_user_command(deploy_dir: Path, action: str, name: str | None = None, sni
             detail = (proc.stderr or proc.stdout or "").strip()
             print(err_text(f"Не удалось добавить пользователя '{name}': {detail}"), file=sys.stderr)
             return 1
+        _sync_tproxy_users_if_enabled()
         print(ok_text(f"Пользователь '{name}' добавлен (подхватится прокси автоматически без перезапуска)."))
         return run_link_command(deploy_dir, sni_override=sni_override, user=name)
 
@@ -3170,6 +3762,7 @@ def run_user_command(deploy_dir: Path, action: str, name: str | None = None, sni
             detail = (proc.stderr or proc.stdout or "").strip()
             print(err_text(f"Не удалось удалить пользователя '{name}': {detail}"), file=sys.stderr)
             return 1
+        _sync_tproxy_users_if_enabled()
         print(ok_text(f"Пользователь '{name}' удалён (доступ отозван без перезапуска контейнера)."))
         return 0
 
@@ -3589,14 +4182,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-build", action="store_true", help="Skip docker compose build")
     parser.add_argument(
         "--mode",
-        choices=("simple", "advanced", "self-steal"),
+        choices=("simple", "advanced", "self-steal", "webproxy"),
         default=None,
-        help="Wizard mode: simple (single VPS direct), advanced (manual settings & edge/egress), or self-steal",
+        help="Wizard mode: simple, advanced, self-steal, or webproxy (tproxy-server sidecar)",
     )
     parser.add_argument(
         "--self-steal",
         action="store_true",
         help="Configure mtevil in self-steal mode against an existing local HTTPS server (nginx/Caddy)",
+    )
+    parser.add_argument(
+        "--webproxy",
+        action="store_true",
+        help="Configure Telegram WEB Proxy (tproxy-server sidecar behind Caddy/nginx) or print webproxy links",
+    )
+    parser.add_argument(
+        "--tproxy-image",
+        type=str,
+        default=None,
+        help="Optional prebuilt Docker image for the tproxy-server sidecar",
     )
     parser.add_argument("--role", choices=("direct", "egress", "edge"), default=None, help="Deployment role (non-interactive override)")
     parser.add_argument(
@@ -3640,6 +4244,7 @@ def main(argv: list[str] | None = None) -> int:
                 user=args.user,
                 all_users=args.all,
                 dd=args.dd,
+                webproxy_only=args.webproxy,
             )
         if args.command == "sni":
             target_sni = args.extra[0] if args.extra else args.sni
@@ -3654,6 +4259,7 @@ def main(argv: list[str] | None = None) -> int:
             return run_adtag_command(deploy_dir, sub_action, sub_val)
         return run_traffic_command(deploy_dir, live=args.live, max_iterations=args.iterations)
 
+    explicit_no_build = bool(args.no_build)
     if args.command in ("setup", "reconfigure"):
         deploy_dir = (args.dir or default_deploy_dir(repo_root)).resolve()
         saved_pre = load_existing_defaults(deploy_dir)
@@ -3666,13 +4272,21 @@ def main(argv: list[str] | None = None) -> int:
         deploy_dir = (args.dir or (repo_root / "deploy" / "wizard")).resolve()
 
     # Resolve conflicting CLI flags explicitly before prompting.
+    if args.self_steal and args.webproxy:
+        print(err_text("Конфликт параметров: не сочетайте --self-steal и --webproxy одновременно."), file=sys.stderr)
+        return 1
     if args.self_steal:
-        if args.mode in ("simple", "advanced"):
-            print(err_text("Конфликт параметров: не сочетайте --self-steal с --mode simple/advanced."), file=sys.stderr)
+        if args.mode in ("simple", "advanced", "webproxy"):
+            print(err_text("Конфликт параметров: не сочетайте --self-steal с другим --mode."), file=sys.stderr)
             return 1
         args.mode = "self-steal"
-    if args.mode == "self-steal" and args.role == "egress":
-        print(err_text("Конфликт параметров: режим self-steal несовместим с ролью egress."), file=sys.stderr)
+    if args.webproxy:
+        if args.mode in ("simple", "advanced", "self-steal"):
+            print(err_text("Конфликт параметров: не сочетайте --webproxy с другим --mode."), file=sys.stderr)
+            return 1
+        args.mode = "webproxy"
+    if args.mode in ("self-steal", "webproxy") and args.role == "egress":
+        print(err_text(f"Конфликт параметров: режим {args.mode} несовместим с ролью egress."), file=sys.stderr)
         return 1
     if args.mode == "simple" and args.role in ("edge", "egress"):
         print(
@@ -3729,12 +4343,28 @@ def main(argv: list[str] | None = None) -> int:
         mode = "advanced"
     elif args.role == "direct":
         mode = "simple"
+    elif existing_cfg.exists() and saved.get("webproxy"):
+        mode = choose_wizard_mode(default="webproxy")
     elif existing_cfg.exists() and is_local_cover_addr(str(saved_cfg.get("cover") or "")):
         mode = choose_wizard_mode(default="self-steal")
     elif existing_cfg.exists() and existing_role in ("edge", "egress"):
         mode = "advanced"
     else:
         mode = choose_wizard_mode(default="simple")
+
+    tproxy_sidecar_cand: dict[str, object] | None = None
+    tproxy_sidecar_live: dict[str, object] | None = None
+    tproxy_config_data: dict[str, object] | None = None
+    webproxy_carrier = "websocket"
+    webproxy_hostname = ""
+    webproxy_base_path = ""
+    tproxy_listen_ep = DEFAULT_TPROXY_LISTEN
+    tproxy_admin_ep = DEFAULT_TPROXY_ADMIN
+    tproxy_image_override = (
+        args.tproxy_image
+        or os.environ.get("MTEVIL_TPROXY_IMAGE")
+        or str(saved.get("MTEVIL_TPROXY_IMAGE") or "")
+    ).strip() or None
 
     default_bind = str(saved.get("MTEVIL_BIND") or "0.0.0.0")
     default_sni = str(saved_cfg.get("sni") or DEFAULT_SNI)
@@ -3816,6 +4446,172 @@ def main(argv: list[str] | None = None) -> int:
                 "fake_tls_cert_jitter": 16,
                 "flight_shaping": True,
             }
+
+    if mode == "webproxy":
+        role = args.role if args.role in ("direct", "edge") else (existing_role if existing_role in ("direct", "edge") else "direct")
+        project = args.project or str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
+        saved_tp = saved.get("tproxy_config") if isinstance(saved.get("tproxy_config"), dict) else {}
+        print("\n" + heading("Настройка WEB Proxy (tproxy-server за Caddy/nginx)"))
+        print("  Клиент Telegram подключается по настоящему HTTPS/WebSocket к вашему домену (порт 443 на Caddy/nginx),")
+        print("  tproxy-server принимает мультиплексированные потоки на loopback и передаёт чистый dd-поток в mtevil.")
+
+        host_seed_raw = str(
+            saved_tp.get("public_hostname")
+            or saved.get("MTEVIL_WEBPROXY_HOST")
+            or (saved.get("MTEVIL_PUBLIC_HOST") if not is_ip_literal(str(saved.get("MTEVIL_PUBLIC_HOST") or "")) else "")
+            or ""
+        ).strip() or None
+        webproxy_hostname = ask_validated(
+            "Публичный домен сайта для WEB Proxy (без https:// и порта)",
+            validate_webproxy_hostname,
+            host_seed_raw,
+        )
+        base_seed = str(saved_tp.get("base_path") or saved.get("MTEVIL_WEBPROXY_BASE_PATH") or "").strip()
+        webproxy_base_path = ask_validated(
+            "Префикс пути base_path (пусто — корень домена /)",
+            validate_webproxy_base_path,
+            base_seed,
+        )
+        carrier_seed = str(saved.get("MTEVIL_WEBPROXY_CARRIER") or "websocket").strip()
+        webproxy_carrier = ask_validated(
+            "Режим транспорта (websocket / https / https-lanes / websocket-lanes)",
+            validate_webproxy_carrier_mode,
+            carrier_seed,
+        )
+        listen_seed = str(saved_tp.get("listen") or saved.get("MTEVIL_TPROXY_LISTEN") or DEFAULT_TPROXY_LISTEN).strip()
+        admin_seed = str(saved_tp.get("admin_listen") or saved.get("MTEVIL_TPROXY_ADMIN") or DEFAULT_TPROXY_ADMIN).strip()
+        while True:
+            tproxy_listen_ep = ask_validated(
+                "Локальный HTTP-адрес tproxy-server (за Caddy/nginx)",
+                validate_loopback_endpoint,
+                listen_seed,
+            )
+            tproxy_admin_ep = ask_validated(
+                "Локальный admin-адрес tproxy-server (/healthz, /readyz)",
+                validate_loopback_endpoint,
+                admin_seed,
+            )
+            if tproxy_listen_ep == tproxy_admin_ep:
+                print(err_text("Ошибка: адреса listen и admin_listen у tproxy-server должны различаться."))
+                continue
+            break
+
+        existing_upstream = str(saved_tp.get("public_upstream") or "").strip()
+        site_mode_default = "upstream" if existing_upstream else "static"
+        while True:
+            site_choice = ask(
+                "Источник публичного сайта при обычном входе браузера (static — каталог ./site, upstream — локальный HTTP-сервер)",
+                site_mode_default,
+            ).strip().lower()
+            if site_choice in ("static", "1", "dir", "site"):
+                webproxy_public_upstream = None
+                webproxy_site_mount = "./site"
+                break
+            if site_choice in ("upstream", "2", "http", "app"):
+                webproxy_public_upstream = ask_validated(
+                    "URL локального HTTP-приложения сайта",
+                    validate_webproxy_upstream,
+                    existing_upstream or "http://127.0.0.1:3000",
+                )
+                webproxy_site_mount = ""
+                break
+            print("Укажите static (каталог ./site) или upstream (http://127.0.0.1:PORT).")
+
+        saved_bind_raw = str(saved.get("MTEVIL_BIND") or "").strip()
+        wp_bind_default = saved_bind_raw if (saved.get("webproxy") and saved_bind_raw) else "127.0.0.1"
+        saved_port_raw = str(saved.get("MTEVIL_PORT") or "").strip()
+        wp_port_default = (
+            saved_port_raw
+            if (saved.get("webproxy") and saved_port_raw and saved_port_raw != "443")
+            else str(DEFAULT_TPROXY_BACKEND_PORT)
+        )
+        bind_ip = ask_validated(
+            "IP привязки mtevil (127.0.0.1 — только за tproxy-server; 0.0.0.0 — также внешний порт FakeTLS)",
+            validate_ip,
+            wp_bind_default,
+        )
+        pub_port = ask_validated("TCP-порт бэкенда mtevil", validate_port, wp_port_default)
+        tp_listen_port = parse_cover_host_port(tproxy_listen_ep)[1]
+        tp_admin_port = parse_cover_host_port(tproxy_admin_ep)[1]
+        if pub_port in (tp_listen_port, tp_admin_port):
+            print(err_text(f"Конфликт портов: порт mtevil ({pub_port}) совпадает с портом tproxy-server."), file=sys.stderr)
+            return 1
+        pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=False)
+        use_network_host = True
+        pub_port, use_network_host = resolve_network_host_port(
+            deploy_dir,
+            project,
+            bind_ip,
+            pub_port,
+            True,
+            explicit_network_host=True,
+            show_link_note=False,
+            allow_bridge_fallback=False,
+        )
+
+        public_host = webproxy_hostname
+        sni = webproxy_hostname
+        cover = default_cover if not is_local_cover_addr(default_cover) else f"{DEFAULT_SNI}:443"
+        same_role_reconfigure = existing_cfg.exists() and existing_role == role
+        if same_role_reconfigure:
+            config_data = copy.deepcopy(saved_cfg)
+            config_data["role"] = "direct" if role == "direct" else "edge"
+            config_data.setdefault("secret_file", "/var/lib/mtevil/proxy-secret")
+            config_data.setdefault("users_file", "/var/lib/mtevil/users.json")
+            config_data.setdefault("replay_file", "/var/lib/mtevil-replay/replay.bin")
+            config_data["sni"] = sni
+            config_data["cover"] = cover
+            config_data["enable_dd"] = True
+        else:
+            config_data = {
+                "role": "direct" if role == "direct" else "edge",
+                "listen": f"{bind_ip}:{pub_port}",
+                "secret_file": "/var/lib/mtevil/proxy-secret",
+                "users_file": "/var/lib/mtevil/users.json",
+                "replay_file": "/var/lib/mtevil-replay/replay.bin",
+                "sni": sni,
+                "cover": cover,
+                "enable_dd": True,
+                "max_connections": 256,
+                "client_hello_timeout_secs": 5,
+                "handshake_timeout_secs": 10,
+                "idle_timeout_secs": 300,
+                "drain_timeout_secs": 5,
+                "fake_tls_cert_jitter": 16,
+                "flight_shaping": True,
+            }
+            if role == "direct":
+                config_data["dc"] = DEFAULT_DCS
+        if role == "edge":
+            saved_upstreams = saved_cfg.get("egress_upstreams") if isinstance(saved_cfg.get("egress_upstreams"), list) else []
+            default_upstreams = ",".join(str(x) for x in saved_upstreams) if saved_upstreams else None
+            upstreams = ask_egress_upstreams(default_upstreams)
+            config_data["egress_upstreams"] = upstreams
+            config_data.setdefault("egress_token_file", "/var/lib/mtevil/egress-token")
+
+        tproxy_include_build = not explicit_no_build and tproxy_image_override is None
+        tproxy_config_data = render_tproxy_config(
+            webproxy_hostname,
+            webproxy_base_path,
+            tproxy_listen_ep,
+            tproxy_admin_ep,
+            public_dir="/srv/tproxy-site" if webproxy_site_mount else None,
+            public_upstream=webproxy_public_upstream,
+        )
+        tproxy_sidecar_cand = {
+            "config_name": "tproxy.candidate.json",
+            "dockerfile_name": "tproxy.candidate.Dockerfile",
+            "admin_listen": tproxy_admin_ep,
+            "include_build": tproxy_include_build,
+            "site_host_dir": webproxy_site_mount,
+        }
+        tproxy_sidecar_live = {
+            "config_name": "tproxy.json",
+            "dockerfile_name": "tproxy.Dockerfile",
+            "admin_listen": tproxy_admin_ep,
+            "include_build": tproxy_include_build,
+            "site_host_dir": webproxy_site_mount,
+        }
 
     if mode == "self-steal":
         role = args.role if args.role in ("direct", "edge") else (existing_role if existing_role in ("direct", "edge") else "direct")
@@ -4120,9 +4916,13 @@ def main(argv: list[str] | None = None) -> int:
     cand_compose = deploy_dir / "compose.candidate.yaml"
     cand_env = deploy_dir / ".env.candidate"
     cand_config = deploy_dir / "config.candidate.json"
+    cand_tproxy_cfg = deploy_dir / "tproxy.candidate.json"
+    cand_tproxy_df = deploy_dir / "tproxy.candidate.Dockerfile"
+    cand_tproxy_profiles = "/var/lib/mtevil/tproxy-profiles.candidate.json"
     pending_token: str | None = None
     previous_token: str | None = None
     cand_token_in_volume = False
+    cand_tproxy_profiles_in_volume = False
     token_written_to_volume = False
     had_backup = False
     env_text = (
@@ -4132,6 +4932,16 @@ def main(argv: list[str] | None = None) -> int:
         f"MTEVIL_PORT={pub_port}\n"
         + (f"MTEVIL_PUBLIC_HOST={public_host}\n" if role in ("direct", "edge") else "")
     )
+    if mode == "webproxy":
+        env_text += (
+            "MTEVIL_WEBPROXY=1\n"
+            f"MTEVIL_WEBPROXY_HOST={webproxy_hostname}\n"
+            f"MTEVIL_WEBPROXY_BASE_PATH={webproxy_base_path}\n"
+            f"MTEVIL_WEBPROXY_CARRIER={webproxy_carrier}\n"
+            f"MTEVIL_TPROXY_LISTEN={tproxy_listen_ep}\n"
+            f"MTEVIL_TPROXY_ADMIN={tproxy_admin_ep}\n"
+            + (f"MTEVIL_TPROXY_IMAGE={tproxy_image_override}\n" if tproxy_image_override else "")
+        )
     cfg_text = json.dumps(config_data, indent=2) + "\n"
 
     cand_base = compose_cmd(deploy_dir, project, "compose.candidate.yaml", ".env.candidate")
@@ -4176,10 +4986,36 @@ def main(argv: list[str] | None = None) -> int:
     created_proxy_secret = False
     had_users_json = False
     created_users_json = False
+    created_tproxy_token_key = False
+    had_tproxy_profiles = False
+    prev_tproxy_profiles_raw: str | None = None
+    tproxy_profiles_modified = False
+    created_site_dir = False
+    created_site_index = False
     had_allowed_sni = False
     prev_allowed_snis: list[str] | None = None
     allowed_snis_modified = False
+    preflight_passed = False
     try:
+        if mode == "webproxy" and tproxy_config_data is not None:
+            if tproxy_config_data.get("public_dir"):
+                site_dir = deploy_dir / "site"
+                if not site_dir.exists():
+                    site_dir.mkdir(parents=True, exist_ok=True)
+                    created_site_dir = True
+                idx_file = site_dir / "index.html"
+                if not idx_file.exists():
+                    idx_file.write_text(
+                        f"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>{webproxy_hostname}</title></head>"
+                        f"<body><main><h1>{webproxy_hostname}</h1><p>Service online.</p></main></body></html>\n",
+                        encoding="utf-8",
+                    )
+                    created_site_index = True
+            cand_tproxy_df.write_text(render_tproxy_dockerfile(), encoding="utf-8")
+            cand_tp_cfg = dict(tproxy_config_data)
+            cand_tp_cfg["profiles_file"] = cand_tproxy_profiles
+            cand_tproxy_cfg.write_text(json.dumps(cand_tp_cfg, indent=2) + "\n", encoding="utf-8")
+
         max_conn_val = int(config_data.get("max_connections", 512 if role == "egress" else 256))
         cand_compose.write_text(
             render_compose(
@@ -4193,6 +5029,7 @@ def main(argv: list[str] | None = None) -> int:
                 include_build=include_build,
                 max_connections=max_conn_val,
                 extra_hosts=compose_extra_hosts,
+                tproxy_sidecar=tproxy_sidecar_cand,
             ),
             encoding="utf-8",
         )
@@ -4200,9 +5037,11 @@ def main(argv: list[str] | None = None) -> int:
         cand_config.write_text(cfg_text, encoding="utf-8")
 
         run(cand_base + ["config", "--quiet"])
-        if not args.no_build:
-            print("\nСборка Docker-образа mtevil...")
-            build_proc = run(cand_base + ["build"], capture=True, check=False)
+        need_tproxy_build = bool(mode == "webproxy" and tproxy_sidecar_cand and tproxy_sidecar_cand.get("include_build"))
+        if not args.no_build or need_tproxy_build:
+            build_targets = [] if not args.no_build else ["tproxy"]
+            print("\nСборка Docker-образа...")
+            build_proc = run(cand_base + ["build", *build_targets], capture=True, check=False)
             if build_proc.returncode != 0:
                 detail = (build_proc.stderr or build_proc.stdout or "").strip()
                 summary, action = diagnose_docker_error(detail, args.image)
@@ -4296,7 +5135,41 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(ok_text("Конфигурация проверена"))
 
-        if role in ("direct", "edge") and mode != "self-steal":
+        if mode == "webproxy":
+            try:
+                created_tproxy_token_key = ensure_tproxy_token_key(cand_base)
+                sync_tproxy_profiles_in_volume(
+                    cand_base,
+                    f"127.0.0.1:{pub_port}",
+                    webproxy_carrier,
+                    profiles_path=cand_tproxy_profiles,
+                )
+                cand_tproxy_profiles_in_volume = True
+            except Exception as exc:
+                print(err_text(f"Не удалось подготовить ключи/профили tproxy-server в томе state: {exc}"), file=sys.stderr)
+                return 1
+            tp_check = run(
+                cand_base
+                + [
+                    "run",
+                    "--rm",
+                    "--no-deps",
+                    "tproxy",
+                    "-config",
+                    "/etc/tproxy-server/config.json",
+                    "-check",
+                ],
+                check=False,
+            )
+            if tp_check.returncode != 0:
+                detail = (tp_check.stderr or tp_check.stdout or "").strip()
+                print(err_text("Конфигурация tproxy-server не прошла проверку (-check)."), file=sys.stderr)
+                if detail:
+                    print(detail, file=sys.stderr)
+                return 1
+            print(ok_text("Конфигурация tproxy-server проверена"))
+
+        if role in ("direct", "edge") and mode not in ("self-steal", "webproxy"):
             cover_ok, cover_out = check_cover_from_container(cand_base, cover, sni)
             if cover_ok:
                 print(ok_text("HTTPS-сайт для маскировки доступен"))
@@ -4342,21 +5215,50 @@ def main(argv: list[str] | None = None) -> int:
             include_build=include_build,
             max_connections=max_conn_val,
             extra_hosts=compose_extra_hosts,
+            tproxy_sidecar=tproxy_sidecar_live,
         )
+        preflight_passed = True
     finally:
         if cand_token_in_volume:
             remove_volume_file(cand_base, cand_token_path)
-        for p in (cand_compose, cand_env, cand_config):
+        if cand_tproxy_profiles_in_volume:
+            remove_volume_file(cand_base, cand_tproxy_profiles)
+        for p in (cand_compose, cand_env, cand_config, cand_tproxy_cfg, cand_tproxy_df):
             if p.exists():
                 p.unlink()
+        if not preflight_passed:
+            if created_tproxy_token_key:
+                remove_volume_file(cand_base, "/var/lib/mtevil/tproxy-token.key")
+                created_tproxy_token_key = False
+            if created_proxy_secret:
+                remove_volume_file(cand_base, "/var/lib/mtevil/proxy-secret")
+                created_proxy_secret = False
+            if created_users_json:
+                remove_volume_file(cand_base, "/var/lib/mtevil/users.json")
+                created_users_json = False
+            if created_site_index:
+                idx_p = deploy_dir / "site" / "index.html"
+                if idx_p.exists():
+                    idx_p.unlink()
+                if created_site_dir:
+                    try:
+                        (deploy_dir / "site").rmdir()
+                    except OSError:
+                        pass
+                created_site_index = False
+                created_site_dir = False
 
     up_attempted = False
     up_succeeded = False
     deployment_committed = False
     backed_up_files: list[str] = []
+    newly_created_host_files: list[str] = []
     try:
         # Back up existing deployment files before promoting validated candidate.
-        for name in ("compose.yaml", ".env", "config.json"):
+        managed_names = ["compose.yaml", ".env", "config.json"]
+        if mode == "webproxy" or (deploy_dir / "tproxy.json").exists() or (deploy_dir / "tproxy.Dockerfile").exists():
+            managed_names.extend(["tproxy.json", "tproxy.Dockerfile"])
+        for name in managed_names:
             live = deploy_dir / name
             if live.exists():
                 live.replace(deploy_dir / f"{name}.bak")
@@ -4365,6 +5267,22 @@ def main(argv: list[str] | None = None) -> int:
         (deploy_dir / "compose.yaml").write_text(live_compose, encoding="utf-8")
         (deploy_dir / ".env").write_text(env_text, encoding="utf-8")
         (deploy_dir / "config.json").write_text(cfg_text, encoding="utf-8")
+        if mode == "webproxy" and tproxy_config_data is not None:
+            for extra_name in ("tproxy.json", "tproxy.Dockerfile"):
+                if extra_name not in backed_up_files:
+                    newly_created_host_files.append(extra_name)
+            (deploy_dir / "tproxy.json").write_text(json.dumps(tproxy_config_data, indent=2) + "\n", encoding="utf-8")
+            (deploy_dir / "tproxy.Dockerfile").write_text(render_tproxy_dockerfile(), encoding="utf-8")
+            had_tproxy_profiles = volume_file_exists(base, "/var/lib/mtevil/tproxy-profiles.json")
+            if had_tproxy_profiles:
+                prev_tproxy_profiles_raw = read_volume_secret(base, "/var/lib/mtevil/tproxy-profiles.json")
+            sync_tproxy_profiles_in_volume(
+                base,
+                f"127.0.0.1:{pub_port}",
+                webproxy_carrier,
+                profiles_path="/var/lib/mtevil/tproxy-profiles.json",
+            )
+            tproxy_profiles_modified = True
         if role in ("direct", "edge"):
             had_allowed_sni = volume_file_exists(base, "/var/lib/mtevil/allowed-sni.txt")
             prev_allowed_snis = read_allowed_snis_from_volume(base) if had_allowed_sni else []
@@ -4384,6 +5302,8 @@ def main(argv: list[str] | None = None) -> int:
             if had_backup:
                 up_args.append("--force-recreate")
             up_args.append(compose_service(base))
+            if mode == "webproxy":
+                up_args.append("tproxy")
             up_attempted = True
             up_proc = run(base + up_args, check=False)
             if up_proc.returncode == 0:
@@ -4441,15 +5361,19 @@ def main(argv: list[str] | None = None) -> int:
         print(ok_text("Контейнер запущен"))
         try:
             wait_healthy(base)
-        except TimeoutError:
-            print(err_text("Контейнер не перешёл в статус healthy за 45 секунд."), file=sys.stderr)
+            if mode == "webproxy":
+                wait_service_healthy(base, "tproxy")
+        except TimeoutError as exc:
+            print(err_text(f"Сервис не перешёл в статус healthy за 45 секунд ({exc})."), file=sys.stderr)
             print_failed_container_logs(base)
-            print(f"Проверьте логи этой установки: docker compose {compose_ref} logs --tail=100 {compose_service(base)}", file=sys.stderr)
+            print(f"Проверьте логи этой установки: docker compose {compose_ref} logs --tail=100", file=sys.stderr)
             return 1
 
         self_steal_probe_ok: bool | None = None
         self_steal_probe_detail = ""
         self_steal_local_https_detail = ""
+        webproxy_probe_ok: bool | None = None
+        webproxy_probe_detail = ""
         if mode == "self-steal":
             local_https_host = "127.0.0.1" if bind_ip in ("0.0.0.0", "::", "127.0.0.1") else bind_ip
             https_ok, https_detail = probe_local_https_get(local_https_host, int(pub_port), sni)
@@ -4474,10 +5398,45 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 1
             print(ok_text(f"Локальная проверка Telegram: {self_steal_probe_detail}."))
+        elif mode == "webproxy":
+            rd_ok, rd_detail = probe_tproxy_readyz(tproxy_admin_ep)
+            if not rd_ok:
+                print(
+                    err_text(
+                        f"Проверка готовности tproxy-server (/readyz на {tproxy_admin_ep}) не пройдена: {rd_detail}"
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            print(ok_text(f"tproxy-server готов (/readyz: {rd_detail}, listen={tproxy_listen_ep})."))
+            webproxy_probe_ok, webproxy_probe_detail = verify_telegram_e2e(base, attempts=3, delay_s=2.0)
+            if not webproxy_probe_ok:
+                print(
+                    err_text(
+                        f"Сквозная проверка Telegram через бэкенд mtevil не пройдена: {webproxy_probe_detail or 'нет ответа'}"
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            print(ok_text(f"Локальная проверка связи с Telegram: {webproxy_probe_detail}."))
+            caddy_snip, nginx_snip = render_webproxy_reverse_proxy_snippets(
+                webproxy_hostname,
+                webproxy_base_path,
+                tproxy_listen_ep,
+            )
+            (deploy_dir / "Caddyfile.webproxy.example").write_text(caddy_snip, encoding="utf-8")
+            (deploy_dir / "nginx.webproxy.example").write_text(nginx_snip, encoding="utf-8")
 
         deployment_committed = True
     finally:
         if not deployment_committed:
+            if mode == "webproxy" and up_attempted and "tproxy.json" not in backed_up_files:
+                run(base + ["stop", "tproxy"], check=False)
+                run(base + ["rm", "-f", "tproxy"], check=False)
+            for extra_f in newly_created_host_files:
+                p_ex = deploy_dir / extra_f
+                if p_ex.exists():
+                    p_ex.unlink()
             if backed_up_files:
                 restore_backup_files(deploy_dir, backed_up_files)
                 print("Прежние файлы конфигурации восстановлены.", file=sys.stderr)
@@ -4494,6 +5453,25 @@ def main(argv: list[str] | None = None) -> int:
                         remove_volume_file(base, effective_egress_token_file)
                 except Exception as exc:
                     print(err_text(f"Не удалось вернуть прежний токен MTV2 в том state: {exc}"), file=sys.stderr)
+            if tproxy_profiles_modified:
+                try:
+                    if had_tproxy_profiles and prev_tproxy_profiles_raw is not None:
+                        write_volume_secret_stdin(base, "/var/lib/mtevil/tproxy-profiles.json", prev_tproxy_profiles_raw)
+                    elif not had_tproxy_profiles:
+                        remove_volume_file(base, "/var/lib/mtevil/tproxy-profiles.json")
+                except Exception as exc:
+                    print(err_text(f"Не удалось восстановить tproxy-profiles.json в томе state: {exc}"), file=sys.stderr)
+            if created_tproxy_token_key:
+                remove_volume_file(base, "/var/lib/mtevil/tproxy-token.key")
+            if created_site_index:
+                idx_p = deploy_dir / "site" / "index.html"
+                if idx_p.exists():
+                    idx_p.unlink()
+                if created_site_dir:
+                    try:
+                        (deploy_dir / "site").rmdir()
+                    except OSError:
+                        pass
             if allowed_snis_modified:
                 try:
                     if had_allowed_sni and prev_allowed_snis:
@@ -4507,10 +5485,15 @@ def main(argv: list[str] | None = None) -> int:
             if created_users_json:
                 remove_volume_file(base, "/var/lib/mtevil/users.json")
             if had_backup and up_attempted:
-                rb_up = run(base + ["up", "-d", "--force-recreate", compose_service(base)], check=False)
+                rb_services = [compose_service(base)]
+                if "tproxy.json" in backed_up_files:
+                    rb_services.append("tproxy")
+                rb_up = run(base + ["up", "-d", "--force-recreate", *rb_services], check=False)
                 if rb_up.returncode == 0:
                     try:
                         wait_healthy(base)
+                        if "tproxy" in rb_services:
+                            wait_service_healthy(base, "tproxy")
                         if prev_image_id:
                             restored_ref = pinned_rollback_tag or str(saved.get("MTEVIL_IMAGE") or args.image)
                             restored_id, _, _ = inspect_current_deployment(deploy_dir, project, restored_ref)
@@ -4531,9 +5514,9 @@ def main(argv: list[str] | None = None) -> int:
                     rb_err = (rb_up.stderr or rb_up.stdout or "").strip()
                     print(err_text(f"Не удалось перезапустить прежний контейнер после отката: {rb_err}"), file=sys.stderr)
             elif not had_backup and up_attempted:
-                svc_name = compose_service(base)
-                run(base + ["stop", svc_name], check=False)
-                run(base + ["rm", "-f", svc_name], check=False)
+                for svc_name in ([compose_service(base), "tproxy"] if mode == "webproxy" else [compose_service(base)]):
+                    run(base + ["stop", svc_name], check=False)
+                    run(base + ["rm", "-f", svc_name], check=False)
                 print("Неудачный кандидат остановлен.", file=sys.stderr)
 
     print(ok_text("Контейнер исправен (Docker healthcheck: локальный порт отвечает)"))
@@ -4560,6 +5543,23 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     file=sys.stderr,
                 )
+        elif mode == "webproxy":
+            probe_ok = webproxy_probe_ok
+            probe_detail = webproxy_probe_detail
+            print_step(3, total_steps, "Проверка WEB Proxy (tproxy-server + mtevil локально готовы)")
+            print(ok_text(f"tproxy-server ({tproxy_listen_ep}) и mtevil ({probe_detail}) проверены."))
+            pub_https_ok, pub_https_detail = probe_local_https_get(webproxy_hostname, 443, webproxy_hostname)
+            if pub_https_ok:
+                print(ok_text(f"Публичный HTTPS {webproxy_hostname}:443 уже отвечает ({pub_https_detail})."))
+            else:
+                caddy_ex = deploy_dir / "Caddyfile.webproxy.example"
+                nginx_ex = deploy_dir / "nginx.webproxy.example"
+                print(
+                    warn_text(
+                        f"Публичный HTTPS {webproxy_hostname}:443 пока не настроен ({pub_https_detail}). "
+                        f"Подключите проксирование в Caddy/nginx по шаблону {caddy_ex} или {nginx_ex}."
+                    )
+                )
         else:
             print_step(3, total_steps, "Сквозная проверка связи с Telegram")
             probe_ok, probe_detail = verify_telegram_e2e(base, attempts=3, delay_s=2.0)
@@ -4574,53 +5574,102 @@ def main(argv: list[str] | None = None) -> int:
                     "Проверьте исходящий доступ к Telegram и логи контейнера (см. deploy/README.md).",
                     file=sys.stderr,
                 )
-        print_step(4, total_steps, "Проверка порта на публичном адресе")
-        port_status, port_detail = check_public_port_reachable(public_host, int(pub_port))
-        if port_status == "ok":
-            print(ok_text(f"Порт {pub_port} отвечает по адресу {public_host} (проверено с самого сервера)."))
-            print("  Доступность из Интернета так не проверяется: убедитесь, что порт открыт в firewall провайдера и сервера.")
-        elif port_status == "unreachable":
-            print(warn_text(f"Не удалось подключиться к {public_host}:{pub_port} с самого сервера ({port_detail})."))
-            print(
-                f"  Откройте порт {pub_port}/tcp в панели провайдера и в firewall сервера "
-                "(например, ufw allow {0}/tcp). Если сервер за NAT, проверьте проброс порта.".format(pub_port)
-            )
+        if mode == "webproxy" and bind_ip in ("127.0.0.1", "::1"):
+            print_step(4, total_steps, "Проверка внешнего порта (Caddy/nginx 443)")
+            port_status, port_detail = check_public_port_reachable(webproxy_hostname, 443)
+            if port_status == "ok":
+                print(ok_text(f"Порт 443 отвечает по адресу {webproxy_hostname}."))
+            else:
+                print(f"Внешний порт 443 ({webproxy_hostname}): {port_detail} (включается вашим Caddy/nginx).")
         else:
-            print(f"Проверка порта пропущена ({port_detail}).")
+            print_step(4, total_steps, "Проверка порта на публичном адресе")
+            port_status, port_detail = check_public_port_reachable(public_host, int(pub_port))
+            if port_status == "ok":
+                print(ok_text(f"Порт {pub_port} отвечает по адресу {public_host} (проверено с самого сервера)."))
+                print("  Доступность из Интернета так не проверяется: убедитесь, что порт открыт в firewall провайдера и сервера.")
+            elif port_status == "unreachable":
+                print(warn_text(f"Не удалось подключиться к {public_host}:{pub_port} с самого сервера ({port_detail})."))
+                print(
+                    f"  Откройте порт {pub_port}/tcp в панели провайдера и в firewall сервера "
+                    "(например, ufw allow {0}/tcp). Если сервер за NAT, проверьте проброс порта.".format(pub_port)
+                )
+            else:
+                print(f"Проверка порта пропущена ({port_detail}).")
 
     if role in ("direct", "edge"):
-        link = run(
-            base
-            + [
-                "exec",
-                "-T",
-                compose_service(base),
-                "mtevil",
-                "link",
-                "--config",
-                "/etc/mtevil/config.json",
-                "--server",
-                public_host,
-                "--port",
-                str(pub_port),
-            ]
-        ).stdout.strip()
-        print("\n" + heading("Ссылка для подключения в Telegram"))
-        print(link)
-        print()
-        print(f"Каталог установки: {deploy_dir}")
-        print(f"Проверка статуса:  {status_cmd}")
-        print("Показать ссылку:   mtevilctl link")
-        print("Сменить SNI:       mtevilctl sni <домен>  (старые ссылки продолжат работать)")
-        print("Перенастроить:     mtevilctl setup")
-        if mode == "simple":
-            print("\nОткройте ссылку в Telegram, нажмите «Подключить прокси» и проверьте отправку сообщения.")
-            print("Справочник по диагностике, обновлению и откату: deploy/README.md")
+        if mode == "webproxy":
+            saved_post = load_existing_defaults(deploy_dir)
+            wp_out = render_webproxy_links_output(base, saved_post)
+            print("\n" + heading("Ссылки WEB Proxy для подключения в Telegram"))
+            print("\n".join(wp_out))
+            if bind_ip not in ("127.0.0.1", "::1"):
+                ee_link = run(
+                    base
+                    + [
+                        "exec",
+                        "-T",
+                        compose_service(base),
+                        "mtevil",
+                        "link",
+                        "--config",
+                        "/etc/mtevil/config.json",
+                        "--server",
+                        public_host,
+                        "--port",
+                        str(pub_port),
+                    ]
+                ).stdout.strip()
+                print("\n" + heading("Резервная ссылка FakeTLS (tg://proxy)"))
+                print(ee_link)
+            print()
+            caddy_ex = deploy_dir / "Caddyfile.webproxy.example"
+            nginx_ex = deploy_dir / "nginx.webproxy.example"
+            site_idx_ex = deploy_dir / "site" / "index.html"
+            print(f"Каталог установки: {deploy_dir}")
+            print(f"Шаблон Caddy:      {caddy_ex}")
+            print(f"Шаблон nginx:      {nginx_ex}")
+            if created_site_index:
+                print(
+                    warn_text(
+                        f"Важно: замените заглушку {site_idx_ex} на уникальный контент вашего сайта и выполните docker compose {compose_ref} restart tproxy."
+                    )
+                )
+            print(f"Проверка статуса:  {status_cmd}")
+            print("Показать ссылку:   mtevilctl link")
+            print("Перенастроить:     mtevilctl setup --webproxy")
         else:
-            print("\nДальше:")
-            print("  1. Откройте ссылку в Telegram и нажмите «Подключить прокси» (сквозная связь проверяется клиентом).")
-            print("  2. Ссылка даёт доступ к прокси — передавайте её только тем, кому доверяете.")
-            print("  3. Дополнительная диагностика и команды управления описаны в deploy/README.md.")
+            link = run(
+                base
+                + [
+                    "exec",
+                    "-T",
+                    compose_service(base),
+                    "mtevil",
+                    "link",
+                    "--config",
+                    "/etc/mtevil/config.json",
+                    "--server",
+                    public_host,
+                    "--port",
+                    str(pub_port),
+                ]
+            ).stdout.strip()
+            print("\n" + heading("Ссылка для подключения в Telegram"))
+            print(link)
+            print()
+            print(f"Каталог установки: {deploy_dir}")
+            print(f"Проверка статуса:  {status_cmd}")
+            print("Показать ссылку:   mtevilctl link")
+            print("Сменить SNI:       mtevilctl sni <домен>  (старые ссылки продолжат работать)")
+            print("Перенастроить:     mtevilctl setup")
+            if mode == "simple":
+                print("\nОткройте ссылку в Telegram, нажмите «Подключить прокси» и проверьте отправку сообщения.")
+                print("Справочник по диагностике, обновлению и откату: deploy/README.md")
+            else:
+                print("\nДальше:")
+                print("  1. Откройте ссылку в Telegram и нажмите «Подключить прокси» (сквозная связь проверяется клиентом).")
+                print("  2. Ссылка даёт доступ к прокси — передавайте её только тем, кому доверяете.")
+                print("  3. Дополнительная диагностика и команды управления описаны в deploy/README.md.")
     else:
         print("\n" + heading("Что указать на входном сервере (edge)"))
         print(f"  Адрес выхода: {bind_ip}:{pub_port}")

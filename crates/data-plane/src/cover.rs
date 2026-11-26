@@ -173,21 +173,42 @@ pub(crate) async fn bounded_cover(
     raw: Vec<u8>,
     state: &State,
     session_id: u64,
+    mut drain_rx: DrainRx,
 ) -> Result<()> {
-    // An HTTPS fallback must not queue while holding a slot from the shared listener.
-    let Ok(_permit) = state.cover_permits.try_acquire() else {
-        state
-            .counters
-            .cover_rejected
-            .fetch_add(1, Ordering::Relaxed);
-        telemetry::event("cover_rejected", session_id, json!({"reason":"capacity"}));
-        return Ok(());
+    // Wait briefly in a bounded queue when cover_permits are saturated so active
+    // probes never observe a synthetic 0 ms close/RST spike, while still keeping
+    // listener admission slots available for authenticated MTProto sessions.
+    let permit = match state.cover_permits.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            use rand::Rng;
+            let jitter_ms = rand::rngs::OsRng.gen_range(80..=200);
+            let queue_wait = Duration::from_millis(jitter_ms).min(state.handshake / 4);
+            let acquired = tokio::select! {
+                biased;
+                () = wait_for_drain(&mut drain_rx) => {
+                    graceful_fin_close(client, state.drain / 2).await;
+                    return Ok(());
+                }
+                res = timeout(queue_wait, state.cover_permits.acquire()) => res,
+            };
+            match acquired {
+                Ok(Ok(permit)) => permit,
+                _ => {
+                    state
+                        .counters
+                        .cover_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                    telemetry::event("cover_rejected", session_id, json!({"reason":"capacity"}));
+                    graceful_fin_close(client, Duration::from_millis(150)).await;
+                    return Ok(());
+                }
+            }
+        }
     };
-    // Unauthenticated fallback must not reserve admission slots for the full
-    // authenticated-session idle timeout, especially after a partial hello.
-    timeout(state.handshake.saturating_mul(2), cover(client, raw, state))
-        .await
-        .context("cover_budget_expired")?
+    let res = cover_with_drain(client, raw, state, drain_rx).await;
+    drop(permit);
+    res
 }
 
 fn is_ipv6_route_error(err: &std::io::Error) -> bool {
@@ -234,18 +255,93 @@ pub(crate) async fn connect_cover_stream(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("cover_connect_budget_exhausted")))
 }
 
+#[cfg(test)]
 pub(crate) async fn cover(client: &mut TcpStream, raw: Vec<u8>, state: &State) -> Result<()> {
-    let mut upstream = connect_cover_stream(&state.cover_resolver, state.handshake).await?;
+    cover_with_drain(client, raw, state, inactive_drain_rx()).await
+}
+
+pub(crate) async fn plain_copy_first_then_idle<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    mut r: R,
+    mut w: W,
+    first_read_budget: Duration,
+    idle: Duration,
+) -> Result<()> {
+    let mut buf = [0; wire::MAX_RECORD];
+    let n = timeout(first_read_budget, r.read(&mut buf))
+        .await
+        .context("cover_budget_expired")??;
+    if n == 0 {
+        timeout(idle, w.shutdown()).await??;
+        return Ok(());
+    }
+    timeout(idle, w.write_all(&buf[..n])).await??;
+    plain_copy(r, w, idle).await
+}
+
+pub(crate) async fn cover_with_drain(
+    client: &mut TcpStream,
+    raw: Vec<u8>,
+    state: &State,
+    mut drain_rx: DrainRx,
+) -> Result<()> {
+    let t_conn = Instant::now();
+    let mut upstream = match connect_cover_stream(&state.cover_resolver, state.handshake).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            // Avoid instant (<1 ms) empty closes on ECONNREFUSED / empty DNS cache.
+            if t_conn.elapsed() < Duration::from_millis(50) {
+                use rand::Rng;
+                let pause_ms = rand::rngs::OsRng.gen_range(60..=160);
+                let pause = Duration::from_millis(pause_ms).min(state.handshake / 3);
+                tokio::select! {
+                    biased;
+                    () = wait_for_drain(&mut drain_rx) => {}
+                    () = tokio::time::sleep(pause) => {}
+                }
+            }
+            graceful_fin_close(client, Duration::from_millis(150)).await;
+            return Err(err);
+        }
+    };
 
     // INV-01: first backend write commits cover; never reconsider the protocol.
-    timeout(state.handshake, upstream.write_all(&raw)).await??;
-    let (cr, cw) = client.split();
-    let (ur, uw) = upstream.split();
-    tokio::try_join!(
-        plain_copy(cr, uw, state.idle),
-        plain_copy(ur, cw, state.idle)
-    )?;
-    Ok(())
+    if let Err(err) = timeout(state.handshake, upstream.write_all(&raw)).await {
+        graceful_fin_close(client, Duration::from_millis(150)).await;
+        return Err(err.into());
+    }
+    let first_reply_budget = state.handshake.saturating_mul(2);
+    // Once the upstream cover responds, allow normal browser HTTP keep-alive
+    // (capped at 60 s so unauthenticated connections still cannot hold slots for 5 min).
+    let cover_idle = state
+        .idle
+        .min(Duration::from_secs(60))
+        .max(first_reply_budget);
+    let copy_res = {
+        let (cr, cw) = client.split();
+        let (ur, uw) = upstream.split();
+        tokio::select! {
+            biased;
+            () = wait_for_drain(&mut drain_rx) => None,
+            res = async {
+                tokio::try_join!(
+                    plain_copy(cr, uw, cover_idle),
+                    plain_copy_first_then_idle(ur, cw, first_reply_budget, cover_idle)
+                )
+            } => Some(res),
+        }
+    };
+    match copy_res {
+        None => {
+            graceful_fin_close(client, state.drain / 2).await;
+            let _ = timeout(Duration::from_millis(150), upstream.shutdown()).await;
+            Ok(())
+        }
+        Some(Ok(_)) => Ok(()),
+        Some(Err(err)) => {
+            graceful_fin_close(client, Duration::from_millis(150)).await;
+            Err(err)
+        }
+    }
 }
 
 const COVER_CALIBRATION_INTERVAL: Duration = Duration::from_secs(86_400);

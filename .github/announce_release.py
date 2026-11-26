@@ -9,7 +9,10 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-RELEASE_TAG = re.compile(r"v\d+\.\d+\.\d+(?:-rc\.\d+)?")
+RELEASE_TAG = re.compile(
+    r"v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    r"(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?"
+)
 NOTES_DIR = Path(__file__).resolve().parents[1] / "docs" / "releases"
 TELEGRAM_MAX_LEN = 3800
 
@@ -166,7 +169,7 @@ def send_telegram(token, chat, thread_id, text, release_url):
 
 def main(tag):
     if not RELEASE_TAG.fullmatch(tag):
-        print("Telegram announcements cover stable and RC tags only.")
+        print("Telegram announcements cover SemVer release and pre-release tags only.")
         return 0
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
