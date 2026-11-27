@@ -19,10 +19,12 @@ use std::{
 };
 use tokio::io::ReadBuf;
 
+use mtevil_proto::{
+    ct_eq_bytes, parse_ws_frame_header, parse_ws_upgrade_request, parse_ws_upgrade_response,
+    WsFrameDecision, MAX_WS_HTTP_HEADER_BYTES,
+};
+
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-const MAX_HTTP_HEADER_BYTES: usize = 8 * 1024;
-/// Upper bound on a single inbound WebSocket frame payload (64 KiB).
-pub(crate) const MAX_WS_FRAME_PAYLOAD: usize = 64 * 1024;
 /// Outbound chunk size per binary WebSocket frame (matches `wire::MAX_RECORD`).
 const MAX_WS_WRITE_CHUNK: usize = 16 * 1024;
 /// Maximum idle lifetime of a pre-warmed WebSocket connection in the pool.
@@ -316,23 +318,6 @@ pub(crate) fn compute_ws_accept(client_key_b64: &str) -> String {
     base64_encode(&digest)
 }
 
-fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|pos| pos + 4)
-}
-
 pub(crate) enum MaybeTlsStream {
     Plain(TcpStream),
     Tls(Box<tokio_native_tls::TlsStream<TcpStream>>),
@@ -463,84 +448,18 @@ impl<S> WsStream<S> {
     /// Attempt to parse one complete WebSocket frame from `rx_raw[rx_raw_pos..]`.
     fn try_decode_frame(&mut self) -> std::io::Result<bool> {
         let avail = &self.rx_raw[self.rx_raw_pos..];
-        if avail.len() < 2 {
-            return Ok(false);
-        }
-        let b0 = avail[0];
-        let b1 = avail[1];
-        if (b0 & 0x70) != 0 {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "WebSocket RSV bits must be zero",
-            ));
-        }
-        let opcode = b0 & 0x0f;
-        let masked = (b1 & 0x80) != 0;
-        // RFC 6455 §5.1: server MUST reject unmasked client frames; client MUST reject masked server frames.
-        if self.is_client && masked {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "server sent masked WebSocket frame",
-            ));
-        }
-        if !self.is_client && !masked {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "client sent unmasked WebSocket frame",
-            ));
-        }
-        let len_code = usize::from(b1 & 0x7f);
-        let (payload_len, mut hdr_len) = if len_code < 126 {
-            (len_code, 2usize)
-        } else if len_code == 126 {
-            if avail.len() < 4 {
-                return Ok(false);
-            }
-            let n = usize::from(u16::from_be_bytes([avail[2], avail[3]]));
-            (n, 4usize)
-        } else {
-            if avail.len() < 10 {
-                return Ok(false);
-            }
-            let mut raw8 = [0u8; 8];
-            raw8.copy_from_slice(&avail[2..10]);
-            let n64 = u64::from_be_bytes(raw8);
-            if n64 > MAX_WS_FRAME_PAYLOAD as u64 {
-                return Err(std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    "WebSocket frame exceeds 64 KiB bound",
-                ));
-            }
-            (n64 as usize, 10usize)
+        let hdr = match parse_ws_frame_header(avail, self.is_client)
+            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e.to_string()))?
+        {
+            WsFrameDecision::Incomplete => return Ok(false),
+            WsFrameDecision::Header(h) => h,
         };
-        if payload_len > MAX_WS_FRAME_PAYLOAD {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "WebSocket frame exceeds 64 KiB bound",
-            ));
-        }
-        let mask_key = if masked {
-            if avail.len() < hdr_len + 4 {
-                return Ok(false);
-            }
-            let m = [
-                avail[hdr_len],
-                avail[hdr_len + 1],
-                avail[hdr_len + 2],
-                avail[hdr_len + 3],
-            ];
-            hdr_len += 4;
-            Some(m)
-        } else {
-            None
-        };
-        let total_len = hdr_len + payload_len;
-        if avail.len() < total_len {
-            return Ok(false);
-        }
-
-        let payload_start = self.rx_raw_pos + hdr_len;
-        let payload_end = payload_start + payload_len;
+        let payload_start = self.rx_raw_pos + hdr.payload_start_rel;
+        let payload_end = payload_start + hdr.payload_len;
+        let opcode = hdr.opcode;
+        let payload_len = hdr.payload_len;
+        let mask_key = hdr.mask_key;
+        let total_len = hdr.total_len;
         match opcode {
             // Continuation (0x0), Text (0x1), Binary (0x2)
             0x0..=0x2 => {
@@ -564,12 +483,6 @@ impl<S> WsStream<S> {
             }
             // Ping (0x9)
             0x9 => {
-                if payload_len > 125 {
-                    return Err(std::io::Error::new(
-                        ErrorKind::InvalidData,
-                        "WebSocket Ping payload > 125 bytes",
-                    ));
-                }
                 let mut ping_data = self.rx_raw[payload_start..payload_end].to_vec();
                 if let Some(mask) = mask_key {
                     for (i, b) in ping_data.iter_mut().enumerate() {
@@ -581,14 +494,7 @@ impl<S> WsStream<S> {
                 self.pending_pong = Some(pong);
             }
             // Pong (0xA)
-            0xA => {
-                if payload_len > 125 {
-                    return Err(std::io::Error::new(
-                        ErrorKind::InvalidData,
-                        "WebSocket Pong payload > 125 bytes",
-                    ));
-                }
-            }
+            0xA => {}
             _ => {
                 return Err(std::io::Error::new(
                     ErrorKind::InvalidData,
@@ -847,11 +753,11 @@ pub(crate) async fn client_ws_upgrade<S: AsyncRead + AsyncWrite + Unpin>(
     let mut raw = Vec::with_capacity(512);
     let mut chunk = [0u8; 1024];
     let hdr_end = loop {
-        if let Some(end) = find_header_end(&raw) {
+        if let Some(end) = parse_ws_upgrade_response(&raw, &expected_accept)? {
             break end;
         }
         ensure!(
-            raw.len() < MAX_HTTP_HEADER_BYTES,
+            raw.len() < MAX_WS_HTTP_HEADER_BYTES,
             "WebSocket response headers exceeded 8 KiB bound"
         );
         let n = stream
@@ -861,47 +767,6 @@ pub(crate) async fn client_ws_upgrade<S: AsyncRead + AsyncWrite + Unpin>(
         ensure!(n > 0, "EOF before WebSocket HTTP 101 response");
         raw.extend_from_slice(&chunk[..n]);
     };
-
-    let hdr_text =
-        std::str::from_utf8(&raw[..hdr_end]).context("non-UTF8 WebSocket HTTP response")?;
-    let mut lines = hdr_text.split("\r\n");
-    let status_line = lines.next().unwrap_or("");
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0);
-    ensure!(
-        status_code == 101,
-        "WebSocket upgrade rejected with HTTP status '{status_line}'"
-    );
-
-    let mut has_upgrade_ws = false;
-    let mut has_conn_upgrade = false;
-    let mut accept_ok = false;
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some((name, val)) = line.split_once(':') {
-            let v = val.trim();
-            if name.eq_ignore_ascii_case("upgrade") && v.eq_ignore_ascii_case("websocket") {
-                has_upgrade_ws = true;
-            } else if name.eq_ignore_ascii_case("connection")
-                && v.split(',')
-                    .any(|tok| tok.trim().eq_ignore_ascii_case("upgrade"))
-            {
-                has_conn_upgrade = true;
-            } else if name.eq_ignore_ascii_case("sec-websocket-accept") {
-                accept_ok = ct_eq_bytes(v.as_bytes(), expected_accept.as_bytes());
-            }
-        }
-    }
-    ensure!(
-        has_upgrade_ws && has_conn_upgrade,
-        "WebSocket 101 response missing Upgrade/Connection headers"
-    );
-    ensure!(accept_ok, "WebSocket Sec-WebSocket-Accept mismatch");
 
     let trailing = raw[hdr_end..].to_vec();
     Ok(WsStream::new(stream, true, trailing))
@@ -943,12 +808,32 @@ pub(crate) async fn server_ws_accept(
     let mut raw = Vec::with_capacity(512);
     raw.extend_from_slice(first4);
     let mut chunk = [0u8; 1024];
-    let hdr_end = loop {
-        if let Some(end) = find_header_end(&raw) {
-            break end;
+    let parsed = loop {
+        match parse_ws_upgrade_request(&raw, peer_ip.is_loopback()) {
+            Ok(Some(req)) => break req,
+            Ok(None) => {}
+            Err(err) => {
+                let msg = err.to_string();
+                if msg.contains("non-UTF8") {
+                    let _ = edge
+                        .write_all(
+                            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = edge.shutdown().await;
+                } else if msg.contains("method") || msg.contains("target") {
+                    let _ = edge
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = edge.shutdown().await;
+                }
+                return Err(err);
+            }
         }
         ensure!(
-            raw.len() < MAX_HTTP_HEADER_BYTES,
+            raw.len() < MAX_WS_HTTP_HEADER_BYTES,
             "inbound HTTP headers on egress exceeded 8 KiB bound"
         );
         let n = edge
@@ -960,68 +845,17 @@ pub(crate) async fn server_ws_accept(
     };
 
     let rx_hdr_bytes = raw.len().saturating_sub(4);
-    let hdr_text = match std::str::from_utf8(&raw[..hdr_end]) {
-        Ok(s) => s,
-        Err(_) => {
-            let _ = edge
-                .write_all(
-                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await;
-            let _ = edge.shutdown().await;
-            bail!("non-UTF8 HTTP header on egress");
-        }
-    };
+    let effective_ip = parsed.forwarded_ip.unwrap_or(peer_ip);
+    let hdr_end = parsed.hdr_end;
 
-    let mut lines = hdr_text.split("\r\n");
-    let req_line = lines.next().unwrap_or("");
-    let mut req_parts = req_line.split_whitespace();
-    let method = req_parts.next().unwrap_or("");
-    let raw_target = req_parts.next().unwrap_or("");
-    let req_path = raw_target.split('?').next().unwrap_or("");
-
-    let mut forwarded_ip: Option<IpAddr> = None;
-    let mut has_upgrade_ws = false;
-    let mut ws_key: Option<String> = None;
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some((name, val)) = line.split_once(':') {
-            let v = val.trim();
-            if name.eq_ignore_ascii_case("upgrade") && v.eq_ignore_ascii_case("websocket") {
-                has_upgrade_ws = true;
-            } else if name.eq_ignore_ascii_case("sec-websocket-key")
-                && !v.is_empty()
-                && v.len() <= 64
-            {
-                ws_key = Some(v.to_string());
-            } else if peer_ip.is_loopback() && name.eq_ignore_ascii_case("x-real-ip") {
-                if let Ok(ip) = v.parse::<IpAddr>() {
-                    forwarded_ip = Some(ip);
-                }
-            } else if peer_ip.is_loopback()
-                && forwarded_ip.is_none()
-                && name.eq_ignore_ascii_case("x-forwarded-for")
-            {
-                if let Some(first_hop) = v.split(',').next() {
-                    if let Ok(ip) = first_hop.trim().parse::<IpAddr>() {
-                        forwarded_ip = Some(ip);
-                    }
-                }
-            }
-        }
-    }
-    let effective_ip = forwarded_ip.unwrap_or(peer_ip);
-
-    if method != "GET" || !ct_eq_bytes(req_path.as_bytes(), expected_path.as_bytes()) {
+    if !ct_eq_bytes(parsed.path.as_bytes(), expected_path.as_bytes()) {
         let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let _ = edge.write_all(resp).await;
         let _ = edge.shutdown().await;
         bail!("egress WebSocket path mismatch");
     }
 
-    let Some(key_b64) = ws_key.filter(|_| has_upgrade_ws) else {
+    let Some(key_b64) = parsed.ws_key.filter(|_| parsed.has_upgrade_websocket) else {
         let resp =
             b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let _ = edge.write_all(resp).await;
@@ -1451,6 +1285,7 @@ mod ws_tests {
             cover_resolver,
             enable_dd: true,
             proxy_protocol: false,
+            proxy_protocol_allow_from: Vec::new(),
             cover_permits: Semaphore::new(8),
             dcs: HashMap::new(),
             dc_media_overrides: HashMap::new(),
@@ -1517,6 +1352,7 @@ mod ws_tests {
             cover: "127.0.0.1:9".to_string(),
             enable_dd: true,
             proxy_protocol: false,
+            proxy_protocol_allow_from: Vec::new(),
             dc: Vec::new(),
             egress_upstreams: upstreams,
             egress_strategy: EgressStrategy::Ordered,
@@ -1602,6 +1438,253 @@ mod ws_tests {
         let _ = eg2_stop_tx.send(());
         let _ = eg2_task.await;
         let _ = std::fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ws_http_and_frame_edge_cases() -> Result<()> {
+        // 1. Oversize HTTP headers (> 8 KiB) rejected by both client & server parsers.
+        let mut huge_req = b"GET /ws/tok HTTP/1.1\r\nHost: x\r\nX-Pad: ".to_vec();
+        huge_req.extend(std::iter::repeat_n(b'a', MAX_WS_HTTP_HEADER_BYTES));
+        huge_req.extend_from_slice(b"\r\n\r\n");
+        assert!(parse_ws_upgrade_request(&huge_req, false).is_err());
+
+        let expected_accept = compute_ws_accept("dGhlIHNhbXBsZSBub25jZQ==");
+        let mut huge_resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {expected_accept}\r\nX-Pad: "
+        )
+        .into_bytes();
+        huge_resp.extend(std::iter::repeat_n(b'b', MAX_WS_HTTP_HEADER_BYTES));
+        huge_resp.extend_from_slice(b"\r\n\r\n");
+        assert!(parse_ws_upgrade_response(&huge_resp, &expected_accept).is_err());
+
+        // 2. Live byte-by-byte fragmented HTTP/WS frames, continuation frames, Ping->Pong, Close.
+        let (cl_raw, srv_raw) = tokio::io::duplex(4096);
+        let mut cl_ws = WsStream::new(cl_raw, true, Vec::new());
+        let (mut srv_r, mut srv_w) = tokio::io::split(srv_raw);
+
+        // Server sends: Ping("hi"), unsolicited Pong, fragmented data ("hello " + continuation "world"),
+        // then waits for masked Pong from client before sending Close(1000).
+        let writer = tokio::spawn(async move {
+            let mut frames = Vec::new();
+            // Ping (0x9) with "hi"
+            frames.extend_from_slice(&[0x89, 0x02, b'h', b'i']);
+            // Unsolicited Pong (0xA)
+            frames.extend_from_slice(&[0x8A, 0x02, b'p', b'o']);
+            // Frame 1: non-FIN binary "hello "
+            frames.extend_from_slice(&[0x02, 0x06]);
+            frames.extend_from_slice(b"hello ");
+            // Frame 2: FIN continuation "world"
+            frames.extend_from_slice(&[0x80, 0x05]);
+            frames.extend_from_slice(b"world");
+            for b in frames {
+                srv_w.write_all(&[b]).await?;
+                tokio::task::yield_now().await;
+            }
+            // Wait for automatic masked Pong from client before closing.
+            let mut pong_buf = [0u8; 8];
+            srv_r.read_exact(&mut pong_buf).await?;
+            assert_eq!(pong_buf[0], 0x8A);
+            assert_eq!(pong_buf[1], 0x82); // masked + len 2
+            let mask = &pong_buf[2..6];
+            let unmasked = [pong_buf[6] ^ mask[0], pong_buf[7] ^ mask[1]];
+            assert_eq!(&unmasked, b"hi");
+            // Close frame with 1000 status code
+            srv_w.write_all(&[0x88, 0x02, 0x03, 0xe8]).await?;
+            srv_w.shutdown().await?;
+            Ok::<_, std::io::Error>(())
+        });
+
+        let mut app_rx = [0u8; 11];
+        cl_ws.read_exact(&mut app_rx).await?;
+        assert_eq!(&app_rx, b"hello world");
+        cl_ws.flush().await?;
+        let mut eof_buf = [0u8; 8];
+        assert_eq!(cl_ws.read(&mut eof_buf).await?, 0);
+        writer.await??;
+
+        // 3. Masking, Ping > 125B, Close len=1, fragmented Ping, and oversize (> 64 KiB) rejection.
+        let invalid_server_frames: &[&[u8]] = &[
+            &[0x82, 0x81, 0, 0, 0, 0, b'x'],   // masked server->client rejected
+            &[0x89, 126, 0, 126, b'a', b'b'],  // Ping > 125 bytes rejected
+            &[0x09, 0x02, b'a', b'b'],         // fragmented Ping rejected
+            &[0x88, 0x01, 0x00],               // Close payload len 1 rejected
+            &[0x82, 126, 0, 5, 1, 2, 3, 4, 5], // non-minimal 16-bit len rejected
+            &[0x82, 127, 0, 0, 0, 0, 0, 1, 0, 1], // 65_537 > 64 KiB rejected
+            &[0x82, 127, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0], // u64 MSB=1 oversize rejected
+        ];
+        for raw_frame in invalid_server_frames {
+            let (mut a, b) = tokio::io::duplex(256);
+            let mut ws = WsStream::new(b, true, Vec::new());
+            a.write_all(raw_frame).await?;
+            let mut tmp = [0u8; 16];
+            let res = ws.read(&mut tmp).await;
+            assert!(res.is_err(), "expected frame error for {raw_frame:x?}");
+        }
+
+        // Unmasked client->server rejected
+        let (mut a, b) = tokio::io::duplex(256);
+        let mut srv_ws = WsStream::new(b, false, Vec::new());
+        a.write_all(&[0x82, 0x02, b'a', b'b']).await?;
+        let mut tmp = [0u8; 8];
+        assert!(srv_ws.read(&mut tmp).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ws_warm_pool_10000_sessions_zero_fd_leak() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let active_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let srv_active = active_conns.clone();
+        let srv_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    acc = listener.accept() => {
+                        let Ok((mut s, peer)) = acc else { break; };
+                        let active = srv_active.clone();
+                        tokio::spawn(async move {
+                            struct Guard(Arc<std::sync::atomic::AtomicUsize>);
+                            impl Drop for Guard {
+                                fn drop(&mut self) {
+                                    self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                            active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let _guard = Guard(active);
+                            let mut first4 = [0u8; 4];
+                            if s.read_exact(&mut first4).await.is_err() {
+                                return;
+                            }
+                            let Ok((mut ws, _, _, _)) =
+                                server_ws_accept(s, &first4, "/ws/leak-test", peer.ip()).await
+                            else {
+                                return;
+                            };
+                            let mut buf = [0u8; 16];
+                            if let Ok(2) = ws.read_exact(&mut buf[..2]).await {
+                                let _ = ws.write_all(&buf[..2]).await;
+                                let _ = ws.shutdown().await;
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        let ep_str = format!("ws://{addr}/ws/leak-test");
+        let upstreams: Vec<EgressEndpoint> = vec![ep_str.parse()?];
+        let EgressEndpoint::Ws(ws_ep) = &upstreams[0] else {
+            unreachable!();
+        };
+        let ws_ep = ws_ep.clone();
+        let ws_pool = Arc::new(WsWarmPool::new(&upstreams, 4, None)?);
+
+        let before_fds = detect_fd_used();
+        let (pool_stop_tx, pool_stop_rx) = tokio::sync::watch::channel(false);
+        let state = Arc::new(State {
+            secrets: std::sync::RwLock::new(Arc::new(Vec::new())),
+            sni: "example.com".to_string(),
+            allowed_snis: std::sync::RwLock::new(Arc::new("example.com".to_string())),
+            cover_resolver: Arc::new(CoverResolver::new(
+                "127.0.0.1:9".to_string(),
+                Duration::from_secs(60),
+            )),
+            enable_dd: false,
+            proxy_protocol: false,
+            proxy_protocol_allow_from: Vec::new(),
+            cover_permits: Semaphore::new(8),
+            dcs: HashMap::new(),
+            dc_media_overrides: HashMap::new(),
+            egress_upstreams: upstreams.clone(),
+            ws_pool: Some(ws_pool.clone()),
+            egress_strategy: EgressStrategy::Ordered,
+            egress_token: [0u8; 16],
+            egress_rr: std::sync::atomic::AtomicUsize::new(0),
+            egress_health: std::sync::Mutex::new(EgressHealth::new(1)),
+            mtv4_cooldown: std::sync::Mutex::new(vec![None; 1]),
+            egress_probe_notify: Arc::new(tokio::sync::Notify::new()),
+            egress_cooldown: Duration::from_millis(500),
+            egress_cooldown_max: Duration::from_secs(5),
+            egress_probe_interval: Duration::from_secs(30),
+            egress_probe_degraded_interval: Duration::from_secs(5),
+            egress_hedge_ms: 150,
+            egress_use_mtv3: true,
+            client_hello: Duration::from_secs(3),
+            handshake: Duration::from_secs(4),
+            idle: Duration::from_secs(10),
+            drain: Duration::from_secs(1),
+            flight: wire::ServerFlightProfile {
+                cert_bytes: wire::DEFAULT_CERT_BYTES,
+                jitter: 0,
+            },
+            flight_cert_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(
+                wire::DEFAULT_CERT_BYTES,
+            )),
+            flight_shaping: false,
+            client_mss_bulk: None,
+            replay: Mutex::new(ReplayCache::new(64, Duration::from_secs(60))),
+            counters: Arc::new(telemetry::Counters::default()),
+            alert_webhook_url: None,
+            alerts_file: None,
+            diagnostics: false,
+            me: None,
+            edge_me: None,
+        });
+        let pool_tasks = ws_pool.spawn_replenishers(state, pool_stop_rx);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        const WORKERS: usize = 50;
+        const SESSIONS_PER_WORKER: usize = 200;
+        let mut workers = tokio::task::JoinSet::new();
+        for _ in 0..WORKERS {
+            let pool = ws_pool.clone();
+            let ep = ws_ep.clone();
+            workers.spawn(async move {
+                for _ in 0..SESSIONS_PER_WORKER {
+                    let mut stream = match pool.pop_warm(0) {
+                        Some(s) => s,
+                        None => dial_ws_endpoint(&ep, None).await?,
+                    };
+                    stream.write_all(b"ok").await?;
+                    let mut ack = [0u8; 2];
+                    stream.read_exact(&mut ack).await?;
+                    ensure!(&ack == b"ok", "unexpected WS echo ack");
+                    stream.shutdown().await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+        }
+        while let Some(res) = workers.join_next().await {
+            res??;
+        }
+
+        let _ = pool_stop_tx.send(true);
+        for t in pool_tasks {
+            let _ = t.await;
+        }
+        ws_pool.clear_node(0);
+        if let Some(slot0) = ws_pool.slots.get(&0) {
+            let q = slot0.idle.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(q.len(), 0);
+        }
+        let _ = stop_tx.send(());
+        let _ = srv_task.await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            active_conns.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "all 10,000 server WS handler tasks should have exited"
+        );
+        if let (Some(before), Some(after)) = (before_fds, detect_fd_used()) {
+            assert!(
+                after <= before + 4,
+                "FD leak after 10,000 WS sessions: before={before}, after={after}"
+            );
+        }
         Ok(())
     }
 }

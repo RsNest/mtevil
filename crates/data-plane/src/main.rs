@@ -8,7 +8,7 @@ use mtevil_proto::{self as wire, AesCtr};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -55,7 +55,7 @@ const BUILD_VERSION: &str = match option_env!("MTEVIL_BUILD_VERSION") {
 struct Args {
     #[command(subcommand)]
     command: Option<Action>,
-    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","egress_ws_path","egress_ws_pool_size","egress_tls_ca_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms","egress_probe_interval_secs","egress_probe_degraded_interval_secs","egress_hedge_ms","egress_accept_legacy","egress_use_mtv3","egress_allow_from","egress_max_failed_per_ip","dc_media_override","dc_probe_interval_secs","cover_dns_ttl_secs","diagnostics","metrics_listen"])]
+    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","egress_ws_path","egress_ws_pool_size","egress_tls_ca_file","role","enable_dd","proxy_protocol","proxy_protocol_allow_from","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms","egress_probe_interval_secs","egress_probe_degraded_interval_secs","egress_hedge_ms","egress_accept_legacy","egress_use_mtv3","egress_allow_from","egress_max_failed_per_ip","dc_media_override","dc_probe_interval_secs","cover_dns_ttl_secs","diagnostics","metrics_listen"])]
     config: Option<PathBuf>,
     #[arg(long)]
     check_config: bool,
@@ -94,6 +94,9 @@ struct Args {
     enable_dd: bool,
     #[arg(long)]
     proxy_protocol: bool,
+    /// Optional CIDRs trusted to send PROXY protocol v2 headers when proxy_protocol=true.
+    #[arg(long)]
+    proxy_protocol_allow_from: Vec<String>,
     #[arg(long)]
     max_connections: Option<usize>,
     #[arg(long)]
@@ -254,6 +257,7 @@ impl Args {
             cover: self.cover.unwrap_or_default(),
             enable_dd: self.enable_dd,
             proxy_protocol: self.proxy_protocol,
+            proxy_protocol_allow_from: self.proxy_protocol_allow_from,
             dc: self.dc,
             egress_upstreams: self.egress_upstreams,
             egress_strategy: self.egress_strategy.unwrap_or(EgressStrategy::RoundRobin),
@@ -330,6 +334,7 @@ struct State {
     cover_resolver: Arc<CoverResolver>,
     enable_dd: bool,
     proxy_protocol: bool,
+    proxy_protocol_allow_from: Vec<config::IpCidr>,
     cover_permits: Semaphore,
     dcs: HashMap<i16, SocketAddr>,
     dc_media_overrides: HashMap<i16, Vec<SocketAddr>>,
@@ -367,6 +372,16 @@ struct State {
 }
 
 impl State {
+    fn is_trusted_proxy_peer(&self, ip: IpAddr) -> bool {
+        if self.proxy_protocol_allow_from.is_empty() {
+            config::is_canonical_loopback(ip)
+        } else {
+            self.proxy_protocol_allow_from
+                .iter()
+                .any(|c| c.contains(ip))
+        }
+    }
+
     fn flight_profile(&self) -> wire::ServerFlightProfile {
         wire::ServerFlightProfile {
             cert_bytes: self
@@ -1057,6 +1072,7 @@ async fn main() -> Result<()> {
     let reload_config = (config.users_file.is_some() || config.allowed_sni_file().is_some())
         .then(|| config.clone());
     let allowed_snis = config.allowed_snis();
+    let proxy_protocol_allow_from = config.parsed_proxy_protocol_allow_from()?;
     let egress_count = config.egress_upstreams.len();
     let counters = Arc::new(telemetry::Counters::default());
     counters.ensure_started();
@@ -1105,6 +1121,7 @@ async fn main() -> Result<()> {
         cover_resolver: cover_resolver.clone(),
         enable_dd: config.enable_dd,
         proxy_protocol: config.proxy_protocol,
+        proxy_protocol_allow_from,
         cover_permits: Semaphore::new(max_cover_connections),
         dcs,
         dc_media_overrides,
