@@ -62,8 +62,8 @@ pub(crate) struct EgressHealth {
 pub(crate) struct EdgeAlertEvent {
     pub(crate) prev: EdgeRouteState,
     pub(crate) next: EdgeRouteState,
-    pub(crate) primary: SocketAddr,
-    pub(crate) active: Option<SocketAddr>,
+    pub(crate) primary: String,
+    pub(crate) active: Option<String>,
     pub(crate) reason: String,
     pub(crate) strategy: EgressStrategy,
 }
@@ -228,7 +228,7 @@ impl EgressHealth {
 
     pub(crate) fn snapshot_breaker_states(
         health: &std::sync::Mutex<EgressHealth>,
-        upstreams: &[SocketAddr],
+        upstreams: &[EgressEndpoint],
     ) -> Vec<(String, u8)> {
         let now = Instant::now();
         let h = health.lock().unwrap_or_else(|e| e.into_inner());
@@ -241,7 +241,7 @@ impl EgressHealth {
                     Some(slot) if slot.until.is_some_and(|u| now < u) => 1,
                     _ => 0,
                 };
-                (addr.to_string(), code)
+                (addr.redacted_label(), code)
             })
             .collect()
     }
@@ -301,21 +301,23 @@ impl EgressHealth {
     pub(crate) fn transition_route_state(
         health: &std::sync::Mutex<EgressHealth>,
         next: EdgeRouteState,
-        upstreams: &[SocketAddr],
+        upstreams: &[EgressEndpoint],
         reason: String,
         strategy: EgressStrategy,
-        active_override: Option<SocketAddr>,
+        active_override: Option<String>,
     ) -> Option<EdgeAlertEvent> {
-        let primary = *upstreams.first()?;
+        let primary = upstreams.first()?.redacted_label();
         let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
         if h.route_state == next {
             return None;
         }
         let prev = h.route_state;
         h.route_state = next;
-        let active = active_override.or(match next {
-            EdgeRouteState::PrimaryOk => Some(primary),
-            EdgeRouteState::FailoverBackup(idx) => upstreams.get(idx).copied(),
+        let active = active_override.or_else(|| match next {
+            EdgeRouteState::PrimaryOk => Some(primary.clone()),
+            EdgeRouteState::FailoverBackup(idx) => {
+                upstreams.get(idx).map(EgressEndpoint::redacted_label)
+            }
             EdgeRouteState::Degraded { .. } => None,
             EdgeRouteState::AllDown => None,
         });

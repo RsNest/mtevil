@@ -24,8 +24,11 @@ hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sha1 = "0.10"
 rand = "0.8"
 socket2 = "0.6"
+native-tls = "0.2"
+tokio-native-tls = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "process"] }
 zeroize = { version = "1", features = ["derive"] }
 

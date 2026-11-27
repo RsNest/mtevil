@@ -70,6 +70,7 @@ pub(crate) fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         dcs: HashMap::from([(2, dc)]),
         dc_media_overrides: default_media_override_map(),
         egress_upstreams: Vec::new(),
+        ws_pool: None,
         egress_strategy: EgressStrategy::RoundRobin,
         egress_token: [0u8; 16],
         egress_rr: std::sync::atomic::AtomicUsize::new(0),
@@ -1021,7 +1022,7 @@ async fn edge_to_egress_with_failover_relays_end_to_end() -> Result<()> {
     let mut cfg = state(cover.addr, "127.0.0.1:1".parse()?);
     let state_mut = Arc::get_mut(&mut cfg).context("unique state")?;
     state_mut.dcs.clear();
-    state_mut.egress_upstreams = vec![bad_egress_addr, egress_addr];
+    state_mut.egress_upstreams = vec![bad_egress_addr.into(), egress_addr.into()];
     state_mut.egress_strategy = EgressStrategy::Ordered;
     state_mut.egress_token = token;
     state_mut.handshake = Duration::from_secs(2);
@@ -1108,7 +1109,7 @@ async fn edge_ordered_fails_over_on_ack_timeout() -> Result<()> {
     let mut cfg = state(cover.addr, "127.0.0.1:1".parse()?);
     let state_mut = Arc::get_mut(&mut cfg).context("unique state")?;
     state_mut.dcs.clear();
-    state_mut.egress_upstreams = vec![stalled_addr, egress_addr];
+    state_mut.egress_upstreams = vec![stalled_addr.into(), egress_addr.into()];
     state_mut.egress_strategy = EgressStrategy::Ordered;
     state_mut.egress_token = token;
     state_mut.handshake = Duration::from_millis(800);
@@ -1254,6 +1255,9 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         egress_upstreams: Vec::new(),
         egress_strategy: EgressStrategy::RoundRobin,
         egress_token_file: None,
+        egress_ws_path: None,
+        egress_ws_pool_size: 4,
+        egress_tls_ca_file: None,
         max_connections: 16,
         client_hello_timeout_secs: 2,
         handshake_timeout_secs: 2,
@@ -1457,7 +1461,7 @@ async fn ordered_egress_cooldown_8_parallel_skip_primary_and_single_probe_recove
     {
         let sm = Arc::get_mut(&mut cfg).context("unique state")?;
         sm.dcs.clear();
-        sm.egress_upstreams = vec![primary_addr, backup_addr];
+        sm.egress_upstreams = vec![primary_addr.into(), backup_addr.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_token = token;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
@@ -1549,7 +1553,7 @@ async fn runtime_stats_file_tracks_edge_and_egress_byte_counters() -> Result<()>
     {
         let sm = Arc::get_mut(&mut edge_state).context("unique state")?;
         sm.dcs.clear();
-        sm.egress_upstreams = vec![egress_addr];
+        sm.egress_upstreams = vec![egress_addr.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_token = token;
         sm.handshake = Duration::from_secs(1);
@@ -1697,6 +1701,9 @@ async fn probe_telegram_e2e_verifies_handshake_and_res_pq_reply() -> Result<()> 
         egress_upstreams: Vec::new(),
         egress_strategy: EgressStrategy::RoundRobin,
         egress_token_file: None,
+        egress_ws_path: None,
+        egress_ws_pool_size: 4,
+        egress_tls_ca_file: None,
         max_connections: 16,
         client_hello_timeout_secs: 2,
         handshake_timeout_secs: 2,
@@ -1801,7 +1808,7 @@ async fn background_egress_alerts_without_client_traffic() -> Result<()> {
 
     let mut cfg = state(primary_addr, backup_addr);
     let inner = Arc::get_mut(&mut cfg).context("unique state")?;
-    inner.egress_upstreams = vec![primary_addr, backup_addr];
+    inner.egress_upstreams = vec![primary_addr.into(), backup_addr.into()];
     inner.egress_strategy = EgressStrategy::Ordered;
     inner.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
     let monitor = tokio::spawn(monitor_edge_egress(cfg.clone(), Duration::from_millis(25)));
@@ -1879,7 +1886,7 @@ async fn edge_route_alerts_emit_once_per_state_transition() -> Result<()> {
     {
         let sm = Arc::get_mut(&mut cfg).context("unique state")?;
         sm.dcs.clear();
-        sm.egress_upstreams = vec![primary_addr, backup_addr];
+        sm.egress_upstreams = vec![primary_addr.into(), backup_addr.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_token = token;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
@@ -1963,7 +1970,7 @@ async fn edge_round_robin_alerts_ignore_healthy_alternation_and_track_availabili
     {
         let sm = Arc::get_mut(&mut cfg).context("unique state")?;
         sm.dcs.clear();
-        sm.egress_upstreams = vec![addr1, addr2];
+        sm.egress_upstreams = vec![addr1.into(), addr2.into()];
         sm.egress_strategy = EgressStrategy::RoundRobin;
         sm.egress_token = token;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
@@ -2109,6 +2116,9 @@ async fn allowed_sni_file_accepts_previous_and_current_sni_without_breaking_link
         egress_upstreams: Vec::new(),
         egress_strategy: EgressStrategy::RoundRobin,
         egress_token_file: None,
+        egress_ws_path: None,
+        egress_ws_pool_size: 4,
+        egress_tls_ca_file: None,
         max_connections: 16,
         client_hello_timeout_secs: 2,
         handshake_timeout_secs: 2,
@@ -2421,7 +2431,7 @@ async fn round_robin_circuit_breaker_skips_cooldown_node_and_preserves_rr_offset
     {
         let sm = Arc::get_mut(&mut cfg).context("unique state")?;
         sm.dcs.clear();
-        sm.egress_upstreams = vec![addr0, addr1, addr2];
+        sm.egress_upstreams = vec![addr0.into(), addr1.into(), addr2.into()];
         sm.egress_strategy = EgressStrategy::RoundRobin;
         sm.egress_token = token;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(3));
@@ -2519,7 +2529,7 @@ async fn all_nodes_in_cooldown_fail_open_forces_soonest_probe_with_storm_protect
     {
         let sm = Arc::get_mut(&mut cfg).context("unique state")?;
         sm.dcs.clear();
-        sm.egress_upstreams = vec![addr0, addr1];
+        sm.egress_upstreams = vec![addr0.into(), addr1.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_token = token;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
@@ -2702,7 +2712,7 @@ async fn background_probe_rotates_dcs_sets_and_clears_breaker_cooldown_and_switc
     let mut cfg = state(primary_addr, backup_addr);
     {
         let inner = Arc::get_mut(&mut cfg).context("unique state")?;
-        inner.egress_upstreams = vec![primary_addr, backup_addr];
+        inner.egress_upstreams = vec![primary_addr.into(), backup_addr.into()];
         inner.egress_strategy = EgressStrategy::Ordered;
         inner.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
         // Long 30s cooldown to prove that background probe recovery clears cooldown directly!
@@ -2811,7 +2821,7 @@ async fn hedged_connect_starts_backup_after_hedge_ms_and_tracks_metrics() -> Res
     {
         let sm = Arc::get_mut(&mut cfg).context("unique state")?;
         sm.dcs.clear();
-        sm.egress_upstreams = vec![primary_addr, backup_addr];
+        sm.egress_upstreams = vec![primary_addr.into(), backup_addr.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_token = token;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
@@ -2910,6 +2920,7 @@ async fn egress_mtv3_verifies_hmac_rejects_replay_skew_legacy_toggle_and_securit
         dc_media_overrides: default_media_override_map(),
         nonce_cache_capacity: 16_384,
         me: None,
+        ws_path: None,
     };
     let egress_task = tokio::spawn(serve_egress_with_security(
         egress_listener,
@@ -2931,7 +2942,7 @@ async fn egress_mtv3_verifies_hmac_rejects_replay_skew_legacy_toggle_and_securit
     {
         let sm = Arc::get_mut(&mut edge_state).context("unique state")?;
         sm.dcs.clear();
-        sm.egress_upstreams = vec![egress_addr];
+        sm.egress_upstreams = vec![egress_addr.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_token = token;
         sm.egress_use_mtv3 = true;
@@ -3035,6 +3046,7 @@ async fn egress_mtv3_verifies_hmac_rejects_replay_skew_legacy_toggle_and_securit
         dc_media_overrides: default_media_override_map(),
         nonce_cache_capacity: 16_384,
         me: None,
+        ws_path: None,
     };
     let egress2_task = tokio::spawn(serve_egress_with_security(
         egress2_listener,
@@ -3489,7 +3501,7 @@ async fn inv10_f23_hedge_zero_disabled_at_most_one_hedge_and_loser_closed() -> R
     let mut st0 = state(cover.addr, "127.0.0.1:1".parse()?);
     {
         let sm = Arc::get_mut(&mut st0).context("unique state")?;
-        sm.egress_upstreams = vec![p1, b1];
+        sm.egress_upstreams = vec![p1.into(), b1.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
         sm.egress_hedge_ms = 0;
@@ -3510,7 +3522,7 @@ async fn inv10_f23_hedge_zero_disabled_at_most_one_hedge_and_loser_closed() -> R
     let mut st1 = state(cover.addr, "127.0.0.1:1".parse()?);
     {
         let sm = Arc::get_mut(&mut st1).context("unique state")?;
-        sm.egress_upstreams = vec![p2, b2, b3];
+        sm.egress_upstreams = vec![p2.into(), b2.into(), b3.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(3));
         sm.egress_hedge_ms = 40;
@@ -3585,7 +3597,7 @@ async fn inv10_f23_hedge_10000_connections_no_fd_leak() -> Result<()> {
     let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
     {
         let sm = Arc::get_mut(&mut st).context("unique state")?;
-        sm.egress_upstreams = vec![a_slow, a_fast];
+        sm.egress_upstreams = vec![a_slow.into(), a_fast.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
         sm.egress_hedge_ms = 2;
@@ -3878,7 +3890,7 @@ async fn inv10_f24_forced_probe_single_flight_200_concurrent_connections() -> Re
     let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
     {
         let sm = Arc::get_mut(&mut st).context("unique state")?;
-        sm.egress_upstreams = vec![addr0, addr1];
+        sm.egress_upstreams = vec![addr0.into(), addr1.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
         sm.egress_cooldown = Duration::from_secs(30);
@@ -4062,7 +4074,7 @@ async fn inv10_f23_round_robin_hedge_adaptive_per_try_and_parallel_node_down_sig
     let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
     {
         let sm = Arc::get_mut(&mut st).context("unique state")?;
-        sm.egress_upstreams = vec![a_blackhole, a_live];
+        sm.egress_upstreams = vec![a_blackhole.into(), a_live.into()];
         sm.egress_strategy = EgressStrategy::RoundRobin;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
         sm.egress_hedge_ms = 200;
@@ -4294,7 +4306,7 @@ async fn inv10_f23_fast_primary_samples_do_not_timeout_healthy_slower_backup() -
     let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
     {
         let sm = Arc::get_mut(&mut st).context("unique state")?;
-        sm.egress_upstreams = vec![p_addr, b_addr];
+        sm.egress_upstreams = vec![p_addr.into(), b_addr.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
         sm.egress_hedge_ms = 80;
@@ -4343,7 +4355,7 @@ async fn inv10_f23_fast_primary_samples_do_not_timeout_healthy_slower_backup() -
     let mut st_rr = state(cover.addr, "127.0.0.1:1".parse()?);
     {
         let sm = Arc::get_mut(&mut st_rr).context("unique state")?;
-        sm.egress_upstreams = vec![rr0, rr1];
+        sm.egress_upstreams = vec![rr0.into(), rr1.into()];
         sm.egress_strategy = EgressStrategy::RoundRobin;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
         sm.egress_hedge_ms = 80;
@@ -4440,7 +4452,7 @@ async fn inv10_f23_signaled_down_does_not_cascade_failures_or_inflate_cooldown()
     let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
     {
         let sm = Arc::get_mut(&mut st).context("unique state")?;
-        sm.egress_upstreams = vec![addr];
+        sm.egress_upstreams = vec![addr.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(1));
         sm.egress_cooldown = base_cd;
@@ -4553,7 +4565,7 @@ async fn inv10_f23_ack_timeout_after_preface_is_dc_level_while_connect_timeout_i
     let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
     {
         let sm = Arc::get_mut(&mut st).context("unique state")?;
-        sm.egress_upstreams = vec![addr];
+        sm.egress_upstreams = vec![addr.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(1));
         sm.egress_cooldown = Duration::from_secs(10);
@@ -4630,7 +4642,7 @@ async fn inv10_f23_ack_timeout_after_preface_is_dc_level_while_connect_timeout_i
     let mut st2 = state(cover.addr, "127.0.0.1:1".parse()?);
     {
         let sm = Arc::get_mut(&mut st2).context("unique state")?;
-        sm.egress_upstreams = vec![dead_addr];
+        sm.egress_upstreams = vec![dead_addr.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(1));
         sm.egress_cooldown = Duration::from_secs(10);
@@ -4764,7 +4776,7 @@ async fn inv10_f23_hung_egress_ack_timeout_escalation_and_isolated_dc_isolation(
     let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
     {
         let sm = Arc::get_mut(&mut st).context("unique state")?;
-        sm.egress_upstreams = vec![a_hung, a_ok];
+        sm.egress_upstreams = vec![a_hung.into(), a_ok.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
         sm.egress_hedge_ms = 0;
@@ -4842,7 +4854,7 @@ async fn inv10_f23_hung_egress_ack_timeout_escalation_and_isolated_dc_isolation(
     let mut st2 = state(cover.addr, "127.0.0.1:1".parse()?);
     {
         let sm = Arc::get_mut(&mut st2).context("unique state")?;
-        sm.egress_upstreams = vec![a_partial, a_ok];
+        sm.egress_upstreams = vec![a_partial.into(), a_ok.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(2));
         sm.egress_hedge_ms = 0;
@@ -4918,7 +4930,7 @@ async fn inv10_f23_hung_egress_30_parallel_single_escalation_and_base_cooldown()
     let mut st = state(cover.addr, "127.0.0.1:1".parse()?);
     {
         let sm = Arc::get_mut(&mut st).context("unique state")?;
-        sm.egress_upstreams = vec![a_hung];
+        sm.egress_upstreams = vec![a_hung.into()];
         sm.egress_strategy = EgressStrategy::Ordered;
         sm.egress_health = std::sync::Mutex::new(EgressHealth::new(1));
         sm.egress_cooldown = base_cd;

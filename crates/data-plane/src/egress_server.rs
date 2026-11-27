@@ -10,6 +10,7 @@ pub(crate) struct EgressSecurityConfig {
     pub(crate) nonce_cache_capacity: usize,
     pub(crate) dc_media_overrides: HashMap<i16, Vec<SocketAddr>>,
     pub(crate) me: Option<Arc<me::MeRuntime>>,
+    pub(crate) ws_path: Option<String>,
 }
 
 impl EgressSecurityConfig {
@@ -24,6 +25,7 @@ impl EgressSecurityConfig {
             nonce_cache_capacity: config::default_egress_nonce_cache_capacity(max_connections),
             dc_media_overrides: default_media_override_map(),
             me: None,
+            ws_path: None,
         }
     }
 
@@ -230,7 +232,7 @@ pub(crate) async fn serve_egress_with_security(
             accepted = listener.accept_conn() => accepted,
             _ = &mut shutdown => break,
         };
-        let (mut edge, peer_addr) = match accept_state
+        let (edge, peer_addr) = match accept_state
             .handle_result(accepted, &counters, &mut shutdown)
             .await?
         {
@@ -245,7 +247,7 @@ pub(crate) async fn serve_egress_with_security(
             let _permit = permit;
             let mut session = telemetry::Session::new(&counters);
             let res = egress_connection(
-                &mut edge,
+                edge,
                 peer_addr.ip(),
                 &dcs,
                 &egress_token,
@@ -276,7 +278,7 @@ pub(crate) async fn serve_egress_with_security(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn egress_connection(
-    edge: &mut TcpStream,
+    mut edge: TcpStream,
     peer_ip: std::net::IpAddr,
     dcs: &HashMap<i16, SocketAddr>,
     expected_token: &[u8; 16],
@@ -286,11 +288,13 @@ pub(crate) async fn egress_connection(
     security: &EgressRuntimeSecurity,
 ) -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
-    security.check_peer_allowed(peer_ip)?;
+    if !peer_ip.is_loopback() || security.cfg.ws_path.is_none() {
+        security.check_peer_allowed(peer_ip)?;
+    }
     let Ok(unauth_permit) = security.unauth_permits.try_acquire() else {
         bail!("egress unauthenticated handshake limit reached");
     };
-    configure_tcp_socket(edge)?;
+    configure_tcp_socket(&edge)?;
     let mut magic = [0u8; 4];
     if let Err(err) = timeout(handshake, edge.read_exact(&mut magic))
         .await
@@ -303,6 +307,106 @@ pub(crate) async fn egress_connection(
     counters
         .downstream_rx_bytes
         .fetch_add(magic.len() as u64, Relaxed);
+
+    if &magic == b"GET " {
+        let Some(expected_path) = security.cfg.ws_path.as_deref() else {
+            if !peer_ip.is_loopback() {
+                security.record_auth_failure_counted(peer_ip, &counters);
+            }
+            bail!("unexpected HTTP request on raw egress listener");
+        };
+        let (mut ws_edge, effective_ip, rx_hdr, tx_resp) = match timeout(
+            handshake,
+            server_ws_accept(edge, &magic, expected_path, peer_ip),
+        )
+        .await
+        .context("egress_ws_upgrade_timeout")
+        .and_then(|r| r)
+        {
+            Ok(res) => res,
+            Err(err) => {
+                if !peer_ip.is_loopback() {
+                    security.record_auth_failure_counted(peer_ip, &counters);
+                }
+                return Err(err);
+            }
+        };
+        counters
+            .downstream_rx_bytes
+            .fetch_add(rx_hdr as u64, Relaxed);
+        counters
+            .downstream_tx_bytes
+            .fetch_add(tx_resp as u64, Relaxed);
+        security.check_peer_allowed(effective_ip)?;
+        let edge_fd = stream_raw_fd(ws_edge.inner_ref());
+        let mut inner_magic = [0u8; 4];
+        if let Err(err) = timeout(handshake, ws_edge.read_exact(&mut inner_magic))
+            .await
+            .context("egress_ws_inner_header_timeout")
+            .and_then(|r| r.context("egress_ws_inner_header_eof"))
+        {
+            counters.egress_preface_aborted.fetch_add(1, Relaxed);
+            return Err(err);
+        }
+        counters
+            .downstream_rx_bytes
+            .fetch_add(inner_magic.len() as u64, Relaxed);
+        return egress_connection_after_magic(
+            &mut ws_edge,
+            edge_fd,
+            inner_magic,
+            effective_ip,
+            dcs,
+            expected_token,
+            handshake,
+            idle,
+            counters,
+            security,
+            unauth_permit,
+        )
+        .await;
+    }
+
+    if peer_ip.is_loopback() {
+        security.check_peer_allowed(peer_ip)?;
+    }
+    let edge_fd = stream_raw_fd(&edge);
+    egress_connection_after_magic(
+        &mut edge,
+        edge_fd,
+        magic,
+        peer_ip,
+        dcs,
+        expected_token,
+        handshake,
+        idle,
+        counters,
+        security,
+        unauth_permit,
+    )
+    .await
+}
+
+#[cfg(unix)]
+type EdgeRawFd = Option<std::os::fd::RawFd>;
+#[cfg(not(unix))]
+type EdgeRawFd = Option<i32>;
+
+#[allow(clippy::too_many_arguments)]
+async fn egress_connection_after_magic<E: AsyncRead + AsyncWrite + Unpin>(
+    edge: &mut E,
+    edge_fd: EdgeRawFd,
+    magic: [u8; 4],
+    peer_ip: std::net::IpAddr,
+    dcs: &HashMap<i16, SocketAddr>,
+    expected_token: &[u8; 16],
+    handshake: Duration,
+    idle: Duration,
+    counters: Arc<telemetry::Counters>,
+    security: &EgressRuntimeSecurity,
+    unauth_permit: tokio::sync::SemaphorePermit<'_>,
+) -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
 
     if magic == wire::EGRESS_MAGIC_V4 {
         let mut rest = [0u8; wire::EGRESS_PREFACE_V4_LEN - 4];
@@ -537,9 +641,8 @@ pub(crate) async fn egress_connection(
     }
     timeout(handshake, edge.write_all(&[EGRESS_ACK_OK])).await??;
     counters.downstream_tx_bytes.fetch_add(1, Relaxed);
-    let edge_fd = stream_raw_fd(edge);
     let dc_fd = stream_raw_fd(&dc);
-    let (er, ew) = edge.split();
+    let (er, ew) = tokio::io::split(edge);
     let (dr, dw) = dc.split();
     let session_start = Instant::now();
     let last_activity_ms = std::sync::atomic::AtomicU64::new(0);

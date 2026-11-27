@@ -20,13 +20,13 @@ pub(crate) fn format_edge_alert_message(ev: &EdgeAlertEvent) -> String {
         EdgeRouteState::FailoverBackup(_) => format!(
             "Основной egress ({}) недоступен — трафик переключён на резервный egress ({}).",
             ev.primary,
-            ev.active.map(|a| a.to_string()).unwrap_or_else(|| "unknown".into())
+            ev.active.as_deref().unwrap_or("unknown")
         ),
         EdgeRouteState::Degraded { healthy, total } => format!(
             "Часть узлов egress недоступна в режиме round-robin: доступно {} из {} (последний успешный: {}). Причина: {}",
             healthy,
             total,
-            ev.active.map(|a| a.to_string()).unwrap_or_else(|| "нет".into()),
+            ev.active.as_deref().unwrap_or("нет"),
             ev.reason
         ),
         EdgeRouteState::AllDown => format!(
@@ -175,8 +175,8 @@ pub(crate) fn emit_edge_route_alert(state: &State, ev: EdgeAlertEvent) {
         "event": "edge_route_alert",
         "prev_state": ev.prev.as_str(),
         "state": ev.next.as_str(),
-        "primary": ev.primary.to_string(),
-        "active": ev.active.map(|a| a.to_string()),
+        "primary": ev.primary.clone(),
+        "active": ev.active.clone(),
         "reason": ev.reason,
         "message": message,
     });
@@ -220,14 +220,22 @@ pub(crate) async fn monitor_edge_egress(state: Arc<State>, period: Duration) {
         let probe_dc = BACKGROUND_PROBE_DCS[dc_rot % BACKGROUND_PROBE_DCS.len()];
         dc_rot = dc_rot.wrapping_add(1);
         let mut probes = tokio::task::JoinSet::new();
-        for (idx, &address) in state.egress_upstreams.iter().enumerate() {
+        for (idx, endpoint) in state.egress_upstreams.iter().cloned().enumerate() {
             let token = state.egress_token;
             let use_mtv3 = state.egress_use_mtv3;
+            let tls_conn = state.ws_pool.as_ref().map(|p| p.tls_connector().clone());
             probes.spawn(async move {
                 let limit = Duration::from_secs(4);
                 let outcome = match timeout(
                     limit,
-                    probe_egress_endpoint_proto(address, probe_dc, &token, limit, use_mtv3),
+                    probe_egress_endpoint_proto(
+                        &endpoint,
+                        probe_dc,
+                        &token,
+                        limit,
+                        use_mtv3,
+                        tls_conn.as_ref(),
+                    ),
                 )
                 .await
                 {

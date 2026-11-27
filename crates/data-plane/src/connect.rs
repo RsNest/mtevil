@@ -36,38 +36,63 @@ pub(crate) fn build_egress_wire_preface(
 
 #[cfg(test)]
 pub(crate) async fn probe_egress_endpoint(
-    addr: SocketAddr,
+    addr: impl Into<EgressEndpoint>,
     dc_id: i16,
     token: &[u8; 16],
     limit: Duration,
 ) -> EgressProbe {
-    probe_egress_endpoint_proto(addr, dc_id, token, limit, false).await
+    let ep = addr.into();
+    probe_egress_endpoint_proto(&ep, dc_id, token, limit, false, None).await
 }
 
 pub(crate) async fn probe_egress_endpoint_proto(
-    addr: SocketAddr,
+    endpoint: &EgressEndpoint,
     dc_id: i16,
     token: &[u8; 16],
     limit: Duration,
     use_mtv3: bool,
+    tls_connector: Option<&tokio_native_tls::TlsConnector>,
 ) -> EgressProbe {
-    let mut stream = match timeout(limit, TcpStream::connect(addr)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(err)) => {
-            return EgressProbe {
-                tcp_reachable: false,
-                token_status: "unknown",
-                dc_reachable: false,
-                detail: format!("tcp_connect_failed: {err}"),
-            };
-        }
-        Err(_) => {
-            return EgressProbe {
-                tcp_reachable: false,
-                token_status: "unknown",
-                dc_reachable: false,
-                detail: "tcp_connect_timeout".to_string(),
-            };
+    let mut stream: UpstreamStream = match endpoint {
+        EgressEndpoint::Tcp(addr) => match timeout(limit, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => UpstreamStream::Tcp(s),
+            Ok(Err(err)) => {
+                return EgressProbe {
+                    tcp_reachable: false,
+                    token_status: "unknown",
+                    dc_reachable: false,
+                    detail: format!("tcp_connect_failed: {err}"),
+                };
+            }
+            Err(_) => {
+                return EgressProbe {
+                    tcp_reachable: false,
+                    token_status: "unknown",
+                    dc_reachable: false,
+                    detail: "tcp_connect_timeout".to_string(),
+                };
+            }
+        },
+        EgressEndpoint::Ws(ws_ep) => {
+            match timeout(limit, dial_ws_endpoint(ws_ep, tls_connector)).await {
+                Ok(Ok(ws)) => UpstreamStream::Ws(Box::new(ws)),
+                Ok(Err(err)) => {
+                    return EgressProbe {
+                        tcp_reachable: false,
+                        token_status: "unknown",
+                        dc_reachable: false,
+                        detail: format!("ws_connect_failed: {err:#}"),
+                    };
+                }
+                Err(_) => {
+                    return EgressProbe {
+                        tcp_reachable: false,
+                        token_status: "unknown",
+                        dc_reachable: false,
+                        detail: "ws_connect_timeout".to_string(),
+                    };
+                }
+            }
         }
     };
     let dc = match wire::dc_transport() {
@@ -254,6 +279,17 @@ pub(crate) async fn probe_telegram_e2e(
         let mut stream = TcpStream::connect(addr)
             .await
             .with_context(|| format!("connecting to proxy {addr}"))?;
+        if cfg.proxy_protocol {
+            // Send 16-byte PROXY protocol v2 LOCAL command header (version 2, command 0, len 0).
+            const LOCAL_V2: [u8; 16] = [
+                0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a, 0x20, 0x00,
+                0x00, 0x00,
+            ];
+            stream
+                .write_all(&LOCAL_V2)
+                .await
+                .context("writing PROXY v2 LOCAL header")?;
+        }
         stream.write_all(&hello_rec).await.context("writing FakeTLS ClientHello")?;
 
         let mut flight = Vec::new();
@@ -317,6 +353,9 @@ pub(crate) fn default_media_override_map() -> HashMap<i16, Vec<SocketAddr>> {
         egress_upstreams: Vec::new(),
         egress_strategy: EgressStrategy::RoundRobin,
         egress_token_file: None,
+        egress_ws_path: None,
+        egress_ws_pool_size: config::default_egress_ws_pool_size(),
+        egress_tls_ca_file: None,
         max_connections: 128,
         client_hello_timeout_secs: 5,
         handshake_timeout_secs: 10,
@@ -663,21 +702,18 @@ pub(crate) async fn dial_egress_candidate(
     dc_abs: i16,
     mode: EgressDialMode<'_>,
     per_try: Duration,
-) -> std::result::Result<TcpStream, EgressAttemptErr> {
+) -> std::result::Result<UpstreamStream, EgressAttemptErr> {
     use std::sync::atomic::Ordering::Relaxed;
-    let addr = state.egress_upstreams[idx];
+    let endpoint = &state.egress_upstreams[idx];
     let notifier = EgressHealth::node_down_notifier(&state.egress_health, idx);
     let node_down = notifier.notified();
     tokio::pin!(node_down);
     node_down.as_mut().enable();
     let t0 = Instant::now();
     let preface_written = std::sync::atomic::AtomicBool::new(false);
+    let is_mtv4 = matches!(mode, EgressDialMode::FramedMe { .. });
 
     let attempt = timeout(per_try, async {
-        let mut upstream = TcpStream::connect(addr)
-            .await
-            .map_err(|e| EgressAttemptErr::Node(e.into()))?;
-        configure_tcp_socket(&upstream).map_err(EgressAttemptErr::Node)?;
         let preface = build_egress_wire_preface_for_mode(
             &state.egress_token,
             dc_id,
@@ -685,6 +721,77 @@ pub(crate) async fn dial_egress_candidate(
             state.egress_use_mtv3,
         )
         .map_err(EgressAttemptErr::Node)?;
+
+        // Fast-path: try a pre-warmed WS/WSS connection first if available.
+        if matches!(endpoint, EgressEndpoint::Ws(_)) {
+            if let Some(mut warm_ws) = state.ws_pool.as_ref().and_then(|p| p.pop_warm(idx)) {
+                let warm_res: std::io::Result<u8> = async {
+                    warm_ws.write_all(&preface).await?;
+                    let mut ack = [0u8; 1];
+                    warm_ws.read_exact(&mut ack).await?;
+                    Ok(ack[0])
+                }
+                .await;
+                match warm_res {
+                    Ok(ack_byte) => {
+                        preface_written.store(true, Relaxed);
+                        state
+                            .counters
+                            .upstream_tx_bytes
+                            .fetch_add(preface.len() as u64, Relaxed);
+                        state.counters.upstream_rx_bytes.fetch_add(1, Relaxed);
+                        if ack_byte == EGRESS_ACK_OK {
+                            EgressHealth::record_ack_latency(
+                                &state.egress_health,
+                                idx,
+                                t0.elapsed(),
+                            );
+                            if is_mtv4 {
+                                clear_mtv4_cooldown(state, idx);
+                            }
+                            return Ok(UpstreamStream::Ws(Box::new(warm_ws)));
+                        } else if ack_byte == EGRESS_ACK_ERR {
+                            return if is_mtv4 {
+                                Err(EgressAttemptErr::Mtv4Unsupported(anyhow::anyhow!(
+                                    "egress rejected MTV4 for DC {dc_abs} (ME disabled or pool empty)"
+                                )))
+                            } else {
+                                Err(EgressAttemptErr::Dc(anyhow::anyhow!(
+                                    "egress DC {dc_abs} unreachable (negative ACK)"
+                                )))
+                            };
+                        } else {
+                            return Err(EgressAttemptErr::Node(anyhow::anyhow!(
+                                "egress upstream invalid ACK byte"
+                            )));
+                        }
+                    }
+                    Err(_) => {
+                        // Stale idle socket closed by remote proxy; purge pool and dial fresh inline.
+                        if let Some(pool) = &state.ws_pool {
+                            pool.clear_node(idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut upstream = match endpoint {
+            EgressEndpoint::Tcp(addr) => {
+                let tcp = TcpStream::connect(addr)
+                    .await
+                    .map_err(|e| EgressAttemptErr::Node(e.into()))?;
+                configure_tcp_socket(&tcp).map_err(EgressAttemptErr::Node)?;
+                UpstreamStream::Tcp(tcp)
+            }
+            EgressEndpoint::Ws(ws_ep) => {
+                let tls_conn = state.ws_pool.as_ref().map(|p| p.tls_connector());
+                let ws = dial_ws_endpoint(ws_ep, tls_conn)
+                    .await
+                    .map_err(EgressAttemptErr::Node)?;
+                UpstreamStream::Ws(Box::new(ws))
+            }
+        };
         upstream
             .write_all(&preface)
             .await
@@ -695,7 +802,6 @@ pub(crate) async fn dial_egress_candidate(
             .upstream_tx_bytes
             .fetch_add(preface.len() as u64, Relaxed);
         let mut ack = [0u8; 1];
-        let is_mtv4 = matches!(mode, EgressDialMode::FramedMe { .. });
         upstream.read_exact(&mut ack).await.map_err(|e| {
             if is_mtv4 {
                 EgressAttemptErr::Mtv4Unsupported(anyhow::anyhow!(
@@ -760,7 +866,7 @@ pub(crate) fn finalize_egress_success(
     last_err: &Option<anyhow::Error>,
     default_backup_reason: &'static str,
 ) {
-    let addr = state.egress_upstreams[idx];
+    let addr_label = state.egress_upstreams[idx].redacted_label();
     claim.record_success();
     let (healthy, total) = EgressHealth::set_node_availability(&state.egress_health, idx, true);
     let (next_state, reason, active_override) = if ordered {
@@ -768,7 +874,7 @@ pub(crate) fn finalize_egress_success(
             (
                 EdgeRouteState::PrimaryOk,
                 "primary_recovered".to_string(),
-                Some(addr),
+                Some(addr_label),
             )
         } else {
             state
@@ -781,14 +887,14 @@ pub(crate) fn finalize_egress_success(
                     .as_ref()
                     .map(|e| format!("{e:#}"))
                     .unwrap_or_else(|| default_backup_reason.to_string()),
-                Some(addr),
+                Some(addr_label),
             )
         }
     } else if healthy == total {
         (
             EdgeRouteState::PrimaryOk,
             "all_egress_recovered".to_string(),
-            Some(addr),
+            Some(addr_label),
         )
     } else {
         (
@@ -797,7 +903,7 @@ pub(crate) fn finalize_egress_success(
                 .as_ref()
                 .map(|e| format!("{e:#}"))
                 .unwrap_or_else(|| default_backup_reason.to_string()),
-            Some(addr),
+            Some(addr_label),
         )
     };
     if let Some(ev) = EgressHealth::transition_route_state(
@@ -832,6 +938,9 @@ pub(crate) fn finalize_egress_error(
                 Instant::now(),
             ) {
                 AckTimeoutEscalation::EscalateNode => {
+                    if let Some(pool) = &state.ws_pool {
+                        pool.clear_node(idx);
+                    }
                     EgressHealth::set_node_availability(&state.egress_health, idx, false);
                     claim.record_node_failure(state.egress_cooldown, state.egress_cooldown_max);
                     EgressHealth::notify_node_down(&state.egress_health, idx);
@@ -846,6 +955,9 @@ pub(crate) fn finalize_egress_error(
             e
         }
         EgressAttemptErr::Node(e) => {
+            if let Some(pool) = &state.ws_pool {
+                pool.clear_node(idx);
+            }
             EgressHealth::set_node_availability(&state.egress_health, idx, false);
             claim.record_node_failure(state.egress_cooldown, state.egress_cooldown_max);
             EgressHealth::notify_node_down(&state.egress_health, idx);
@@ -868,7 +980,7 @@ pub(crate) async fn connect_upstream(
     state: &State,
     dc_id: i16,
     dc_header: &[u8; 64],
-) -> Result<(TcpStream, &'static str)> {
+) -> Result<(UpstreamStream, &'static str)> {
     use std::sync::atomic::Ordering::Relaxed;
     if state.egress_upstreams.is_empty() {
         let seq = state.egress_rr.fetch_add(1, Relaxed);
@@ -880,7 +992,7 @@ pub(crate) async fn connect_upstream(
             .counters
             .upstream_tx_bytes
             .fetch_add(dc_header.len() as u64, Relaxed);
-        return Ok((upstream, "direct"));
+        return Ok((UpstreamStream::Tcp(upstream), "direct"));
     }
     connect_egress_with_mode(state, dc_id, EgressDialMode::DirectStream(dc_header)).await
 }
@@ -890,7 +1002,7 @@ pub(crate) async fn connect_upstream_mtv4(
     dc_id: i16,
     proto: wire::ClientProtoKind,
     client_addr: Option<std::net::SocketAddrV4>,
-) -> Result<(TcpStream, &'static str)> {
+) -> Result<(UpstreamStream, &'static str)> {
     ensure!(
         !state.egress_upstreams.is_empty(),
         "MTV4 requires at least one egress upstream"
@@ -907,7 +1019,7 @@ async fn connect_egress_with_mode(
     state: &State,
     dc_id: i16,
     mode: EgressDialMode<'_>,
-) -> Result<(TcpStream, &'static str)> {
+) -> Result<(UpstreamStream, &'static str)> {
     use std::sync::atomic::Ordering::Relaxed;
     let route_label: &'static str = match mode {
         EgressDialMode::DirectStream(_) => "egress",
@@ -1017,8 +1129,8 @@ async fn connect_egress_with_mode(
                 let fut2 = dial_egress_candidate(state, idx2, dc_id, dc_abs, mode, per_try2);
                 tokio::pin!(fut2);
                 enum HedgeRace {
-                    First(std::result::Result<TcpStream, EgressAttemptErr>),
-                    Second(std::result::Result<TcpStream, EgressAttemptErr>),
+                    First(std::result::Result<UpstreamStream, EgressAttemptErr>),
+                    Second(std::result::Result<UpstreamStream, EgressAttemptErr>),
                 }
                 let first_done = tokio::select! {
                     res1 = &mut fut1 => HedgeRace::First(res1),

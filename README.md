@@ -50,7 +50,7 @@ python3 deploy/setup.py
 
 ### Режим `webproxy` (Telegram WEB Proxy через `tproxy-server`)
 
-Если ваш домен уже обслуживается внешним `Caddy` или `nginx` на порту `443`, мастер поддерживает режим **`webproxy`** (`mtevilctl setup --webproxy` или пункт **4**): рядом с `mtevil` поднимается sidecar-контейнер `telegramdesktop/tproxy-server`, а поддерживающие протокол клиенты Telegram подключаются по ссылкам `https://t.me/webproxy?...` / `tg://webproxy?...` через встроенный браузерный движок (настоящий `TLS 1.3`, `HTTP/2` и `WebSocket`) с маршрутизацией потока в `mtevil` (`direct`, `edge → egress` или `ME`). Неаутентифицированные запросы получают ваш реальный сайт (`./site` или локальный HTTP-бэкенд). Инструкция и ограничения — в [deploy/README.md](deploy/README.md#режим-webproxy-telegram-web-proxy-через-tproxy-server-за-caddynginx) и [ADR-004](docs/adr/004-webproxy-and-live-sessions.md).
+Если ваш домен обслуживается `Caddy` или `nginx` на порту `443` (либо порт `443` свободен и вы запускаете автономный режим `mtevilctl setup --webproxy --managed-caddy`), мастер поддерживает режим **`webproxy`** (`mtevilctl setup --webproxy` или пункт **4**): рядом с `mtevil` поднимается sidecar-контейнер `telegramdesktop/tproxy-server`, а поддерживающие протокол клиенты Telegram подключаются по ссылкам `https://t.me/webproxy?...` / `tg://webproxy?...` через встроенный браузерный движок (настоящий `TLS 1.3`, `HTTP/2` и `WebSocket`) с маршрутизацией потока в `mtevil` (`direct`, `edge → egress` или `ME`). Для одиночных зарубежных VPS также доступен профиль `--cdn` (за Cloudflare), а для деления порта `:443` с `Xray` / `nginx stream` — режим `mtevilctl setup --shared-443` (пункт **5**). Инструкция и ограничения — в [deploy/README.md](deploy/README.md#режим-webproxy-telegram-web-proxy-через-tproxy-server-за-caddynginx), [ADR-004](docs/adr/004-webproxy-and-live-sessions.md) и [ADR-005](docs/adr/005-wss-egress-and-turnkey-443.md).
 
 ## Как обновиться и управлять прокси
 
@@ -65,7 +65,11 @@ mtevilctl user list              # Показать список дополни�
 mtevilctl adtag set              # Задать рекламный тег ME (@MTProxybot) через скрытый ввод без истории shell
 mtevilctl adtag show             # Показать статус рекламного тега (значение маскируется)
 mtevilctl adtag clear            # Удалить рекламный тег ME
-mtevilctl setup                  # Запустить интерактивный мастер перенастройки текущей установки
+mtevilctl egress list            # Показать узлы egress, стратегию и задержку хеджирования (на edge)
+mtevilctl egress add <адрес>     # Добавить резервный egress (IP:PORT или wss://host/ws/...)
+mtevilctl egress hedge 250       # Задать задержку хеджирования egress в мс
+mtevilctl tuning                 # Показать/настроить фрагментацию TCP MSS (--handshake-mss, --bulk-mss)
+mtevilctl setup                  # Запустить интерактивный мастер перенастройки (--webproxy, --shared-443)
 mtevilctl update                 # Обновить до свежего стабильного релиза без повторного прохождения мастера
 mtevilctl update --prerelease    # Обновить с учётом предварительных релизов (alpha/beta/rc)
 mtevilctl rollback               # Вернуть предыдущий рабочий образ и конфигурацию одной командой (без интернета)
@@ -111,7 +115,7 @@ flowchart LR
     Backup --> DC
 ```
 
-Сначала запустите мастер с ролью `egress` на выходных серверах, затем с ролью `edge` на входном. Узлы связываются по доступным адресам приватной сети. Подойдут, например, SharX, WireGuard или AmneziaWG.
+Сначала запустите мастер с ролью `egress` на выходных серверах, затем с ролью `edge` на входном. Узлы связываются либо напрямую через встроенный **`WSS`-транспорт на `:443`** (`mtevilctl setup --egress-ws` на выходе и `wss://домен/ws/...` на `edge`, с тёплым пулом независимых соединений без внешних SSH/VPN-туннелей и без TCP-over-TCP HOL blocking), либо по приватной L3-сети (WireGuard, AmneziaWG, SharX). Управлять списком выходов и задержкой переключения можно одной командой: `mtevilctl egress add|del|hedge|check`.
 
 В стратегии `ordered` новые подключения идут через основной egress (с hedged connect через `400 мс` на резервный выход при задержке ACK), а в `round-robin` — чередуются по кругу с пропуском узлов в cooldown (circuit breaker работает в обеих стратегиях с экспоненциальным backoff `3..60 с` `±20%` jitter, fail-open пробой при одновременном cooldown всех узлов и фоновым пробингом `30 с / 5 с` по DC `2, 4, -2, -4` для автоматического failback). Между `edge` и `egress` используется аутентифицированный префейс `MTV3` (`HMAC-SHA256` по токену, `timestamp` с окном `±30 с` и `nonce` с защитой от повтора, с обратной совместимостью с `MTV2` при `egress_accept_legacy = true`), а при включённом ME-режиме — `MTV4` с поддержкой `ad_tag` и автоматическим fallback на Direct (`MTV3`) при недоступности ME или несовместимом `egress v0.2.0`. При обновлении схемы `edge → egress` всегда обновляйте сначала `egress`, затем `edge`. Уже открытая сессия может оборваться. Telegram может подключиться снова по той же ссылке.
 
@@ -151,5 +155,5 @@ flowchart LR
 ## Документация и лицензия
 
 - [Развёртывание, диагностика, обновление и откат](deploy/README.md)
-- [Архитектура и решения](docs/adr/000-architecture-baseline.md) · [ADR-002: ME-режим и `ad_tag`](docs/adr/002-me-mode.md) · [ADR-003: Маскировка FakeTLS](docs/adr/003-masking-improvements.md) · [ADR-004: WEB Proxy и живые сессии](docs/adr/004-webproxy-and-live-sessions.md) · [Реализация ядра](docs/specs/prototype.md) · [Журнал проверок](docs/evidence-log.md)
+- [Архитектура и решения](docs/adr/000-architecture-baseline.md) · [ADR-002: ME-режим и `ad_tag`](docs/adr/002-me-mode.md) · [ADR-003: Маскировка FakeTLS](docs/adr/003-masking-improvements.md) · [ADR-004: WEB Proxy и живые сессии](docs/adr/004-webproxy-and-live-sessions.md) · [ADR-005: WSS egress и совместный `:443`](docs/adr/005-wss-egress-and-turnkey-443.md) · [Реализация ядра](docs/specs/prototype.md) · [Журнал проверок](docs/evidence-log.md)
 - Лицензия: двойная `MIT OR Apache-2.0` ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)).

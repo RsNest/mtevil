@@ -568,6 +568,46 @@ def validate_sni(value: str) -> str:
     return v
 
 
+DEFAULT_CADDY_IMAGE = "caddy:2.8-alpine"
+SNI_HYGIENE_STOPWORDS = (
+    "mtevil",
+    "mtveil",
+    "mtproto",
+    "tproxy",
+    "webproxy",
+    "proxy",
+    "vpn",
+    "xray",
+    "vless",
+    "vmess",
+    "trojan",
+)
+
+
+def lint_sni_hygiene(domain: str) -> list[str]:
+    """Return non-fatal DPI hygiene warnings for a chosen SNI or webproxy domain."""
+    host = (domain or "").strip().lower().rstrip(".")
+    if not host:
+        return []
+    matched: list[str] = []
+    for kw in SNI_HYGIENE_STOPWORDS:
+        if kw in host and kw not in matched:
+            matched.append(kw)
+    if not matched:
+        return []
+    joined = ", ".join(f"'{m}'" for m in matched)
+    return [
+        f"Гигиена домена/SNI: имя '{domain}' содержит маркеры прокси ({joined}) — "
+        "ТСПУ и цензоры могут фильтровать такие поддомены по открытому полю SNI/Certificate Transparency. "
+        "Рекомендуется нейтральное имя домена."
+    ]
+
+
+def warn_if_sni_suspicious(domain: str) -> None:
+    for msg in lint_sni_hygiene(domain):
+        print(warn_text(f"  Предупреждение: {msg}"))
+
+
 WEBPROXY_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
@@ -816,12 +856,19 @@ def render_webproxy_reverse_proxy_snippets(
     hostname: str,
     base_path: str,
     tproxy_listen: str,
+    *,
+    cdn_mode: bool = False,
 ) -> tuple[str, str]:
     host = validate_webproxy_hostname(hostname)
     prefix = validate_webproxy_base_path(base_path)
     listen_ep = validate_loopback_endpoint(tproxy_listen)
+    cdn_note = (
+        "# Режим за CDN (Cloudflare): включите SSL/TLS -> Full (Strict) и Network -> WebSockets: ON.\n"
+        if cdn_mode
+        else ""
+    )
     if prefix == "":
-        caddy = f"""# Caddyfile (рекомендуемый вариант: весь домен идёт через tproxy-server)
+        caddy = f"""{cdn_note}# Caddyfile (рекомендуемый вариант: весь домен идёт через tproxy-server)
 {{
     servers {{
         protocols h1 h2
@@ -847,7 +894,7 @@ def render_webproxy_reverse_proxy_snippets(
 """
         loc_path = "/"
     else:
-        caddy = f"""# Caddyfile (режим сосуществования на существующем сайте по префиксу /{prefix}/)
+        caddy = f"""{cdn_note}# Caddyfile (режим сосуществования на существующем сайте по префиксу /{prefix}/)
 {host} {{
     handle /{prefix}/* {{
         encode zstd gzip
@@ -863,7 +910,134 @@ def render_webproxy_reverse_proxy_snippets(
 """
         loc_path = f"/{prefix}/"
 
-    nginx = f"""# nginx (HTTPS 443 -> tproxy-server; НЕ включайте access_log с query-строкой!)
+    xff_expr = "$http_cf_connecting_ip" if cdn_mode else "$remote_addr"
+    cdn_nginx_note = (
+        "    # При работе за Cloudflare разрешайте порт 443 в firewall только для подсетей Cloudflare!\n"
+        if cdn_mode
+        else ""
+    )
+    nginx = f"""{cdn_note}# nginx (HTTPS 443 -> tproxy-server; НЕ включайте access_log с query-строкой!)
+map $http_upgrade $connection_upgrade {{
+    default upgrade;
+    ''      close;
+}}
+
+server {{
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name {host};
+{cdn_nginx_note}
+    ssl_certificate     /etc/letsencrypt/live/{host}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{host}/privkey.pem;
+    access_log off;
+
+    location {loc_path} {{
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For {xff_expr};
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 65s;
+        proxy_send_timeout 65s;
+        proxy_pass http://{listen_ep};
+    }}
+}}
+"""
+    return caddy, nginx
+
+
+def validate_egress_ws_path(value: str) -> str:
+    path = (value or "").strip()
+    if not path.startswith("/"):
+        raise ValueError("путь WebSocket должен начинаться с '/' (например, /ws/9f3c8a...)")
+    if len(path) < 2 or len(path) > 256:
+        raise ValueError("длина пути WebSocket должна быть от 2 до 256 символов (корень '/' не допускается)")
+    if any((ord(ch) <= 32 or ord(ch) >= 127 or ch in "?#\"'\\<>") for ch in path):
+        raise ValueError("путь WebSocket содержит недопустимые символы")
+    return path
+
+
+def validate_egress_upstream(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError("адрес egress не может быть пустым")
+    if raw.startswith("tcp://"):
+        return f"tcp://{validate_endpoint(raw[len('tcp://'):])}"
+    if raw.startswith(("wss://", "ws://")):
+        parsed = urllib.parse.urlsplit(raw)
+        scheme = parsed.scheme.lower()
+        if parsed.username or parsed.password or parsed.fragment:
+            raise ValueError("userinfo и '#' не допускаются в URL egress")
+        host = (parsed.hostname or "").strip()
+        if not host:
+            raise ValueError("не указан хост в URL egress")
+        try:
+            ip = ipaddress.ip_address(host)
+            if ip.is_unspecified:
+                raise ValueError("wildcard IP (0.0.0.0 / ::) не допускается в URL egress")
+            host_fmt = f"[{ip}]" if ip.version == 6 else str(ip)
+        except ValueError as exc:
+            if "wildcard" in str(exc):
+                raise
+            host_l = host.lower()
+            if host_l != "localhost":
+                validate_sni(host_l)
+            host_fmt = host_l
+        default_port = 443 if scheme == "wss" else 80
+        try:
+            port = parsed.port if parsed.port is not None else default_port
+        except ValueError as exc:
+            raise ValueError("некорректный порт в URL egress") from exc
+        validate_port(str(port))
+        ws_path = validate_egress_ws_path(parsed.path)
+        conn_q = ""
+        if parsed.query:
+            params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            for k, v in params:
+                if k != "connect":
+                    raise ValueError(f"неподдерживаемый параметр '?{k}=' (поддерживается только ?connect=IP:PORT)")
+                ep = validate_endpoint(v)
+                conn_q = f"?connect={ep}"
+        port_part = "" if port == default_port else f":{port}"
+        return f"{scheme}://{host_fmt}{port_part}{ws_path}{conn_q}"
+    return validate_endpoint(raw)
+
+
+def redact_egress_upstream(value: str) -> str:
+    raw = (value or "").strip()
+    if raw.startswith(("wss://", "ws://")):
+        parsed = urllib.parse.urlsplit(raw)
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        default_port = 443 if scheme == "wss" else 80
+        port = parsed.port or default_port
+        return f"{scheme}://{host}:{port}/***"
+    return raw
+
+
+def render_egress_ws_reverse_proxy_snippets(
+    hostname: str,
+    ws_path: str,
+    egress_listen: str,
+) -> tuple[str, str]:
+    host = validate_sni(hostname).lower()
+    path = validate_egress_ws_path(ws_path)
+    listen_ep = validate_loopback_endpoint(egress_listen)
+    caddy = f"""# Caddyfile на узле egress (принимает WSS от RU edge на :443 без внешнего SSH/VPN)
+{host} {{
+    @mtevil_egress path {path}
+    handle @mtevil_egress {{
+        reverse_proxy {listen_ep}
+    }}
+    handle {{
+        respond "OK" 200
+    }}
+}}
+"""
+    nginx = f"""# nginx на узле egress (принимает WSS от RU edge на :443; access_log отключён!)
 map $http_upgrade $connection_upgrade {{
     default upgrade;
     ''      close;
@@ -879,19 +1053,65 @@ server {{
     ssl_certificate_key /etc/letsencrypt/live/{host}/privkey.pem;
     access_log off;
 
-    location {loc_path} {{
+    location = {path} {{
         proxy_http_version 1.1;
         proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
-        proxy_read_timeout 65s;
-        proxy_send_timeout 65s;
+        proxy_read_timeout 360s;
+        proxy_send_timeout 360s;
         proxy_pass http://{listen_ep};
+    }}
+
+    location / {{
+        return 200 'OK';
+        add_header Content-Type text/plain;
     }}
 }}
 """
     return caddy, nginx
+
+
+def render_shared_443_snippets(sni: str, backend_listen: str) -> tuple[str, str]:
+    host = validate_sni(sni).lower()
+    listen_ep = validate_loopback_endpoint(backend_listen)
+    xray_snip = f"""// Фрагмент для Xray (VLESS + TLS / REALITY) с делением порта 443 через fallbacks (PROXY protocol v2):
+// Если в Xray используется REALITY на другом домене, поставьте перед Xray и mtevil nginx stream (см. nginx.stream443.example.conf),
+// либо добавьте этот объект в массив "fallbacks" вашего VLESS-inbound на :443:
+{{
+  "dest": "{listen_ep}",
+  "xver": 2
+}}
+"""
+    nginx_stream = f"""# nginx stream (L4 SNI-маршрутизатор на :443 без расшифровки TLS — совместим с Xray REALITY и mtevil!)
+# Поместите блок stream на верхнем уровне /etc/nginx/nginx.conf (рядом с http {{ ... }}):
+stream {{
+    map $ssl_preread_server_name $sni_443_backend {{
+        {host}   mtevil_shared443;
+        default  existing_443_service;
+    }}
+
+    upstream mtevil_shared443 {{
+        server {listen_ep};
+    }}
+
+    upstream existing_443_service {{
+        # Укажите внутренний порт вашего Xray REALITY / веб-сервера (перенесите его с 0.0.0.0:443 на 127.0.0.1:8444)
+        server 127.0.0.1:8444;
+    }}
+
+    server {{
+        listen 443 reuseport;
+        listen [::]:443 reuseport;
+        ssl_preread on;
+        proxy_protocol on;
+        proxy_pass $sni_443_backend;
+    }}
+}}
+"""
+    return xray_snip, nginx_stream
 
 
 def validate_port(value: str) -> int:
@@ -1086,6 +1306,10 @@ def ensure_available_port(
                 "  Подсказка (self-steal): для маскировки под свой сайт освободите 443 "
                 "(перенесите nginx/caddy на 127.0.0.1:8443) или выберите другой порт."
             )
+            print(
+                "  Подсказка (делить порт 443 без выхода на высокие порты): используйте "
+                "'mtevilctl setup --shared-443' (за Xray/nginx SNI-роутером) или 'mtevilctl setup --webproxy'."
+            )
         alt = find_free_port(bind_ip, pub_port)
         if alt is not None:
             if show_link_note:
@@ -1138,6 +1362,7 @@ def render_compose(
     max_connections: int | None = None,
     extra_hosts: list[str] | None = None,
     tproxy_sidecar: dict[str, object] | None = None,
+    managed_caddy: dict[str, object] | None = None,
 ) -> str:
     try:
         rel_context = os.path.relpath(repo_root, deploy_dir).replace("\\", "/")
@@ -1210,6 +1435,38 @@ def render_compose(
         max-size: "10m"
         max-file: "3"
 """
+    caddy_block = ""
+    caddy_volumes = ""
+    if managed_caddy:
+        cf_name = str(managed_caddy.get("caddyfile_name") or "Caddyfile")
+        caddy_block = f"""
+  caddy:
+    image: ${{MTEVIL_CADDY_IMAGE:-{DEFAULT_CADDY_IMAGE}}}
+    init: true
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      tproxy:
+        condition: service_healthy
+    volumes:
+      - ./{cf_name}:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: "0.50"
+    pids_limit: 128
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+"""
+        caddy_volumes = "  caddy_data:\n  caddy_config:\n"
     return f"""name: ${{MTEVIL_PROJECT:-mtevil-{role}}}
 
 x-image: &image
@@ -1248,7 +1505,7 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-{tproxy_block}
+{tproxy_block}{caddy_block}
   init:
     <<: *image
     profiles: [tools]
@@ -1264,7 +1521,7 @@ services:
 volumes:
   state:
   replay:
-"""
+{caddy_volumes}"""
 
 
 def deployment_service(deploy_dir: Path) -> str:
@@ -1638,6 +1895,7 @@ def choose_wizard_mode(default: str = "simple") -> str:
         "advanced": "2",
         "self-steal": "3",
         "webproxy": "4",
+        "shared-443": "5",
     }.get(default, "1")
     print()
     print(heading("Выберите режим установки"))
@@ -1645,6 +1903,7 @@ def choose_wizard_mode(default: str = "simple") -> str:
     print("  2. Расширенная настройка · ручные параметры и несколько серверов")
     print("  3. self-steal · маскировка под свой локальный HTTPS-сайт (nginx/Caddy)")
     print("  4. webproxy · Telegram WEB Proxy через tproxy-server за Caddy/nginx")
+    print("  5. shared-443 · делить порт 443 с Xray/nginx через SNI-роутер (PROXY protocol v2)")
     print()
     while True:
         choice = ask("Ваш выбор", default_num).lower()
@@ -1656,7 +1915,9 @@ def choose_wizard_mode(default: str = "simple") -> str:
             return "self-steal"
         if choice in ("4", "webproxy", "web-proxy", "web_proxy", "tproxy"):
             return "webproxy"
-        print("Некорректный выбор: введите 1 (простая), 2 (расширенная), 3 (self-steal) или 4 (webproxy).")
+        if choice in ("5", "shared-443", "shared_443", "shared443"):
+            return "shared-443"
+        print("Некорректный выбор: введите 1 (простая), 2 (расширенная), 3 (self-steal), 4 (webproxy) или 5 (shared-443).")
 
 
 def ask_simple_confirm() -> str:
@@ -1829,6 +2090,7 @@ def prompt_masking_config(
     print("\n" + heading("Шаг 3. Маскировка (HTTPS-cover)"))
     print("Подсказка: после настройки можно уточнить fake_tls_cert_bytes в config.json под размер цепочки сертификата выбранного домена.")
     sni = ask_validated("Домен для HTTPS-маскировки (SNI)", validate_sni, default_sni)
+    warn_if_sni_suspicious(sni)
     cover_default = default_cover if sni == default_sni else f"{sni}:443"
     cover = ask("Адрес HTTPS-cover (host:port)", cover_default)
     cover_ok_host, cover_detail_host = probe_cover_reachable(cover, sni)
@@ -1862,6 +2124,7 @@ def prompt_sni_choice(default_sni: str = DEFAULT_SNI) -> str:
                 print(f"Некорректный домен SNI: {exc}")
                 continue
         ok, detail = probe_cover_reachable(f"{chosen}:443", chosen)
+        warn_if_sni_suspicious(chosen)
         if not ok:
             print(f"Предупреждение: cover {chosen}:443 не отвечает с этого VPS ({detail}).")
             if sys.stdin.isatty() and not ask_yes_no("Всё равно выбрать этот домен?", default=False):
@@ -1895,14 +2158,20 @@ def choose_advanced_role(default_role: str = "direct") -> str:
 
 def ask_egress_upstreams(default_upstreams: str | None) -> list[str]:
     while True:
-        raw_list = ask("Основной (или список через запятую) адрес egress (IP:port)", default_upstreams)
+        raw_list = ask(
+            "Основной (или список через запятую) адрес egress (IP:port или wss://host/path)",
+            default_upstreams,
+        )
         try:
-            upstreams = [validate_endpoint(item) for item in raw_list.split(",") if item.strip()]
+            upstreams = [validate_egress_upstream(item) for item in raw_list.split(",") if item.strip()]
             if not upstreams:
-                raise ValueError("укажите хотя бы один адрес IP:port")
+                raise ValueError("укажите хотя бы один адрес IP:port или wss://host/path")
             return upstreams
         except ValueError as exc:
-            print(f"Некорректный адрес egress: {exc}. Формат: IP:PORT (например, 10.203.0.9:29443).")
+            print(
+                f"Некорректный адрес egress: {exc}. Формат: IP:PORT или wss://host/ws/... "
+                "(например, 10.203.0.9:29443 или wss://egress.example.com/ws/9f3c...)."
+            )
 
 
 def choose_egress_strategy(default_strategy: str = "ordered") -> str:
@@ -1968,6 +2237,8 @@ def load_existing_defaults(deploy_dir: Path) -> dict[str, object]:
         str(defaults.get("MTEVIL_WEBPROXY") or "").strip() == "1"
         or "tproxy_config" in defaults
     )
+    defaults["shared_443"] = bool(str(defaults.get("MTEVIL_SHARED_443") or "").strip() == "1")
+    defaults["managed_caddy"] = bool(str(defaults.get("MTEVIL_MANAGED_CADDY") or "").strip() == "1")
     return defaults
 
 
@@ -3082,13 +3353,31 @@ def run_status_command(deploy_dir: Path) -> int:
     print(f"  Версия:            {cur_version or configured_image or 'нет данных'}")
     print(f"  Роль:              {role_names.get(role, role)}")
     if bind_val and port_val:
-        print(f"  Порт и сеть:       {bind_val}:{port_val} ({net_mode_label})")
+        pub_port_env = str(saved.get("MTEVIL_PUBLIC_PORT") or "").strip()
+        if pub_port_env and pub_port_env != port_val:
+            print(
+                f"  Порт и сеть:       внешний :{pub_port_env} -> {bind_val}:{port_val} "
+                f"({net_mode_label}, PROXY protocol v2)"
+            )
+        else:
+            print(f"  Порт и сеть:       {bind_val}:{port_val} ({net_mode_label})")
     if role in ("direct", "edge"):
         cur_sni = str(saved_cfg.get("sni") or "").strip()
         if cur_sni:
             extra_snis = [s for s in read_allowed_snis_from_volume(base) if s != cur_sni.lower()]
             sni_note = f" (также разрешены: {', '.join(extra_snis)})" if extra_snis else ""
             print(f"  Маскировка (SNI):  {cur_sni}{sni_note}")
+        c_mss = saved_cfg.get("client_mss")
+        b_mss = saved_cfg.get("client_mss_bulk")
+        if c_mss is not None or b_mss is not None:
+            print(f"  Профиль TCP MSS:   handshake={c_mss or 'авто'}, bulk={b_mss or 'авто'}")
+    if role == "edge":
+        raw_ups = saved_cfg.get("egress_upstreams") if isinstance(saved_cfg.get("egress_upstreams"), list) else []
+        if raw_ups:
+            redacted_ups = ", ".join(redact_egress_upstream(str(u)) for u in raw_ups)
+            strat = str(saved_cfg.get("egress_strategy") or "round-robin")
+            hedge_ms = int(saved_cfg.get("egress_hedge_ms", 400))
+            print(f"  Узлы egress:       {redacted_ups} ({strat}, hedge={hedge_ms} мс)")
     print(f"  Состояние:         {health_status}")
     print(f"  Время работы:      {uptime_str}")
     print(f"  Версия для отката: {rollback_ver}")
@@ -3100,13 +3389,19 @@ def run_status_command(deploy_dir: Path) -> int:
     if saved.get("webproxy"):
         for wp_line in format_webproxy_status_lines(base, saved):
             print(wp_line)
-    if running and not (saved.get("webproxy") and bind_val in ("127.0.0.1", "::1")):
+    if (
+        running
+        and not (saved.get("webproxy") and bind_val in ("127.0.0.1", "::1"))
+        and not bool(saved_cfg.get("proxy_protocol", False))
+    ):
         for cov_line in format_cover_status_lines(role, saved_cfg, bind_val, port_val):
             print(cov_line)
     if role == "egress":
         accept_legacy = saved_cfg.get("egress_accept_legacy", True) is not False
         proto_mode = "MTV4 + MTV3 + legacy MTV2 (переходный)" if accept_legacy else "MTV4 + MTV3 (строгий)"
         print(f"  Протокол egress:   {proto_mode}")
+        if saved_cfg.get("egress_ws_path"):
+            print("  Транспорт WS/WSS:  включён (путь скрыт)")
         if isinstance(rstats, dict):
             mtv3_cnt = rstats.get("egress_mtv3_connections")
             legacy_cnt = rstats.get("egress_legacy_connections")
@@ -3376,7 +3671,7 @@ def run_traffic_command(deploy_dir: Path, *, live: bool = False, max_iterations:
 
 
 def resolve_client_server_and_port(saved: dict[str, object]) -> tuple[str, int]:
-    port_raw = str(saved.get("MTEVIL_PORT") or "443").strip()
+    port_raw = str(saved.get("MTEVIL_PUBLIC_PORT") or saved.get("MTEVIL_PORT") or "443").strip()
     try:
         port = validate_port(port_raw)
     except Exception:
@@ -3603,6 +3898,7 @@ def run_sni_command(deploy_dir: Path, new_sni_arg: str | None = None) -> int:
         except Exception as exc:
             print(err_text(f"Некорректный домен SNI: {exc}"), file=sys.stderr)
             return 1
+        warn_if_sni_suspicious(new_sni)
     else:
         new_sni = prompt_sni_choice(old_sni)
 
@@ -4166,14 +4462,383 @@ def run_adtag_command(deploy_dir: Path, action: str, tag_value: str | None = Non
     return 1
 
 
+def _validate_mss_arg(raw: str | None) -> tuple[bool, int | None]:
+    """Return (changed, new_value) for `--handshake-mss` / `--bulk-mss`."""
+    if raw is None:
+        return False, None
+    v = raw.strip().lower()
+    if v in ("off", "none", "auto", "clear", "0"):
+        return True, None
+    try:
+        num = int(v)
+    except ValueError as exc:
+        raise ValueError("укажите число 88..1460 или 'off'") from exc
+    if not (88 <= num <= 1460):
+        raise ValueError("значение TCP MSS должно быть в диапазоне 88..1460 (или 'off' для сброса)")
+    return True, num
+
+
+def _apply_updated_config_safely(
+    deploy_dir: Path,
+    base: list[str],
+    svc: str,
+    cfg_file: Path,
+    orig_cfg_text: str,
+    new_cfg: dict[str, object],
+) -> tuple[bool, str]:
+    cand_cfg = deploy_dir / "config.cli-candidate.json"
+    try:
+        cand_cfg.write_text(json.dumps(new_cfg, indent=2) + "\n", encoding="utf-8")
+        abs_cand = str(cand_cfg.resolve())
+        chk = run(
+            base
+            + [
+                "run",
+                "--rm",
+                "-T",
+                "--no-deps",
+                "-v",
+                f"{abs_cand}:/etc/mtevil/config.cli.json:ro",
+                svc,
+                "--config",
+                "/etc/mtevil/config.cli.json",
+                "--check-config",
+            ],
+            check=False,
+        )
+        if chk.returncode != 0:
+            detail = (chk.stderr or chk.stdout or "").strip()
+            return False, f"конфигурация не прошла проверку (--check-config): {detail}"
+    finally:
+        if cand_cfg.exists():
+            cand_cfg.unlink()
+
+    cfg_file.write_text(json.dumps(new_cfg, indent=2) + "\n", encoding="utf-8")
+    cid = run(base + ["ps", "-q", svc], check=False).stdout.strip()
+    if not cid:
+        return True, "конфигурация обновлена (контейнер сейчас остановлен)"
+
+    up_proc = run(base + ["up", "-d", "--no-build", "--force-recreate", svc], check=False)
+    if up_proc.returncode != 0:
+        cfg_file.write_text(orig_cfg_text, encoding="utf-8")
+        run(base + ["up", "-d", "--no-build", "--force-recreate", svc], check=False)
+        detail = (up_proc.stderr or up_proc.stdout or "").strip()
+        return False, f"не удалось перезапустить контейнер: {detail}"
+    try:
+        wait_healthy(base)
+    except TimeoutError:
+        print_failed_container_logs(base)
+        cfg_file.write_text(orig_cfg_text, encoding="utf-8")
+        run(base + ["up", "-d", "--no-build", "--force-recreate", svc], check=False)
+        return False, "контейнер не перешёл в статус healthy; возвращена прежняя конфигурация"
+    return True, "контейнер перезапущен и исправен"
+
+
+def run_egress_command(
+    deploy_dir: Path,
+    action: str = "list",
+    target: str | None = None,
+    *,
+    force: bool = False,
+) -> int:
+    check_prerequisites()
+    compose_file = deploy_dir / "compose.yaml"
+    env_file = deploy_dir / ".env"
+    cfg_file = deploy_dir / "config.json"
+    if not compose_file.is_file() or not env_file.is_file() or not cfg_file.is_file():
+        print(err_text(f"Существующая установка не найдена в {deploy_dir}."), file=sys.stderr)
+        return 1
+
+    saved = load_existing_defaults(deploy_dir)
+    saved_cfg = saved.get("config") if isinstance(saved.get("config"), dict) else {}
+    role = str(saved_cfg.get("role") or "direct")
+    if role == "direct" and saved_cfg.get("egress_upstreams"):
+        role = "edge"
+    if role != "edge":
+        print(
+            err_text("Команда 'mtevilctl egress' предназначена для входного сервера (роль edge)."),
+            file=sys.stderr,
+        )
+        return 1
+
+    project = str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
+    base = compose_cmd(deploy_dir, project)
+    svc = compose_service(base)
+    orig_cfg_text = cfg_file.read_text(encoding="utf-8")
+    upstreams = [str(u) for u in (saved_cfg.get("egress_upstreams") or []) if str(u).strip()]
+    strategy = str(saved_cfg.get("egress_strategy") or "round-robin")
+    hedge_ms = int(saved_cfg.get("egress_hedge_ms", 400))
+    ws_pool_sz = int(saved_cfg.get("egress_ws_pool_size", 4))
+
+    act = (action or "list").strip().lower()
+    if act in ("list", "ls", "show", "status"):
+        print(heading(f"Узлы egress ({len(upstreams)}):"))
+        for idx, u in enumerate(upstreams, start=1):
+            tag = " [основной]" if (strategy == "ordered" and idx == 1) else ""
+            print(f"  {idx}. {redact_egress_upstream(u)}{tag}")
+        print(f"  Стратегия:         {strategy}")
+        print(f"  Хеджирование:      {hedge_ms} мс")
+        if any(u.startswith(("ws://", "wss://")) for u in upstreams):
+            print(f"  Тёплый пул WS/WSS: {ws_pool_sz} соед./узел")
+        return 0
+
+    if act == "check":
+        proc = run(
+            base + ["run", "--rm", "-T", "--no-deps", svc, "check-egress", "--config", "/etc/mtevil/config.json", "--dc", "2"],
+            check=False,
+        )
+        if proc.stdout.strip():
+            print(proc.stdout.strip())
+        if proc.returncode != 0:
+            if proc.stderr.strip():
+                print(proc.stderr.strip(), file=sys.stderr)
+            print(err_text("Один или несколько узлов egress не прошли проверку."), file=sys.stderr)
+            return 1
+        print(ok_text("Все узлы egress ответили успешно (DC 2)."))
+        return 0
+
+    if act == "add":
+        if not target:
+            print(err_text("Укажите адрес: mtevilctl egress add <IP:PORT | wss://host/ws/...>"), file=sys.stderr)
+            return 1
+        try:
+            norm = validate_egress_upstream(target)
+        except ValueError as exc:
+            print(err_text(f"Некорректный адрес egress: {exc}"), file=sys.stderr)
+            return 1
+        if norm in upstreams:
+            print(warn_text(f"Узел {redact_egress_upstream(norm)} уже присутствует в списке egress_upstreams."))
+            return 0
+        new_cfg = copy.deepcopy(saved_cfg)
+        new_cfg["egress_upstreams"] = upstreams + [norm]
+        if not force:
+            probe_cfg = copy.deepcopy(saved_cfg)
+            probe_cfg["egress_upstreams"] = [norm]
+            cand_probe = deploy_dir / "config.egress-probe.json"
+            try:
+                cand_probe.write_text(json.dumps(probe_cfg, indent=2) + "\n", encoding="utf-8")
+                abs_p = str(cand_probe.resolve())
+                chk = run(
+                    base
+                    + [
+                        "run",
+                        "--rm",
+                        "-T",
+                        "--no-deps",
+                        "-v",
+                        f"{abs_p}:/etc/mtevil/config.probe.json:ro",
+                        svc,
+                        "check-egress",
+                        "--config",
+                        "/etc/mtevil/config.probe.json",
+                        "--dc",
+                        "2",
+                    ],
+                    check=False,
+                )
+                if chk.returncode != 0:
+                    detail = (chk.stderr or chk.stdout or "").strip()
+                    print(
+                        err_text(
+                            f"Проверка нового узла {redact_egress_upstream(norm)} не пройдена (используйте --force для принудительного добавления)."
+                        ),
+                        file=sys.stderr,
+                    )
+                    if detail:
+                        print(detail, file=sys.stderr)
+                    return 1
+            finally:
+                if cand_probe.exists():
+                    cand_probe.unlink()
+        ok, msg = _apply_updated_config_safely(deploy_dir, base, svc, cfg_file, orig_cfg_text, new_cfg)
+        if not ok:
+            print(err_text(f"Не удалось применить новый список egress: {msg}"), file=sys.stderr)
+            return 1
+        print(ok_text(f"Добавлен узел egress {redact_egress_upstream(norm)} ({msg})."))
+        return 0
+
+    if act in ("del", "delete", "rm", "remove"):
+        if not target:
+            print(err_text("Укажите адрес или номер узла: mtevilctl egress del <адрес|номер>"), file=sys.stderr)
+            return 1
+        idx_to_del: int | None = None
+        if target.isdigit():
+            pos = int(target) - 1
+            if 0 <= pos < len(upstreams):
+                idx_to_del = pos
+        else:
+            t_clean = target.strip()
+            for i, u in enumerate(upstreams):
+                if u == t_clean or redact_egress_upstream(u) == t_clean:
+                    idx_to_del = i
+                    break
+            if idx_to_del is None:
+                try:
+                    t_norm = validate_egress_upstream(t_clean)
+                    if t_norm in upstreams:
+                        idx_to_del = upstreams.index(t_norm)
+                except ValueError:
+                    pass
+        if idx_to_del is None:
+            print(err_text(f"Узел '{target}' не найден в egress_upstreams."), file=sys.stderr)
+            return 1
+        if len(upstreams) <= 1:
+            print(err_text("Нельзя удалить единственный узел egress на сервере с ролью edge."), file=sys.stderr)
+            return 1
+        removed = upstreams[idx_to_del]
+        new_list = [u for i, u in enumerate(upstreams) if i != idx_to_del]
+        new_cfg = copy.deepcopy(saved_cfg)
+        new_cfg["egress_upstreams"] = new_list
+        ok, msg = _apply_updated_config_safely(deploy_dir, base, svc, cfg_file, orig_cfg_text, new_cfg)
+        if not ok:
+            print(err_text(f"Не удалось обновить список egress: {msg}"), file=sys.stderr)
+            return 1
+        print(ok_text(f"Удалён узел egress {redact_egress_upstream(removed)} ({msg})."))
+        return 0
+
+    if act == "strategy":
+        if target not in ("ordered", "round-robin"):
+            print(err_text("Укажите стратегию: mtevilctl egress strategy <ordered|round-robin>"), file=sys.stderr)
+            return 1
+        new_cfg = copy.deepcopy(saved_cfg)
+        new_cfg["egress_strategy"] = target
+        ok, msg = _apply_updated_config_safely(deploy_dir, base, svc, cfg_file, orig_cfg_text, new_cfg)
+        if not ok:
+            print(err_text(f"Не удалось сменить стратегию egress: {msg}"), file=sys.stderr)
+            return 1
+        print(ok_text(f"Стратегия egress изменена на '{target}' ({msg})."))
+        return 0
+
+    if act == "hedge":
+        if target is None:
+            print(err_text("Укажите задержку в мс (0..30000): mtevilctl egress hedge <мс>"), file=sys.stderr)
+            return 1
+        try:
+            ms = int(target.strip())
+            if not (0 <= ms <= 30000):
+                raise ValueError
+        except ValueError:
+            print(err_text("Задержка хеджирования должна быть целым числом от 0 до 30000 мс."), file=sys.stderr)
+            return 1
+        new_cfg = copy.deepcopy(saved_cfg)
+        new_cfg["egress_hedge_ms"] = ms
+        ok, msg = _apply_updated_config_safely(deploy_dir, base, svc, cfg_file, orig_cfg_text, new_cfg)
+        if not ok:
+            print(err_text(f"Не удалось обновить egress_hedge_ms: {msg}"), file=sys.stderr)
+            return 1
+        print(ok_text(f"Параметр egress_hedge_ms установлен в {ms} мс ({msg})."))
+        return 0
+
+    print(
+        err_text(
+            f"Неизвестное действие '{action}'. Используйте: list, add <адрес>, del <адрес>, strategy <ordered|round-robin>, hedge <мс> или check."
+        ),
+        file=sys.stderr,
+    )
+    return 1
+
+
+def run_tuning_command(
+    deploy_dir: Path,
+    *,
+    handshake_mss: str | None = None,
+    bulk_mss: str | None = None,
+) -> int:
+    check_prerequisites()
+    compose_file = deploy_dir / "compose.yaml"
+    env_file = deploy_dir / ".env"
+    cfg_file = deploy_dir / "config.json"
+    if not compose_file.is_file() or not env_file.is_file() or not cfg_file.is_file():
+        print(err_text(f"Существующая установка не найдена в {deploy_dir}."), file=sys.stderr)
+        return 1
+
+    saved = load_existing_defaults(deploy_dir)
+    saved_cfg = saved.get("config") if isinstance(saved.get("config"), dict) else {}
+    role = str(saved_cfg.get("role") or "direct")
+    if role == "direct" and saved_cfg.get("egress_upstreams"):
+        role = "edge"
+    if role == "egress":
+        print(err_text("Настройка клиентского TCP MSS применяется только на узлах входа (direct или edge)."), file=sys.stderr)
+        return 1
+
+    try:
+        hs_changed, hs_val = _validate_mss_arg(handshake_mss)
+        bk_changed, bk_val = _validate_mss_arg(bulk_mss)
+    except ValueError as exc:
+        print(err_text(str(exc)), file=sys.stderr)
+        return 1
+
+    if not hs_changed and not bk_changed:
+        c_mss = saved_cfg.get("client_mss")
+        b_mss = saved_cfg.get("client_mss_bulk")
+        print(heading("Параметры TCP-фрагментации (tuning)"))
+        print(f"  client_mss (SYN-ACK):      {c_mss if c_mss is not None else 'выкл (системный MSS)'}")
+        print(f"  client_mss_bulk (отдача):  {b_mss if b_mss is not None else 'выкл (системный MSS)'}")
+        print("  Пример включения: mtevilctl tuning --handshake-mss 280 --bulk-mss 1400")
+        print("  Пример сброса:    mtevilctl tuning --handshake-mss off --bulk-mss off")
+        return 0
+
+    orig_cfg_text = cfg_file.read_text(encoding="utf-8")
+    new_cfg = copy.deepcopy(saved_cfg)
+    if hs_changed:
+        if hs_val is None:
+            new_cfg.pop("client_mss", None)
+        else:
+            new_cfg["client_mss"] = hs_val
+    if bk_changed:
+        if bk_val is None:
+            new_cfg.pop("client_mss_bulk", None)
+        else:
+            new_cfg["client_mss_bulk"] = bk_val
+
+    if new_cfg.get("client_mss") is not None:
+        print(
+            warn_text(
+                f"Примечание (RFC 9293): client_mss={new_cfg['client_mss']} объявляется в SYN-ACK и нарезает ClientHello, "
+                "однако входящий поток от клиента (upload медиа) останется ограничен этим размером сегмента до конца сессии "
+                "(client_mss_bulk поднимает размер сегмента только на скачивание сервер -> клиент)."
+            )
+        )
+
+    project = str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
+    base = compose_cmd(deploy_dir, project)
+    svc = compose_service(base)
+    ok, msg = _apply_updated_config_safely(deploy_dir, base, svc, cfg_file, orig_cfg_text, new_cfg)
+    if not ok:
+        print(err_text(f"Не удалось применить настройки TCP MSS: {msg}"), file=sys.stderr)
+        return 1
+    print(
+        ok_text(
+            f"Настройки TCP MSS обновлены: handshake={new_cfg.get('client_mss') or 'off'}, "
+            f"bulk={new_cfg.get('client_mss_bulk') or 'off'} ({msg})."
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Interactive Docker Compose wizard and lifecycle tool for mtevil")
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("wizard", "setup", "reconfigure", "status", "update", "rollback", "traffic", "traf", "link", "sni", "user", "adtag"),
+        choices=(
+            "wizard",
+            "setup",
+            "reconfigure",
+            "status",
+            "update",
+            "rollback",
+            "traffic",
+            "traf",
+            "link",
+            "sni",
+            "user",
+            "adtag",
+            "egress",
+            "tuning",
+        ),
         default="wizard",
-        help="Action to perform: wizard (default), setup, status, update, rollback, traffic, link, sni, user, adtag",
+        help="Action to perform: wizard (default), setup, status, update, rollback, traffic, link, sni, user, adtag, egress, tuning",
     )
     parser.add_argument("extra", nargs="*", help=argparse.SUPPRESS)
     parser.add_argument("--dir", type=Path, default=None, help="Target deployment directory (default: deploy/wizard)")
@@ -4182,9 +4847,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-build", action="store_true", help="Skip docker compose build")
     parser.add_argument(
         "--mode",
-        choices=("simple", "advanced", "self-steal", "webproxy"),
+        choices=("simple", "advanced", "self-steal", "webproxy", "shared-443"),
         default=None,
-        help="Wizard mode: simple, advanced, self-steal, or webproxy (tproxy-server sidecar)",
+        help="Wizard mode: simple, advanced, self-steal, webproxy, or shared-443",
     )
     parser.add_argument(
         "--self-steal",
@@ -4197,11 +4862,46 @@ def main(argv: list[str] | None = None) -> int:
         help="Configure Telegram WEB Proxy (tproxy-server sidecar behind Caddy/nginx) or print webproxy links",
     )
     parser.add_argument(
+        "--shared-443",
+        action="store_true",
+        help="Configure mtevil on loopback behind an SNI router (Xray fallbacks / nginx stream) sharing external port 443 via PROXY protocol v2",
+    )
+    parser.add_argument(
+        "--managed-caddy",
+        action="store_true",
+        help="Include an automated Caddy TLS sidecar container in compose.yaml (for --webproxy when port 443 is free)",
+    )
+    parser.add_argument(
+        "--cdn",
+        action="store_true",
+        help="Generate Cloudflare/CDN reverse-proxy snippets and headers in --webproxy mode",
+    )
+    parser.add_argument(
+        "--egress-ws",
+        action="store_true",
+        help="Enable RFC 6455 WebSocket listener path on egress (behind Caddy/nginx on :443 without SSH/VPN)",
+    )
+    parser.add_argument(
+        "--egress-ws-path",
+        type=str,
+        default=None,
+        help="Explicit secret HTTP path for WebSocket egress (e.g. /ws/9f3c...)",
+    )
+    parser.add_argument(
+        "--egress-domain",
+        type=str,
+        default=None,
+        help="Public domain name for generating WSS egress reverse-proxy snippets",
+    )
+    parser.add_argument(
         "--tproxy-image",
         type=str,
         default=None,
         help="Optional prebuilt Docker image for the tproxy-server sidecar",
     )
+    parser.add_argument("--handshake-mss", type=str, default=None, help="Client SYN-ACK TCP MSS (88..1460 or off)")
+    parser.add_argument("--bulk-mss", type=str, default=None, help="Post-handshake server->client TCP MSS (88..1460 or off)")
+    parser.add_argument("--force", action="store_true", help="Skip live check-egress preflight in 'mtevilctl egress add'")
     parser.add_argument("--role", choices=("direct", "egress", "edge"), default=None, help="Deployment role (non-interactive override)")
     parser.add_argument(
         "--network-host",
@@ -4224,7 +4924,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     repo_root = Path(__file__).resolve().parent.parent
-    if args.command in ("status", "update", "rollback", "traffic", "traf", "link", "sni", "user", "adtag"):
+    if args.command in ("status", "update", "rollback", "traffic", "traf", "link", "sni", "user", "adtag", "egress", "tuning"):
         deploy_dir = (args.dir or default_deploy_dir(repo_root)).resolve()
         if args.command == "status":
             return run_status_command(deploy_dir)
@@ -4257,6 +4957,16 @@ def main(argv: list[str] | None = None) -> int:
             sub_action = args.extra[0] if len(args.extra) >= 1 else "show"
             sub_val = args.extra[1] if len(args.extra) >= 2 else None
             return run_adtag_command(deploy_dir, sub_action, sub_val)
+        if args.command == "egress":
+            sub_action = args.extra[0] if len(args.extra) >= 1 else "list"
+            sub_val = args.extra[1] if len(args.extra) >= 2 else None
+            return run_egress_command(deploy_dir, sub_action, sub_val, force=args.force)
+        if args.command == "tuning":
+            return run_tuning_command(
+                deploy_dir,
+                handshake_mss=args.handshake_mss,
+                bulk_mss=args.bulk_mss,
+            )
         return run_traffic_command(deploy_dir, live=args.live, max_iterations=args.iterations)
 
     explicit_no_build = bool(args.no_build)
@@ -4272,21 +4982,36 @@ def main(argv: list[str] | None = None) -> int:
         deploy_dir = (args.dir or (repo_root / "deploy" / "wizard")).resolve()
 
     # Resolve conflicting CLI flags explicitly before prompting.
-    if args.self_steal and args.webproxy:
-        print(err_text("Конфликт параметров: не сочетайте --self-steal и --webproxy одновременно."), file=sys.stderr)
+    mode_shorthands = sum([bool(args.self_steal), bool(args.webproxy), bool(args.shared_443)])
+    if mode_shorthands > 1:
+        print(
+            err_text("Конфликт параметров: не сочетайте --self-steal, --webproxy и --shared-443 одновременно."),
+            file=sys.stderr,
+        )
         return 1
     if args.self_steal:
-        if args.mode in ("simple", "advanced", "webproxy"):
+        if args.mode in ("simple", "advanced", "webproxy", "shared-443"):
             print(err_text("Конфликт параметров: не сочетайте --self-steal с другим --mode."), file=sys.stderr)
             return 1
         args.mode = "self-steal"
     if args.webproxy:
-        if args.mode in ("simple", "advanced", "self-steal"):
+        if args.mode in ("simple", "advanced", "self-steal", "shared-443"):
             print(err_text("Конфликт параметров: не сочетайте --webproxy с другим --mode."), file=sys.stderr)
             return 1
         args.mode = "webproxy"
-    if args.mode in ("self-steal", "webproxy") and args.role == "egress":
+    if args.shared_443:
+        if args.mode in ("simple", "advanced", "self-steal", "webproxy"):
+            print(err_text("Конфликт параметров: не сочетайте --shared-443 с другим --mode."), file=sys.stderr)
+            return 1
+        args.mode = "shared-443"
+    if args.mode in ("self-steal", "webproxy", "shared-443") and args.role == "egress":
         print(err_text(f"Конфликт параметров: режим {args.mode} несовместим с ролью egress."), file=sys.stderr)
+        return 1
+    if (args.managed_caddy or args.cdn) and args.mode not in (None, "webproxy"):
+        print(err_text("Конфликт параметров: флаги --managed-caddy и --cdn применимы только к режиму --webproxy."), file=sys.stderr)
+        return 1
+    if args.managed_caddy and args.cdn:
+        print(err_text("Конфликт параметров: не сочетайте --managed-caddy (прямой Let's Encrypt) и --cdn одновременно."), file=sys.stderr)
         return 1
     if args.mode == "simple" and args.role in ("edge", "egress"):
         print(
@@ -4339,12 +5064,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.mode is not None:
         mode = args.mode
+    elif args.egress_ws or args.egress_ws_path:
+        mode = "advanced"
+        args.role = args.role or "egress"
     elif args.role in ("edge", "egress") or args.network_host:
         mode = "advanced"
     elif args.role == "direct":
         mode = "simple"
     elif existing_cfg.exists() and saved.get("webproxy"):
         mode = choose_wizard_mode(default="webproxy")
+    elif existing_cfg.exists() and saved.get("shared_443"):
+        mode = choose_wizard_mode(default="shared-443")
     elif existing_cfg.exists() and is_local_cover_addr(str(saved_cfg.get("cover") or "")):
         mode = choose_wizard_mode(default="self-steal")
     elif existing_cfg.exists() and existing_role in ("edge", "egress"):
@@ -4354,6 +5084,12 @@ def main(argv: list[str] | None = None) -> int:
 
     tproxy_sidecar_cand: dict[str, object] | None = None
     tproxy_sidecar_live: dict[str, object] | None = None
+    managed_caddy_cand: dict[str, object] | None = None
+    managed_caddy_live: dict[str, object] | None = None
+    managed_caddy_enabled = False
+    egress_ws_domain: str | None = None
+    egress_ws_path_val: str | None = None
+    public_link_port_override: int | None = None
     tproxy_config_data: dict[str, object] | None = None
     webproxy_carrier = "websocket"
     webproxy_hostname = ""
@@ -4466,6 +5202,7 @@ def main(argv: list[str] | None = None) -> int:
             validate_webproxy_hostname,
             host_seed_raw,
         )
+        warn_if_sni_suspicious(webproxy_hostname)
         base_seed = str(saved_tp.get("base_path") or saved.get("MTEVIL_WEBPROXY_BASE_PATH") or "").strip()
         webproxy_base_path = ask_validated(
             "Префикс пути base_path (пусто — корень домена /)",
@@ -4612,6 +5349,17 @@ def main(argv: list[str] | None = None) -> int:
             "include_build": tproxy_include_build,
             "site_host_dir": webproxy_site_mount,
         }
+        if args.managed_caddy or (
+            sys.stdin.isatty()
+            and not args.cdn
+            and ask_yes_no(
+                "Поднять встроенный контейнер Caddy (автоматический TLS Let's Encrypt на порту 443)?",
+                default=bool(saved.get("managed_caddy", False)),
+            )
+        ):
+            managed_caddy_enabled = True
+            managed_caddy_cand = {"caddyfile_name": "Caddyfile.candidate"}
+            managed_caddy_live = {"caddyfile_name": "Caddyfile"}
 
     if mode == "self-steal":
         role = args.role if args.role in ("direct", "edge") else (existing_role if existing_role in ("direct", "edge") else "direct")
@@ -4622,6 +5370,7 @@ def main(argv: list[str] | None = None) -> int:
 
         sni_seed = default_sni if (is_local_cover_addr(default_cover) or default_sni not in ("mozilla.org", "example.com")) else None
         sni = ask_validated("Публичный домен сайта (SNI)", validate_sni, sni_seed)
+        warn_if_sni_suspicious(sni)
         default_host = str(saved.get("MTEVIL_PUBLIC_HOST") or "") or sni
         public_host, dns_records = prompt_client_address(default_host)
 
@@ -4716,6 +5465,80 @@ def main(argv: list[str] | None = None) -> int:
             config_data["egress_upstreams"] = upstreams
             config_data.setdefault("egress_token_file", "/var/lib/mtevil/egress-token")
 
+    if mode == "shared-443":
+        role = args.role if args.role in ("direct", "edge") else (existing_role if existing_role in ("direct", "edge") else "direct")
+        project = args.project or str(saved.get("MTEVIL_PROJECT") or f"mtevil-{role}")
+        print("\n" + heading("Настройка shared-443 (деление внешнего порта 443 через SNI-роутер)"))
+        print("  mtevil слушает локальный порт (127.0.0.1) с включённым PROXY protocol v2,")
+        print("  а внешний порт 443 маршрутизируется по SNI через nginx stream или Xray fallbacks.")
+
+        sni = ask_validated("Домен маскировки (SNI) для маршрутизации с :443", validate_sni, default_sni)
+        warn_if_sni_suspicious(sni)
+        cover_seed = default_cover if sni == default_sni else f"{sni}:443"
+        cover = ask("Адрес HTTPS-cover при несовпадении секрета (host:port)", cover_seed).strip()
+        default_host = str(saved.get("MTEVIL_PUBLIC_HOST") or "") or detect_local_global_ipv4() or sni
+        public_host, dns_records = prompt_client_address(default_host)
+
+        bind_ip = "127.0.0.1"
+        saved_port_raw = str(saved.get("MTEVIL_PORT") or "").strip()
+        local_port_seed = saved_port_raw if (saved_port_raw and saved_port_raw != "443") else "24443"
+        pub_port = ask_validated("Локальный TCP-порт бэкенда mtevil (на 127.0.0.1)", validate_port, local_port_seed)
+        if pub_port == 443:
+            print(err_text("Ошибка: локальный порт бэкенда mtevil в режиме shared-443 не должен быть 443 (его занимает SNI-роутер)."), file=sys.stderr)
+            return 1
+        pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=False)
+        use_network_host = True
+        pub_port, use_network_host = resolve_network_host_port(
+            deploy_dir,
+            project,
+            bind_ip,
+            pub_port,
+            True,
+            explicit_network_host=True,
+            show_link_note=False,
+            allow_bridge_fallback=False,
+        )
+        public_link_port_override = 443
+        if dns_records is not None:
+            check_domain_expected_ips(dns_records)
+
+        same_role_reconfigure = existing_cfg.exists() and existing_role == role
+        if same_role_reconfigure:
+            config_data = copy.deepcopy(saved_cfg)
+            config_data["role"] = "direct" if role == "direct" else "edge"
+            config_data.setdefault("secret_file", "/var/lib/mtevil/proxy-secret")
+            config_data.setdefault("users_file", "/var/lib/mtevil/users.json")
+            config_data.setdefault("replay_file", "/var/lib/mtevil-replay/replay.bin")
+            config_data["sni"] = sni
+            config_data["cover"] = cover
+            config_data["proxy_protocol"] = True
+        else:
+            config_data = {
+                "role": "direct" if role == "direct" else "edge",
+                "listen": f"{bind_ip}:{pub_port}",
+                "secret_file": "/var/lib/mtevil/proxy-secret",
+                "users_file": "/var/lib/mtevil/users.json",
+                "replay_file": "/var/lib/mtevil-replay/replay.bin",
+                "sni": sni,
+                "cover": cover,
+                "proxy_protocol": True,
+                "max_connections": 256,
+                "client_hello_timeout_secs": 5,
+                "handshake_timeout_secs": 10,
+                "idle_timeout_secs": 300,
+                "drain_timeout_secs": 5,
+                "fake_tls_cert_jitter": 16,
+                "flight_shaping": True,
+            }
+            if role == "direct":
+                config_data["dc"] = DEFAULT_DCS
+        if role == "edge":
+            saved_upstreams = saved_cfg.get("egress_upstreams") if isinstance(saved_cfg.get("egress_upstreams"), list) else []
+            default_upstreams = ",".join(str(x) for x in saved_upstreams) if saved_upstreams else None
+            upstreams = ask_egress_upstreams(default_upstreams)
+            config_data["egress_upstreams"] = upstreams
+            config_data.setdefault("egress_token_file", "/var/lib/mtevil/egress-token")
+
     if mode == "advanced":
         default_role = existing_role if existing_role in ("direct", "edge", "egress") else "direct"
         role = args.role or choose_advanced_role(default_role)
@@ -4768,11 +5591,13 @@ def main(argv: list[str] | None = None) -> int:
         elif role == "egress":
             print("\n" + heading("Шаг 2. Сеть и адрес выхода"))
             default_egress_port = str(saved.get("MTEVIL_PORT") or "29443")
-            default_egress_bind = str(saved.get("MTEVIL_BIND") or "")
-            print("Укажите приватный IP этого сервера, по которому до него дотянется edge (0.0.0.0 запрещён).")
-            bind_ip = ask_validated("Локальный IP туннеля", validate_egress_ip, default_egress_bind or None)
+            default_egress_bind = str(saved.get("MTEVIL_BIND") or ("127.0.0.1" if (args.egress_ws or args.egress_ws_path) else ""))
+            print("Укажите приватный IP этого сервера (или 127.0.0.1 для режима WSS за Caddy/nginx; 0.0.0.0 запрещён).")
+            bind_ip = ask_validated("Локальный IP туннеля / loopback", validate_egress_ip, default_egress_bind or None)
             pub_port = ask_validated("TCP-порт egress", validate_port, default_egress_port)
-            if not args.network_host:
+            if bind_ip in ("127.0.0.1", "::1") and (args.egress_ws or args.egress_ws_path):
+                use_network_host = True
+            elif not args.network_host:
                 use_network_host = ask_yes_no("Использовать сетевой режим host (--network-host)?", default=existing_network_host)
             pub_port = ensure_available_port(deploy_dir, project, bind_ip, pub_port, show_link_note=False)
             pub_port, use_network_host = resolve_network_host_port(
@@ -4781,7 +5606,7 @@ def main(argv: list[str] | None = None) -> int:
                 bind_ip,
                 pub_port,
                 use_network_host,
-                explicit_network_host=args.network_host,
+                explicit_network_host=bool(args.network_host or (bind_ip in ("127.0.0.1", "::1") and (args.egress_ws or args.egress_ws_path))),
                 show_link_note=False,
             )
             public_host = bind_ip
@@ -4795,6 +5620,30 @@ def main(argv: list[str] | None = None) -> int:
                 "idle_timeout_secs": 300,
                 "drain_timeout_secs": 5,
             }
+            prev_ws_path = str(saved_cfg.get("egress_ws_path") or "").strip()
+            want_ws = bool(args.egress_ws or args.egress_ws_path)
+            if not want_ws and sys.stdin.isatty():
+                want_ws = ask_yes_no(
+                    "Включить приём защищённых подключений wss:// (WebSocket за Caddy/nginx на :443 без SSH/VPN)?",
+                    default=bool(prev_ws_path),
+                )
+            if want_ws:
+                if args.egress_ws_path:
+                    egress_ws_path_val = validate_egress_ws_path(args.egress_ws_path)
+                elif prev_ws_path:
+                    egress_ws_path_val = validate_egress_ws_path(prev_ws_path)
+                else:
+                    egress_ws_path_val = f"/ws/{secrets.token_hex(12)}"
+                config_data["egress_ws_path"] = egress_ws_path_val
+                if args.egress_domain:
+                    egress_ws_domain = validate_sni(args.egress_domain).lower()
+                elif sys.stdin.isatty():
+                    egress_ws_domain = ask_validated(
+                        "Публичный домен этого узла egress для шаблона Caddy/nginx",
+                        validate_sni,
+                        str(saved.get("MTEVIL_EGRESS_DOMAIN") or "") or None,
+                    ).lower()
+                    warn_if_sni_suspicious(egress_ws_domain)
         else:  # edge
             print("\n" + heading("Шаг 2. Сеть и адрес"))
             default_host = carry_host or str(saved.get("MTEVIL_PUBLIC_HOST") or "") or detect_local_global_ipv4()
@@ -4828,7 +5677,9 @@ def main(argv: list[str] | None = None) -> int:
             default_upstreams = ",".join(str(x) for x in saved_upstreams) if saved_upstreams else None
             upstreams = ask_egress_upstreams(default_upstreams)
             while ask_yes_no("Добавить резервный egress?", default=False):
-                upstreams.append(ask_validated("Резервный адрес egress (IP:port)", validate_endpoint))
+                upstreams.append(
+                    ask_validated("Резервный адрес egress (IP:port или wss://host/path)", validate_egress_upstream)
+                )
             default_strat = "round-robin" if saved_cfg.get("egress_strategy") == "round-robin" else "ordered"
             strategy = choose_egress_strategy(default_strat)
             config_data = {
@@ -4918,6 +5769,7 @@ def main(argv: list[str] | None = None) -> int:
     cand_config = deploy_dir / "config.candidate.json"
     cand_tproxy_cfg = deploy_dir / "tproxy.candidate.json"
     cand_tproxy_df = deploy_dir / "tproxy.candidate.Dockerfile"
+    cand_caddyfile = deploy_dir / "Caddyfile.candidate"
     cand_tproxy_profiles = "/var/lib/mtevil/tproxy-profiles.candidate.json"
     pending_token: str | None = None
     previous_token: str | None = None
@@ -4930,12 +5782,19 @@ def main(argv: list[str] | None = None) -> int:
         f"MTEVIL_IMAGE={args.image}\n"
         f"MTEVIL_BIND={bind_ip}\n"
         f"MTEVIL_PORT={pub_port}\n"
+        + (f"MTEVIL_PUBLIC_PORT={public_link_port_override}\n" if public_link_port_override else "")
         + (f"MTEVIL_PUBLIC_HOST={public_host}\n" if role in ("direct", "edge") else "")
     )
+    if mode == "shared-443":
+        env_text += "MTEVIL_SHARED_443=1\n"
+    if egress_ws_domain:
+        env_text += f"MTEVIL_EGRESS_DOMAIN={egress_ws_domain}\n"
     if mode == "webproxy":
         env_text += (
             "MTEVIL_WEBPROXY=1\n"
-            f"MTEVIL_WEBPROXY_HOST={webproxy_hostname}\n"
+            + ("MTEVIL_MANAGED_CADDY=1\n" if managed_caddy_enabled else "")
+            + ("MTEVIL_WEBPROXY_CDN=1\n" if args.cdn else "")
+            + f"MTEVIL_WEBPROXY_HOST={webproxy_hostname}\n"
             f"MTEVIL_WEBPROXY_BASE_PATH={webproxy_base_path}\n"
             f"MTEVIL_WEBPROXY_CARRIER={webproxy_carrier}\n"
             f"MTEVIL_TPROXY_LISTEN={tproxy_listen_ep}\n"
@@ -5015,6 +5874,14 @@ def main(argv: list[str] | None = None) -> int:
             cand_tp_cfg = dict(tproxy_config_data)
             cand_tp_cfg["profiles_file"] = cand_tproxy_profiles
             cand_tproxy_cfg.write_text(json.dumps(cand_tp_cfg, indent=2) + "\n", encoding="utf-8")
+            if managed_caddy_enabled:
+                caddy_cand_txt, _ = render_webproxy_reverse_proxy_snippets(
+                    webproxy_hostname,
+                    webproxy_base_path,
+                    tproxy_listen_ep,
+                    cdn_mode=False,
+                )
+                cand_caddyfile.write_text(caddy_cand_txt, encoding="utf-8")
 
         max_conn_val = int(config_data.get("max_connections", 512 if role == "egress" else 256))
         cand_compose.write_text(
@@ -5030,6 +5897,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_connections=max_conn_val,
                 extra_hosts=compose_extra_hosts,
                 tproxy_sidecar=tproxy_sidecar_cand,
+                managed_caddy=managed_caddy_cand,
             ),
             encoding="utf-8",
         )
@@ -5216,6 +6084,7 @@ def main(argv: list[str] | None = None) -> int:
             max_connections=max_conn_val,
             extra_hosts=compose_extra_hosts,
             tproxy_sidecar=tproxy_sidecar_live,
+            managed_caddy=managed_caddy_live,
         )
         preflight_passed = True
     finally:
@@ -5223,7 +6092,7 @@ def main(argv: list[str] | None = None) -> int:
             remove_volume_file(cand_base, cand_token_path)
         if cand_tproxy_profiles_in_volume:
             remove_volume_file(cand_base, cand_tproxy_profiles)
-        for p in (cand_compose, cand_env, cand_config, cand_tproxy_cfg, cand_tproxy_df):
+        for p in (cand_compose, cand_env, cand_config, cand_tproxy_cfg, cand_tproxy_df, cand_caddyfile):
             if p.exists():
                 p.unlink()
         if not preflight_passed:
@@ -5258,6 +6127,8 @@ def main(argv: list[str] | None = None) -> int:
         managed_names = ["compose.yaml", ".env", "config.json"]
         if mode == "webproxy" or (deploy_dir / "tproxy.json").exists() or (deploy_dir / "tproxy.Dockerfile").exists():
             managed_names.extend(["tproxy.json", "tproxy.Dockerfile"])
+        if managed_caddy_enabled or (deploy_dir / "Caddyfile").exists():
+            managed_names.append("Caddyfile")
         for name in managed_names:
             live = deploy_dir / name
             if live.exists():
@@ -5273,6 +6144,16 @@ def main(argv: list[str] | None = None) -> int:
                     newly_created_host_files.append(extra_name)
             (deploy_dir / "tproxy.json").write_text(json.dumps(tproxy_config_data, indent=2) + "\n", encoding="utf-8")
             (deploy_dir / "tproxy.Dockerfile").write_text(render_tproxy_dockerfile(), encoding="utf-8")
+            if managed_caddy_enabled:
+                if "Caddyfile" not in backed_up_files:
+                    newly_created_host_files.append("Caddyfile")
+                live_caddy_txt, _ = render_webproxy_reverse_proxy_snippets(
+                    webproxy_hostname,
+                    webproxy_base_path,
+                    tproxy_listen_ep,
+                    cdn_mode=False,
+                )
+                (deploy_dir / "Caddyfile").write_text(live_caddy_txt, encoding="utf-8")
             had_tproxy_profiles = volume_file_exists(base, "/var/lib/mtevil/tproxy-profiles.json")
             if had_tproxy_profiles:
                 prev_tproxy_profiles_raw = read_volume_secret(base, "/var/lib/mtevil/tproxy-profiles.json")
@@ -5304,6 +6185,8 @@ def main(argv: list[str] | None = None) -> int:
             up_args.append(compose_service(base))
             if mode == "webproxy":
                 up_args.append("tproxy")
+                if managed_caddy_enabled:
+                    up_args.append("caddy")
             up_attempted = True
             up_proc = run(base + up_args, check=False)
             if up_proc.returncode == 0:
@@ -5423,16 +6306,32 @@ def main(argv: list[str] | None = None) -> int:
                 webproxy_hostname,
                 webproxy_base_path,
                 tproxy_listen_ep,
+                cdn_mode=bool(args.cdn),
             )
             (deploy_dir / "Caddyfile.webproxy.example").write_text(caddy_snip, encoding="utf-8")
             (deploy_dir / "nginx.webproxy.example").write_text(nginx_snip, encoding="utf-8")
+        elif mode == "shared-443":
+            xray_snip, nginx_stream_snip = render_shared_443_snippets(sni, f"127.0.0.1:{pub_port}")
+            (deploy_dir / "xray.shared443.example.json").write_text(xray_snip, encoding="utf-8")
+            (deploy_dir / "nginx.stream443.example.conf").write_text(nginx_stream_snip, encoding="utf-8")
+        elif role == "egress" and egress_ws_path_val:
+            eg_host_for_snip = egress_ws_domain or "egress.example.com"
+            eg_loopback = f"{bind_ip}:{pub_port}" if bind_ip in ("127.0.0.1", "::1") else f"127.0.0.1:{pub_port}"
+            eg_caddy, eg_nginx = render_egress_ws_reverse_proxy_snippets(
+                eg_host_for_snip,
+                egress_ws_path_val,
+                eg_loopback,
+            )
+            (deploy_dir / "Caddyfile.egress.example").write_text(eg_caddy, encoding="utf-8")
+            (deploy_dir / "nginx.egress.example").write_text(eg_nginx, encoding="utf-8")
 
         deployment_committed = True
     finally:
         if not deployment_committed:
             if mode == "webproxy" and up_attempted and "tproxy.json" not in backed_up_files:
-                run(base + ["stop", "tproxy"], check=False)
-                run(base + ["rm", "-f", "tproxy"], check=False)
+                for extra_svc in (["caddy", "tproxy"] if managed_caddy_enabled else ["tproxy"]):
+                    run(base + ["stop", extra_svc], check=False)
+                    run(base + ["rm", "-f", extra_svc], check=False)
             for extra_f in newly_created_host_files:
                 p_ex = deploy_dir / extra_f
                 if p_ex.exists():
@@ -5581,6 +6480,13 @@ def main(argv: list[str] | None = None) -> int:
                 print(ok_text(f"Порт 443 отвечает по адресу {webproxy_hostname}."))
             else:
                 print(f"Внешний порт 443 ({webproxy_hostname}): {port_detail} (включается вашим Caddy/nginx).")
+        elif mode == "shared-443":
+            print_step(4, total_steps, "Проверка внешнего порта (SNI-роутер 443)")
+            port_status, port_detail = check_public_port_reachable(public_host, 443)
+            if port_status == "ok":
+                print(ok_text(f"Внешний порт 443 отвечает по адресу {public_host}."))
+            else:
+                print(f"Внешний порт 443 ({public_host}): {port_detail} (обслуживается вашим Xray/nginx SNI-роутером).")
         else:
             print_step(4, total_steps, "Проверка порта на публичном адресе")
             port_status, port_detail = check_public_port_reachable(public_host, int(pub_port))
@@ -5638,6 +6544,7 @@ def main(argv: list[str] | None = None) -> int:
             print("Показать ссылку:   mtevilctl link")
             print("Перенастроить:     mtevilctl setup --webproxy")
         else:
+            effective_link_port = public_link_port_override or pub_port
             link = run(
                 base
                 + [
@@ -5651,28 +6558,42 @@ def main(argv: list[str] | None = None) -> int:
                     "--server",
                     public_host,
                     "--port",
-                    str(pub_port),
+                    str(effective_link_port),
                 ]
             ).stdout.strip()
             print("\n" + heading("Ссылка для подключения в Telegram"))
             print(link)
             print()
             print(f"Каталог установки: {deploy_dir}")
+            if mode == "shared-443":
+                print(f"Шаблон Xray:       {deploy_dir / 'xray.shared443.example.json'}")
+                print(f"Шаблон nginx L4:   {deploy_dir / 'nginx.stream443.example.conf'}")
             print(f"Проверка статуса:  {status_cmd}")
             print("Показать ссылку:   mtevilctl link")
             print("Сменить SNI:       mtevilctl sni <домен>  (старые ссылки продолжат работать)")
-            print("Перенастроить:     mtevilctl setup")
+            print("Перенастроить:     mtevilctl setup" + (" --shared-443" if mode == "shared-443" else ""))
             if mode == "simple":
                 print("\nОткройте ссылку в Telegram, нажмите «Подключить прокси» и проверьте отправку сообщения.")
                 print("Справочник по диагностике, обновлению и откату: deploy/README.md")
             else:
                 print("\nДальше:")
-                print("  1. Откройте ссылку в Telegram и нажмите «Подключить прокси» (сквозная связь проверяется клиентом).")
-                print("  2. Ссылка даёт доступ к прокси — передавайте её только тем, кому доверяете.")
-                print("  3. Дополнительная диагностика и команды управления описаны в deploy/README.md.")
+                if mode == "shared-443":
+                    print(f"  1. Добавьте маршрут SNI '{sni}' -> 127.0.0.1:{pub_port} (PROXY protocol v2) в ваш Xray или nginx stream по шаблону выше.")
+                    print("  2. Откройте ссылку в Telegram (порт 443) и нажмите «Подключить прокси».")
+                else:
+                    print("  1. Откройте ссылку в Telegram и нажмите «Подключить прокси» (сквозная связь проверяется клиентом).")
+                    print("  2. Ссылка даёт доступ к прокси — передавайте её только тем, кому доверяете.")
+                    print("  3. Дополнительная диагностика и команды управления описаны в deploy/README.md.")
     else:
         print("\n" + heading("Что указать на входном сервере (edge)"))
-        print(f"  Адрес выхода: {bind_ip}:{pub_port}")
+        if egress_ws_path_val:
+            eg_dom_disp = egress_ws_domain or "<ваш-домен-egress>"
+            print(f"  Адрес выхода (WSS без SSH/VPN): wss://{eg_dom_disp}{egress_ws_path_val}")
+            print(f"  Добавить на edge одной командой: mtevilctl egress add \"wss://{eg_dom_disp}{egress_ws_path_val}\"")
+            print(f"  Шаблон Caddy:      {deploy_dir / 'Caddyfile.egress.example'}")
+            print(f"  Шаблон nginx:      {deploy_dir / 'nginx.egress.example'}")
+        else:
+            print(f"  Адрес выхода: {bind_ip}:{pub_port}")
         print("  Режим в мастере на edge: 2 (Расширенная настройка) -> 2 (edge)")
         print(f"  Получить токен безопасно: docker compose {compose_ref} exec -T {compose_service(base)} cat {effective_egress_token_file}")
         print("  Миграция на MTV3: сначала обновите egress, затем все edge; после этого выставите \"egress_accept_legacy\": false в config.json egress.")

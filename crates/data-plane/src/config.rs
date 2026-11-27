@@ -151,11 +151,20 @@ pub struct Config {
     #[serde(default)]
     pub dc: Vec<String>,
     #[serde(default)]
-    pub egress_upstreams: Vec<SocketAddr>,
+    pub egress_upstreams: Vec<crate::ws_egress::EgressEndpoint>,
     #[serde(default)]
     pub egress_strategy: EgressStrategy,
     #[serde(default)]
     pub egress_token_file: Option<PathBuf>,
+    /// Optional secret HTTP path on `egress` for accepting RFC 6455 WebSocket upgrades.
+    #[serde(default)]
+    pub egress_ws_path: Option<String>,
+    /// Warm pool size of pre-established `ws://`/`wss://` streams per WS upstream on `edge` (0 = disabled).
+    #[serde(default = "default_egress_ws_pool_size")]
+    pub egress_ws_pool_size: usize,
+    /// Optional PEM root CA file on `edge` for `wss://` egress certificate verification.
+    #[serde(default)]
+    pub egress_tls_ca_file: Option<PathBuf>,
     #[serde(default = "default_connections")]
     pub max_connections: usize,
     #[serde(default = "default_client_hello")]
@@ -405,6 +414,9 @@ pub fn default_egress_probe_degraded_interval_secs() -> u64 {
 pub fn default_egress_hedge_ms() -> u64 {
     400
 }
+pub fn default_egress_ws_pool_size() -> usize {
+    4
+}
 pub fn default_egress_accept_legacy() -> bool {
     true
 }
@@ -548,6 +560,22 @@ impl Config {
                 (88..=1460).contains(&mss),
                 "client_mss_bulk must be 88..=1460"
             );
+        }
+        ensure!(
+            self.egress_ws_pool_size <= 64,
+            "egress_ws_pool_size must be 0..=64"
+        );
+        if let Some(ref ws_path) = self.egress_ws_path {
+            crate::ws_egress::validate_egress_ws_path(ws_path)?;
+        }
+        if let Some(ref ca_file) = self.egress_tls_ca_file {
+            ensure!(
+                !ca_file.as_os_str().is_empty(),
+                "egress_tls_ca_file path must not be empty"
+            );
+            if ca_file.exists() {
+                let _ = crate::ws_egress::build_tls_connector(Some(ca_file))?;
+            }
         }
         if self.me.enabled {
             ensure!(

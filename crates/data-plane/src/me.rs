@@ -641,7 +641,7 @@ pub(crate) async fn read_mtv4_frame<R: tokio::io::AsyncRead + Unpin>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn relay_edge_mtv4_session(
     client: &mut TcpStream,
-    mut upstream: TcpStream,
+    mut upstream: UpstreamStream,
     route: &'static str,
     state: &State,
     session_id: u64,
@@ -696,7 +696,7 @@ pub(crate) async fn relay_edge_mtv4_session(
     );
 
     let client_fd = stream_raw_fd(client);
-    let upstream_fd = stream_raw_fd(&upstream);
+    let upstream_fd = stream_raw_fd(upstream.tcp_ref());
     let relay = RelayStats {
         counters: Some(state.counters.clone()),
         client_fd,
@@ -709,7 +709,7 @@ pub(crate) async fn relay_edge_mtv4_session(
 
     let result = {
         let (mut cr, mut cw) = client.split();
-        let (mut ur, mut uw) = upstream.split();
+        let (mut ur, mut uw) = tokio::io::split(&mut upstream);
         relay_until_end_with_drain(
             &relay,
             state.idle,
@@ -851,8 +851,8 @@ pub(crate) async fn relay_edge_mtv4_session(
 }
 
 /// Egress-side `MTV4` relay: bridges bounded `MTV4` frames from `edge` to a multiplexed `MeSession`.
-pub(crate) async fn relay_egress_mtv4_me(
-    edge: &mut TcpStream,
+pub(crate) async fn relay_egress_mtv4_me<E: AsyncRead + AsyncWrite + Unpin>(
+    edge: &mut E,
     me_session: MeSession,
     idle: Duration,
     counters: Arc<telemetry::Counters>,
@@ -866,7 +866,7 @@ pub(crate) async fn relay_egress_mtv4_me(
     counters.me_active_sessions.fetch_add(1, Ordering::Relaxed);
     let _me_guard = MeActiveGuard(counters.clone());
 
-    let (mut er, mut ew) = edge.split();
+    let (mut er, mut ew) = tokio::io::split(edge);
     let (mut me_rx, me_tx) = split_me_session_handles(me_session);
     let relay = RelayStats {
         counters: Some(counters.clone()),
@@ -1698,6 +1698,7 @@ mod tests {
             dcs: HashMap::new(),
             dc_media_overrides: HashMap::new(),
             egress_upstreams: Vec::new(),
+            ws_pool: None,
             egress_strategy: EgressStrategy::RoundRobin,
             egress_token: [0; 16],
             egress_rr: std::sync::atomic::AtomicUsize::new(0),
@@ -1992,6 +1993,7 @@ mod tests {
             dcs: st_dcs,
             dc_media_overrides: HashMap::new(),
             egress_upstreams: Vec::new(),
+            ws_pool: None,
             egress_strategy: EgressStrategy::RoundRobin,
             egress_token: [0; 16],
             egress_rr: std::sync::atomic::AtomicUsize::new(0),
@@ -2232,6 +2234,7 @@ mod tests {
             dcs,
             dc_media_overrides: HashMap::new(),
             egress_upstreams: Vec::new(),
+            ws_pool: None,
             egress_strategy: EgressStrategy::RoundRobin,
             egress_token: [0; 16],
             egress_rr: std::sync::atomic::AtomicUsize::new(0),
@@ -2351,7 +2354,8 @@ mod tests {
             cover_permits: Semaphore::new(4),
             dcs: HashMap::new(),
             dc_media_overrides: HashMap::new(),
-            egress_upstreams: upstreams,
+            egress_upstreams: upstreams.into_iter().map(Into::into).collect(),
+            ws_pool: None,
             egress_strategy: EgressStrategy::Ordered,
             egress_token,
             egress_rr: std::sync::atomic::AtomicUsize::new(0),
@@ -2970,6 +2974,7 @@ mod tests {
             dcs: st_dcs,
             dc_media_overrides: HashMap::new(),
             egress_upstreams: Vec::new(),
+            ws_pool: None,
             egress_strategy: EgressStrategy::RoundRobin,
             egress_token: [0; 16],
             egress_rr: std::sync::atomic::AtomicUsize::new(0),
