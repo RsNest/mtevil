@@ -482,15 +482,15 @@ class SetupValidationTests(unittest.TestCase):
             with mock.patch.object(setup.socket, "socket", return_value=FakeSock(priv)):
                 self.assertIsNone(setup.detect_local_global_ipv4())
 
-        with mock.patch.object(setup.socket, "socket", return_value=FakeSock("93.184.216.34")):
-            self.assertEqual(setup.detect_local_global_ipv4(), "93.184.216.34")
+        with mock.patch.object(setup.socket, "socket", return_value=FakeSock("1.1.1.1")):
+            self.assertEqual(setup.detect_local_global_ipv4(), "1.1.1.1")
 
         with mock.patch.object(sys, "stdin", io.StringIO("у\n")), mock.patch.object(sys, "stdout", io.StringIO()):
             self.assertTrue(setup.ask_yes_no("Продолжить?", default=False))
 
         with mock.patch.object(sys, "stdin", io.StringIO("\n")), mock.patch.object(sys, "stdout", io.StringIO()):
-            host, recs = setup.prompt_client_address("93.184.216.34")
-            self.assertEqual(host, "93.184.216.34")
+            host, recs = setup.prompt_client_address("1.1.1.1")
+            self.assertEqual(host, "1.1.1.1")
             self.assertIsNone(recs)
 
     def test_edge_failed_check_preserves_live_token_and_wait_healthy_timeout_has_abs_logs(self):
@@ -1530,9 +1530,9 @@ class SetupValidationTests(unittest.TestCase):
                 return False
 
         with mock.patch.object(setup.socket, "create_connection", return_value=_Conn()):
-            self.assertEqual(setup.check_public_port_reachable("93.184.216.34", 443), ("ok", ""))
+            self.assertEqual(setup.check_public_port_reachable("1.1.1.1", 443), ("ok", ""))
         with mock.patch.object(setup.socket, "create_connection", side_effect=OSError("timed out")):
-            st, detail = setup.check_public_port_reachable("93.184.216.34", 443)
+            st, detail = setup.check_public_port_reachable("1.1.1.1", 443)
             self.assertEqual(st, "unreachable")
             self.assertIn("timed out", detail)
 
@@ -1543,7 +1543,7 @@ class SetupValidationTests(unittest.TestCase):
 
             def fake_run(argv, **_kwargs):
                 if "link" in " ".join(argv):
-                    return subprocess.CompletedProcess(argv, 0, stdout="https://t.me/proxy?server=93.184.216.34&port=443&secret=ee00\n", stderr="")
+                    return subprocess.CompletedProcess(argv, 0, stdout="https://t.me/proxy?server=1.1.1.1&port=443&secret=ee00\n", stderr="")
                 return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
             out_buf = io.StringIO()
@@ -1554,7 +1554,7 @@ class SetupValidationTests(unittest.TestCase):
                 mock.patch.object(sys, "stdout", out_buf),
                 mock.patch.object(sys, "stderr", err_buf),
                 mock.patch.object(setup, "check_prerequisites"),
-                mock.patch.object(setup, "detect_local_global_ipv4", return_value="93.184.216.34"),
+                mock.patch.object(setup, "detect_local_global_ipv4", return_value="1.1.1.1"),
                 mock.patch.object(setup, "is_port_available", return_value=True),
                 mock.patch.object(setup, "deployment_owns_port", return_value=False),
                 mock.patch.object(setup, "ensure_generated_secret", return_value=True),
@@ -1569,9 +1569,9 @@ class SetupValidationTests(unittest.TestCase):
             self.assertEqual(rc, 0, out_buf.getvalue() + err_buf.getvalue())
             self.assertIn("Не удалось получить ответ Telegram через прокси.", err_buf.getvalue())
             self.assertIn("probe_telegram_timeout", err_buf.getvalue())
-            self.assertIn("Не удалось подключиться к 93.184.216.34:443 с самого сервера", out_buf.getvalue())
+            self.assertIn("Не удалось подключиться к 1.1.1.1:443 с самого сервера", out_buf.getvalue())
             self.assertIn("ufw allow 443/tcp", out_buf.getvalue())
-            self.assertIn("https://t.me/proxy?server=93.184.216.34&port=443&secret=ee00", out_buf.getvalue().splitlines())
+            self.assertIn("https://t.me/proxy?server=1.1.1.1&port=443&secret=ee00", out_buf.getvalue().splitlines())
 
     def test_simple_missing_ip_occupied_port_invalid_input_switch_and_cancel(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2874,7 +2874,7 @@ class SetupValidationTests(unittest.TestCase):
                         "max_connections": 777,
                         "client_mss": 1200,
                         "fake_tls_cert_bytes": 4320,
-                        "me": {"enabled": True, "public_ipv4": "1.2.3.4", "pool_size": 4},
+                        "me": {"enabled": True, "public_ipv4": "198.51.100.4", "pool_size": 4},
                     }
                 )
                 + "\n",
@@ -2894,7 +2894,7 @@ class SetupValidationTests(unittest.TestCase):
             self.assertEqual(cfg["max_connections"], 777)
             self.assertEqual(cfg["client_mss"], 1200)
             self.assertEqual(cfg["fake_tls_cert_bytes"], 4320)
-            self.assertEqual(cfg["me"], {"enabled": True, "public_ipv4": "1.2.3.4", "pool_size": 4})
+            self.assertEqual(cfg["me"], {"enabled": True, "public_ipv4": "198.51.100.4", "pool_size": 4})
 
             # 2. Edge reconfigure preserves egress_strategy and egress_token_file.
             (d / "config.json").write_text(
@@ -3684,7 +3684,7 @@ class SetupValidationTests(unittest.TestCase):
     def test_v040_validators_sni_hygiene_and_reverse_proxy_snippets(self):
         # 1. SNI / domain hygiene linter
         self.assertEqual(setup.lint_sni_hygiene("news-portal.example.org"), [])
-        w_mtevil = setup.lint_sni_hygiene("mtevil-wizard.schoolbox75.tech")
+        w_mtevil = setup.lint_sni_hygiene("mtevil-wizard.example.org")
         self.assertEqual(len(w_mtevil), 1)
         self.assertIn("'mtevil'", w_mtevil[0])
         w_multi = setup.lint_sni_hygiene("xray-vpn.example.com")
@@ -4211,6 +4211,204 @@ class SetupValidationTests(unittest.TestCase):
         self.assertIn("log_skip @mtevil_egress", eg_c)
         loc_block = eg_n.split("location = /ws/secret-token", 1)[1].split("}", 1)[0]
         self.assertIn("access_log off;", loc_block)
+
+    def test_p1_repo_hygiene_linter_catches_leaks_and_passes_clean_tree(self):
+        import importlib.util
+
+        hygiene_path = Path(__file__).resolve().parent.parent / "scripts" / "check_repo_hygiene.py"
+        spec = importlib.util.spec_from_file_location("check_repo_hygiene", str(hygiene_path))
+        self.assertIsNotNone(spec)
+        hygiene = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hygiene)
+
+        # Clean real repo passes cleanly.
+        self.assertEqual(hygiene.scan_repo(hygiene.REPO_ROOT), [])
+
+        # Temp directory catches non-allowlisted domain, public IP, partial CIDR, and AS number.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bad_dom = "node.nonexistent-private-domain." + "tech"
+            bad_ip = ".".join(["93", "184", "216", "34"])
+            bad_pfx = ".".join(["93", "184"]) + "/16"
+            bad_asn = "AS" + "12345"
+            (root / "clean.md").write_text("Host edge.example.org IP 203.0.113.10 IPv6 2001:db8::1\n", encoding="utf-8")
+            (root / "bad_dom.md").write_text(f"SNI {bad_dom}\n", encoding="utf-8")
+            (root / "bad_ip.md").write_text(f"Server 198.51.100.1 ok vs {bad_ip} bad and prefix {bad_pfx}\n", encoding="utf-8")
+            (root / "bad_asn.md").write_text(f"Carrier {bad_asn}\n", encoding="utf-8")
+            with mock.patch.object(hygiene.subprocess, "check_output", side_effect=OSError("no git")):
+                errs = hygiene.scan_repo(root)
+            joined = "\n".join(errs)
+            self.assertNotIn("clean.md", joined)
+            self.assertIn("bad_dom.md", joined)
+            self.assertIn("bad_ip.md", joined)
+            self.assertIn("bad_asn.md", joined)
+
+    def test_p2_proxy_protocol_migration_bridge_host_loopback_and_corrupted(self):
+        import contextlib
+
+        # 1. Loopback addresses (IPv4, IPv6, IPv4-mapped IPv6) require no migration.
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    network_mode: host\n", encoding="utf-8")
+            for listen in ("127.0.0.1:24443", "[::1]:24443", "[::ffff:127.0.0.1]:24443"):
+                (d / "config.json").write_text(
+                    setup.json.dumps({"role": "direct", "listen": listen, "proxy_protocol": True}),
+                    encoding="utf-8",
+                )
+                status, sug, _, _ = setup.inspect_proxy_protocol_config(d, d / "config.json")
+                self.assertEqual((status, sug), ("ok", []))
+
+        # 2. Bridge + HAProxy: stops cleanly before docker pull when unconfirmed, updates with gateway CIDR when confirmed.
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: mtevil:v0.4.0\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_PROJECT=mtevil-bridge\nMTEVIL_IMAGE=mtevil:v0.4.0\n", encoding="utf-8")
+            orig_cfg = {
+                "role": "direct",
+                "listen": "0.0.0.0:24443",
+                "proxy_protocol": True,
+                "sni": "example.org",
+                "cover": "example.org:443",
+            }
+            (d / "config.json").write_text(setup.json.dumps(orig_cfg), encoding="utf-8")
+
+            called_cmds: list[list[str]] = []
+
+            def fake_run_bridge(argv, **_kwargs):
+                called_cmds.append(list(argv))
+                if argv[:3] == ["docker", "network", "inspect"] and argv[3] == "mtevil-bridge_default":
+                    payload = setup.json.dumps([{"IPAM": {"Config": [{"Subnet": "172.24.0.0/16", "Gateway": "172.24.0.1"}]}}])
+                    return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
+                if "pull" in argv:
+                    return subprocess.CompletedProcess(argv, 1, stdout="", stderr="stop-after-check")
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            # 2a. Non-interactive -> stops BEFORE docker pull without touching config.json
+            err_buf = io.StringIO()
+            with (
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "inspect_current_deployment", return_value=("id0", None, "v0.4.0")),
+                mock.patch.object(setup, "run", side_effect=fake_run_bridge),
+                mock.patch.object(sys.stdin, "isatty", return_value=False),
+                mock.patch.dict(setup.os.environ, {"MTEVIL_SKIP_ASSET_DOWNLOAD": "1"}),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(err_buf),
+            ):
+                rc = setup.run_update_command(d, "v0.4.1", reexec=True)
+            self.assertEqual(rc, 1)
+            self.assertIn("172.24.0.1/32", err_buf.getvalue())
+            self.assertFalse(any("pull" in c for c in called_cmds))
+            self.assertEqual(setup.json.loads((d / "config.json").read_text(encoding="utf-8")), orig_cfg)
+
+            # 2b. Interactive confirmed -> writes gateway CIDR + backup BEFORE docker pull
+            called_cmds.clear()
+            fake_tty = io.StringIO("y\n\n")
+            with (
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "inspect_current_deployment", return_value=("id0", None, "v0.4.0")),
+                mock.patch.object(setup, "run", side_effect=fake_run_bridge),
+                mock.patch.object(sys, "stdin", fake_tty),
+                mock.patch.object(fake_tty, "isatty", return_value=True, create=True),
+                mock.patch.dict(setup.os.environ, {"MTEVIL_SKIP_ASSET_DOWNLOAD": "1"}),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                rc2 = setup.run_update_command(d, "v0.4.1", reexec=True)
+            # Stopped on mocked `pull` AFTER successful migration
+            self.assertEqual(rc2, 1)
+            self.assertTrue(any("pull" in c for c in called_cmds))
+            migrated = setup.json.loads((d / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(migrated["proxy_protocol_allow_from"], ["172.24.0.1/32"])
+            self.assertTrue((d / "config.json.pre-v041-pp.bak").is_file())
+
+        # 3. Host-network with AWG subnet listen + wildcard 0.0.0.0 + wizard check
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    network_mode: host\n", encoding="utf-8")
+            (d / "config.json").write_text(
+                setup.json.dumps({"role": "edge", "listen": "10.203.0.2:24443", "proxy_protocol": True}),
+                encoding="utf-8",
+            )
+            status, sug, reason, _ = setup.inspect_proxy_protocol_config(d, d / "config.json")
+            self.assertEqual(status, "needs_allow_from")
+            self.assertEqual(sug, ["10.203.0.0/24"])
+            self.assertIn("host-network", reason)
+
+            # Wildcard 0.0.0.0 on host-network inspects AWG interface addresses
+            (d / "config.json").write_text(
+                setup.json.dumps({"role": "direct", "listen": "0.0.0.0:24443", "proxy_protocol": True}),
+                encoding="utf-8",
+            )
+            def fake_ip_addr(argv, **_kwargs):
+                if argv[:2] == ["ip", "-o"]:
+                    return subprocess.CompletedProcess(
+                        argv, 0, stdout="7: awg0    inet 10.204.5.2/24 scope global awg0\n", stderr=""
+                    )
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+            with mock.patch.object(setup, "run", side_effect=fake_ip_addr):
+                st_w, sug_w, _, _ = setup.inspect_proxy_protocol_config(d, d / "config.json")
+            self.assertEqual(st_w, "needs_allow_from")
+            self.assertIn("10.204.5.0/24", sug_w)
+
+            # Wizard reconfigure preserves proxy_protocol=True with non-loopback bind_ip and stops if unconfirmed
+            (d / ".env").write_text("MTEVIL_PROJECT=mtevil-direct\nMTEVIL_BIND=10.203.0.2\nMTEVIL_PORT=24443\n", encoding="utf-8")
+            (d / "config.json").write_text(
+                setup.json.dumps({
+                    "role": "direct",
+                    "listen": "10.203.0.2:24443",
+                    "proxy_protocol": True,
+                    "sni": "example.org",
+                    "cover": "127.0.0.1:8443",
+                }),
+                encoding="utf-8",
+            )
+            # self-steal reconfigure: y (reconfigure) -> sni -> host -> port -> bind -> cover -> apply y -> non-tty pp decline -> exit 1
+            wiz_in = io.StringIO("y\nexample.org\n24443\n10.203.0.2\n127.0.0.1:8443\ny\n")
+            wiz_err = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["setup.py", "--self-steal", "--dir", str(d), "--image", "mtevil:test", "--no-build"]),
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "inspect_current_deployment", return_value=("id0", None, "v0.4.0")),
+                mock.patch.object(setup, "is_port_available", return_value=True),
+                mock.patch.object(setup, "deployment_owns_port", return_value=True),
+                mock.patch.object(setup, "prompt_client_address", return_value=("example.org", None)),
+                mock.patch.object(setup, "check_cover_from_container", return_value=(True, "ok")),
+                mock.patch.object(sys, "stdin", wiz_in),
+                mock.patch.object(wiz_in, "isatty", return_value=False, create=True),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+                mock.patch.object(sys, "stderr", wiz_err),
+            ):
+                wiz_rc = setup.main()
+            self.assertEqual(wiz_rc, 1)
+            self.assertIn("10.203.0.0/24", wiz_err.getvalue())
+
+        # 4. Corrupted configuration fails cleanly BEFORE docker pull / container replacement
+        for bad_raw in (
+            "{not valid json",
+            "[]",
+            setup.json.dumps({"role": "direct", "listen": "bad-listen", "proxy_protocol": True}),
+            setup.json.dumps({"role": "direct", "listen": "0.0.0.0:24443", "proxy_protocol": True, "proxy_protocol_allow_from": ["not-cidr"]}),
+            setup.json.dumps({"role": "egress", "listen": "127.0.0.1:29443", "proxy_protocol": True}),
+        ):
+            with tempfile.TemporaryDirectory() as td:
+                d = Path(td)
+                (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: mtevil:v0.4.0\n", encoding="utf-8")
+                (d / ".env").write_text("MTEVIL_PROJECT=mtevil-bad\n", encoding="utf-8")
+                (d / "config.json").write_text(bad_raw, encoding="utf-8")
+                pull_called = []
+                err_b = io.StringIO()
+                with (
+                    mock.patch.object(setup, "check_prerequisites"),
+                    mock.patch.object(setup, "inspect_current_deployment", return_value=("id0", None, "v0.4.0")),
+                    mock.patch.object(setup, "run", side_effect=lambda argv, **k: pull_called.append(argv) or subprocess.CompletedProcess(argv, 0, "", "")),
+                    mock.patch.dict(setup.os.environ, {"MTEVIL_SKIP_ASSET_DOWNLOAD": "1"}),
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(err_b),
+                ):
+                    rc_bad = setup.run_update_command(d, "v0.4.1", reexec=True)
+                self.assertEqual(rc_bad, 1, msg=bad_raw)
+                self.assertEqual(pull_called, [])
+                self.assertEqual((d / "config.json").read_text(encoding="utf-8"), bad_raw)
 
 
 if __name__ == "__main__":
