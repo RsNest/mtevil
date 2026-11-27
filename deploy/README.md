@@ -335,3 +335,37 @@ mtevilctl setup --webproxy
   - Домен и IP привязаны к вам и могут блокироваться без коллатерального ущерба для сторонних сервисов.
   - Поддержка `tg://webproxy` зависит от версии клиента Telegram на платформе пользователя (в первую очередь Telegram Desktop и свежие сборки Android; для клиентов без поддержки `webproxy` можно либо оставить классический `mtevil` вход на отдельном порту, выбрав `0.0.0.0` при настройке бэкенда, либо использовать отдельный узел с `tg://proxy`).
 - **Откат:** при любой ошибке проверки (`-check`, `healthy`, `/readyz`, `probe-telegram`) мастер автоматически откатывает `compose.yaml`, `.env`, `config.json`, удаляет или восстанавливает `tproxy.json` и файлы в томе `state`. Для возврата к прежнему релизу используйте `mtevilctl rollback`.
+- **Автономный `Caddy` и режим за CDN:** если порт `443` свободен и на хосте нет веб-сервера, флаг `mtevilctl setup --webproxy --managed-caddy` поднимет встроенный контейнер `caddy` с автоматическим выпуском сертификата Let's Encrypt. Для одиночного зарубежного узла за Cloudflare используйте `mtevilctl setup --webproxy --cdn` (режим SSL `Full (Strict)` и включённые `WebSockets`).
+
+---
+
+## Нативный `WSS`-транспорт `edge → egress` (без внешних SSH/VPN), `shared-443` и `tuning`
+
+### 1. Связка `edge → egress` по `wss://` (без `ssh -L` и сторонних туннелей)
+1. На зарубежном узле `egress` включите приём WebSocket по секретному пути за `Caddy`/`nginx` на `:443`:
+   ```bash
+   mtevilctl setup --egress-ws --egress-domain egress.example.com
+   ```
+   Мастер привяжет `mtevil` к `127.0.0.1:29443`, сгенерирует секретный путь `/ws/<hex>`, сохранит шаблоны `Caddyfile.egress.example` и `nginx.egress.example` и выведет готовую команду для `edge`.
+2. На входном сервере `edge` укажите `wss://egress.example.com/ws/<hex>` при настройке или добавьте резервный выход на лету:
+   ```bash
+   mtevilctl egress add "wss://egress.example.com/ws/<hex>"
+   mtevilctl egress hedge 250
+   mtevilctl egress list
+   ```
+   На `edge` автоматически работает тёплый пул независимых `TLS + WebSocket` соединений (`egress_ws_pool_size = 4` по умолчанию) без межпользовательского TCP-over-TCP Head-of-Line blocking.
+
+### 2. Деление порта `:443` с `Xray` или `nginx` (`--shared-443`)
+Если внешний порт `443` уже занят `Xray` или `nginx`, не выводите прокси на нестандартные высокие порты:
+```bash
+mtevilctl setup --shared-443
+```
+Мастер настроит `mtevil` на `127.0.0.1:24443` с `proxy_protocol: true`, зафиксирует порт `:443` во всех клиентских ссылках (`MTEVIL_PUBLIC_PORT=443`) и создаст готовые примеры маршрутизации по SNI в `nginx.stream443.example.conf` (`ssl_preread on; proxy_protocol on;`) и `xray.shared443.example.json` (`fallbacks` с `"xver": 2`).
+
+### 3. Профиль TCP MSS (`mtevilctl tuning`)
+Для тактической нарезки `ClientHello` у старых клиентов `tg://proxy` доступно управление `client_mss` и `client_mss_bulk`:
+```bash
+mtevilctl tuning --handshake-mss 280 --bulk-mss 1400
+mtevilctl tuning --handshake-mss off --bulk-mss off
+```
+> По стандарту TCP (RFC 9293) `client_mss_bulk` восстанавливает размер сегмента только на скачивание (`сервер → клиент`); отдача от клиента (`upload`) остаётся ограниченной `client_mss` до конца TCP-сессии.

@@ -3658,6 +3658,476 @@ class SetupValidationTests(unittest.TestCase):
                 setup.run(base + ["down", "-v", "--remove-orphans"], check=False)
                 setup.run(["docker", "rmi", "-f", tp_tag], check=False)
 
+    def test_v040_validators_sni_hygiene_and_reverse_proxy_snippets(self):
+        # 1. SNI / domain hygiene linter
+        self.assertEqual(setup.lint_sni_hygiene("news-portal.example.org"), [])
+        w_mtevil = setup.lint_sni_hygiene("mtevil-wizard.schoolbox75.tech")
+        self.assertEqual(len(w_mtevil), 1)
+        self.assertIn("'mtevil'", w_mtevil[0])
+        w_multi = setup.lint_sni_hygiene("xray-vpn.example.com")
+        self.assertIn("'vpn'", w_multi[0])
+        self.assertIn("'xray'", w_multi[0])
+
+        # 2. Egress upstream validator + secret WS path redaction
+        self.assertEqual(setup.validate_egress_upstream("10.203.0.9:29443"), "10.203.0.9:29443")
+        self.assertEqual(setup.validate_egress_upstream("tcp://10.203.0.9:29443"), "tcp://10.203.0.9:29443")
+        self.assertEqual(
+            setup.validate_egress_upstream("wss://CH.Example.com:443/ws/9f3c8a1b"),
+            "wss://ch.example.com/ws/9f3c8a1b",
+        )
+        self.assertEqual(
+            setup.validate_egress_upstream("wss://[2001:db8::1]:8443/ws/sec?connect=127.0.0.1:18443"),
+            "wss://[2001:db8::1]:8443/ws/sec?connect=127.0.0.1:18443",
+        )
+        self.assertEqual(
+            setup.redact_egress_upstream("wss://ch.example.com/ws/9f3c8a1b"),
+            "wss://ch.example.com:443/***",
+        )
+        self.assertNotIn("9f3c8a1b", setup.redact_egress_upstream("wss://ch.example.com/ws/9f3c8a1b"))
+        for bad in (
+            "wss://ch.example.com/",
+            "wss://ch.example.com",
+            "wss://0.0.0.0/ws/abc",
+            "wss://ch.example.com/ws/abc?bad=1",
+            "wss://ch.example.com/ws/abc#frag",
+        ):
+            with self.assertRaises(ValueError, msg=bad):
+                setup.validate_egress_upstream(bad)
+
+        # 3. Reverse proxy & shared-443 & managed-caddy snippets
+        eg_c, eg_n = setup.render_egress_ws_reverse_proxy_snippets("egress.example.com", "/ws/9f3c", "127.0.0.1:29443")
+        self.assertIn("@mtevil_egress path /ws/9f3c", eg_c)
+        self.assertIn("location = /ws/9f3c", eg_n)
+        self.assertIn("access_log off;", eg_n)
+
+        xr_s, ng_s = setup.render_shared_443_snippets("media.example.com", "127.0.0.1:24443")
+        self.assertIn('"xver": 2', xr_s)
+        self.assertIn("proxy_protocol on;", ng_s)
+        self.assertIn("ssl_preread on;", ng_s)
+
+        wp_c_cdn, wp_n_cdn = setup.render_webproxy_reverse_proxy_snippets(
+            "proxy.example.com", "", "127.0.0.1:8080", cdn_mode=True
+        )
+        self.assertIn("Full (Strict)", wp_c_cdn)
+        self.assertIn("$http_cf_connecting_ip", wp_n_cdn)
+
+        comp = setup.render_compose(
+            Path("."),
+            Path("."),
+            "direct",
+            network_host=True,
+            include_build=False,
+            tproxy_sidecar={"config_name": "tproxy.json", "include_build": False},
+            managed_caddy={"caddyfile_name": "Caddyfile"},
+        )
+        self.assertIn("\n  caddy:\n", comp)
+        self.assertIn("caddy_data:", comp)
+        self.assertIn("./Caddyfile:/etc/caddy/Caddyfile:ro", comp)
+
+    def test_v040_egress_tuning_shared443_and_managed_caddy_commands(self):
+        import contextlib
+        import json
+
+        with mock.patch.object(setup, "ask", return_value="5"), mock.patch("builtins.print"):
+            self.assertEqual(setup.choose_wizard_mode(), "shared-443")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            edge_cfg = {
+                "role": "edge",
+                "listen": "0.0.0.0:443",
+                "secret_file": "/var/lib/mtevil/proxy-secret",
+                "users_file": "/var/lib/mtevil/users.json",
+                "replay_file": "/var/lib/mtevil-replay/replay.bin",
+                "sni": "mozilla.org",
+                "cover": "mozilla.org:443",
+                "egress_upstreams": ["wss://ch.example.com/ws/topsecret1"],
+                "egress_strategy": "ordered",
+                "egress_hedge_ms": 400,
+                "egress_token_file": "/var/lib/mtevil/egress-token",
+            }
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: mtevil:local\n", encoding="utf-8")
+            (d / ".env").write_text(
+                "MTEVIL_PROJECT=mtevil-edge\nMTEVIL_IMAGE=mtevil:local\nMTEVIL_BIND=0.0.0.0\nMTEVIL_PORT=443\nMTEVIL_PUBLIC_HOST=203.0.113.5\n",
+                encoding="utf-8",
+            )
+            (d / "config.json").write_text(json.dumps(edge_cfg), encoding="utf-8")
+
+            def fake_ok_run(_cmd, **_kw):
+                return mock.Mock(returncode=0, stdout="ok", stderr="")
+
+            # 1. mtevilctl egress list redacts secret WS path; add / hedge / strategy / del work cleanly
+            out_list = io.StringIO()
+            with mock.patch.object(setup, "check_prerequisites"), mock.patch.object(sys, "stdout", out_list):
+                self.assertEqual(setup.run_egress_command(d, "list"), 0)
+            self.assertIn("wss://ch.example.com:443/***", out_list.getvalue())
+            self.assertNotIn("topsecret1", out_list.getvalue())
+
+            # Refuses deleting the sole upstream
+            with mock.patch.object(setup, "check_prerequisites"), mock.patch.object(sys, "stderr", io.StringIO()):
+                self.assertEqual(setup.run_egress_command(d, "del", "1"), 1)
+
+            with (
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "run", side_effect=fake_ok_run),
+                mock.patch.object(setup, "wait_healthy"),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+            ):
+                self.assertEqual(setup.run_egress_command(d, "add", "wss://nl.example.com/ws/topsecret2"), 0)
+                self.assertEqual(setup.run_egress_command(d, "hedge", "250"), 0)
+                self.assertEqual(setup.run_egress_command(d, "strategy", "round-robin"), 0)
+
+            updated = json.loads((d / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                updated["egress_upstreams"],
+                ["wss://ch.example.com/ws/topsecret1", "wss://nl.example.com/ws/topsecret2"],
+            )
+            self.assertEqual(updated["egress_hedge_ms"], 250)
+            self.assertEqual(updated["egress_strategy"], "round-robin")
+
+            with (
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "run", side_effect=fake_ok_run),
+                mock.patch.object(setup, "wait_healthy"),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+            ):
+                self.assertEqual(setup.run_egress_command(d, "del", "2"), 0)
+            self.assertEqual(len(json.loads((d / "config.json").read_text(encoding="utf-8"))["egress_upstreams"]), 1)
+
+            # 2. mtevilctl tuning sets & clears client_mss / client_mss_bulk and warns about RFC 9293 upload
+            out_tun = io.StringIO()
+            with (
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "run", side_effect=fake_ok_run),
+                mock.patch.object(setup, "wait_healthy"),
+                mock.patch.object(sys, "stdout", out_tun),
+            ):
+                self.assertEqual(setup.run_tuning_command(d, handshake_mss="280", bulk_mss="1400"), 0)
+            self.assertIn("RFC 9293", out_tun.getvalue())
+            tun_cfg = json.loads((d / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(tun_cfg["client_mss"], 280)
+            self.assertEqual(tun_cfg["client_mss_bulk"], 1400)
+
+            with (
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "run", side_effect=fake_ok_run),
+                mock.patch.object(setup, "wait_healthy"),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+            ):
+                self.assertEqual(setup.run_tuning_command(d, handshake_mss="off", bulk_mss="off"), 0)
+            tun_cleared = json.loads((d / "config.json").read_text(encoding="utf-8"))
+            self.assertNotIn("client_mss", tun_cleared)
+            self.assertNotIn("client_mss_bulk", tun_cleared)
+
+            # 3. Shared-443 wizard configures proxy_protocol=True and MTEVIL_PUBLIC_PORT=443
+            d_sh = d / "shared443"
+            stdin_sh = "\n".join(
+                [
+                    "media.example.org",   # SNI
+                    "media.example.org:443",  # cover
+                    "203.0.113.10",        # public_host
+                    "24443",               # local port
+                ]
+            ) + "\n"
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(sys, "argv", ["mtevilctl", "setup", "--shared-443", "--no-build", "--dir", str(d_sh)]))
+                stack.enter_context(mock.patch.object(setup, "check_prerequisites"))
+                stack.enter_context(mock.patch.object(setup, "deployment_owns_port", return_value=True))
+                stack.enter_context(mock.patch.object(setup, "is_port_available", return_value=True))
+                stack.enter_context(mock.patch.object(setup, "read_unprivileged_port_start", return_value=0))
+                stack.enter_context(mock.patch.object(setup, "volume_file_exists", return_value=True))
+                stack.enter_context(mock.patch.object(setup, "ensure_generated_secret", return_value=False))
+                stack.enter_context(mock.patch.object(setup, "read_allowed_snis_from_volume", return_value=[]))
+                stack.enter_context(mock.patch.object(setup, "record_allowed_snis_in_volume"))
+                stack.enter_context(mock.patch.object(setup, "check_cover_from_container", return_value=(True, "ok")))
+                stack.enter_context(mock.patch.object(setup, "wait_healthy"))
+                stack.enter_context(mock.patch.object(setup, "verify_telegram_e2e", return_value=(True, "ok")))
+                stack.enter_context(mock.patch.object(setup, "check_public_port_reachable", return_value=("ok", "")))
+                stack.enter_context(mock.patch.object(setup, "run", side_effect=fake_ok_run))
+                stack.enter_context(mock.patch.object(sys, "stdin", io.StringIO(stdin_sh)))
+                stack.enter_context(mock.patch.object(sys, "stdout", io.StringIO()))
+                stack.enter_context(mock.patch.object(sys, "stderr", io.StringIO()))
+                self.assertEqual(setup.main(), 0)
+
+            sh_saved = setup.load_existing_defaults(d_sh)
+            self.assertTrue(sh_saved["shared_443"])
+            self.assertTrue(sh_saved["config"]["proxy_protocol"])
+            self.assertEqual(setup.resolve_client_server_and_port(sh_saved), ("203.0.113.10", 443))
+            self.assertTrue((d_sh / "xray.shared443.example.json").is_file())
+            self.assertTrue((d_sh / "nginx.stream443.example.conf").is_file())
+
+    def test_linux_real_wss_egress_and_shared443_e2e(self):
+        if sys.platform != "linux":
+            self.skipTest("requires Linux Docker host")
+        img = self._local_image_or_skip()
+        import os
+        import shutil
+        import ssl
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ca_key = root / "ca.key"
+            ca_crt = root / "ca.pem"
+            srv_key = root / "srv.key"
+            srv_csr = root / "srv.csr"
+            srv_ext = root / "srv.ext"
+            srv_crt = root / "srv.pem"
+
+            # 1. Generate ephemeral Root CA + leaf cert for egress.example.test via openssl
+            subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-keyout",
+                    str(ca_key),
+                    "-out",
+                    str(ca_crt),
+                    "-days",
+                    "2",
+                    "-subj",
+                    "/CN=mtevil-test-ca",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-keyout",
+                    str(srv_key),
+                    "-out",
+                    str(srv_csr),
+                    "-subj",
+                    "/CN=egress.example.test",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            srv_ext.write_text("subjectAltName=DNS:egress.example.test\n", encoding="utf-8")
+            subprocess.run(
+                [
+                    "openssl",
+                    "x509",
+                    "-req",
+                    "-in",
+                    str(srv_csr),
+                    "-CA",
+                    str(ca_crt),
+                    "-CAkey",
+                    str(ca_key),
+                    "-CAcreateserial",
+                    "-out",
+                    str(srv_crt),
+                    "-days",
+                    "2",
+                    "-extfile",
+                    str(srv_ext),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            ca_crt.chmod(0o644)
+
+            dc = _LocalMockTelegramDc()
+            eg_port = setup.find_free_port("127.0.0.1", 29510) or 29510
+            tls_port = setup.find_free_port("127.0.0.1", 29511) or 29511
+            edge_port = setup.find_free_port("127.0.0.1", 24510) or 24510
+            token_hex = "ab" * 16
+            ws_secret_path = "/ws/e2e-live-secret-99"
+
+            # 2. Local TLS 1.3 terminator forwarding encrypted WSS to 127.0.0.1:eg_port
+            tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            tls_ctx.load_cert_chain(certfile=str(srv_crt), keyfile=str(srv_key))
+            tls_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            tls_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            tls_sock.bind(("127.0.0.1", tls_port))
+            tls_sock.listen(32)
+            stop_tls = threading.Event()
+
+            def _pipe(src, dst):
+                try:
+                    while True:
+                        chunk = src.recv(16384)
+                        if not chunk:
+                            try:
+                                dst.shutdown(socket.SHUT_WR)
+                            except OSError:
+                                pass
+                            break
+                        dst.sendall(chunk)
+                except OSError:
+                    pass
+                finally:
+                    try:
+                        src.close()
+                    except OSError:
+                        pass
+
+            def _tls_accept_loop():
+                tls_sock.settimeout(0.5)
+                while not stop_tls.is_set():
+                    try:
+                        raw_cl, _ = tls_sock.accept()
+                    except TimeoutError:
+                        continue
+                    except OSError:
+                        break
+                    def _handle(cl_s):
+                        try:
+                            ssl_cl = tls_ctx.wrap_socket(cl_s, server_side=True)
+                            be = socket.create_connection(("127.0.0.1", eg_port), timeout=3)
+                            t1 = threading.Thread(target=_pipe, args=(ssl_cl, be), daemon=True)
+                            t2 = threading.Thread(target=_pipe, args=(be, ssl_cl), daemon=True)
+                            t1.start()
+                            t2.start()
+                        except Exception:
+                            try:
+                                cl_s.close()
+                            except OSError:
+                                pass
+                    threading.Thread(target=_handle, args=(raw_cl,), daemon=True).start()
+
+            tls_thread = threading.Thread(target=_tls_accept_loop, daemon=True)
+            tls_thread.start()
+
+            eg_dir = root / "egress"
+            edge_dir = root / "edge"
+            eg_base = setup.compose_cmd(eg_dir, f"mtevil-eg-wss-{os.getpid()}")
+            edge_base = setup.compose_cmd(edge_dir, f"mtevil-ed-wss-{os.getpid()}")
+            try:
+                # 3. Deploy egress container with --egress-ws
+                stdin_eg = "\n".join(
+                    [
+                        "127.0.0.1",  # bind_ip
+                        str(eg_port),
+                        "y",          # Применить конфигурацию и запустить контейнер?
+                        "y",          # Это первый узел egress (сгенерировать новый токен MTV2)?
+                        "n",          # Показать сгенерированный токен MTV2?
+                    ]
+                ) + "\n"
+                with (
+                    mock.patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "setup.py",
+                            "--dir",
+                            str(eg_dir),
+                            "--project",
+                            f"mtevil-eg-wss-{os.getpid()}",
+                            "--image",
+                            img,
+                            "--no-build",
+                            "--egress-ws",
+                            "--egress-ws-path",
+                            ws_secret_path,
+                            "--egress-domain",
+                            "egress.example.test",
+                        ],
+                    ),
+                    mock.patch.object(sys, "stdin", io.StringIO(stdin_eg)),
+                    mock.patch.object(sys, "stdout", io.StringIO()),
+                    mock.patch.object(sys, "stderr", io.StringIO()),
+                ):
+                    self.assertEqual(setup.main(), 0)
+
+                self.assertTrue((eg_dir / "Caddyfile.egress.example").is_file())
+                setup.write_volume_secret_stdin(eg_base, "/var/lib/mtevil/egress-token", token_hex)
+                eg_cfg = setup.json.loads((eg_dir / "config.json").read_text(encoding="utf-8"))
+                eg_cfg["dc"] = [f"{i}=127.0.0.1:{dc.port}" for i in range(1, 6)]
+                (eg_dir / "config.json").write_text(setup.json.dumps(eg_cfg, indent=2) + "\n", encoding="utf-8")
+                setup.run(eg_base + ["up", "-d", "--force-recreate", setup.compose_service(eg_base)])
+                setup.wait_healthy(eg_base)
+
+                # 4. Deploy edge container in --shared-443 mode dialing wss://egress.example.test
+                wss_uri = f"wss://egress.example.test:{tls_port}{ws_secret_path}?connect=127.0.0.1:{tls_port}"
+                edge_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ca_crt, edge_dir / "egress-ca.pem")
+                (edge_dir / "egress-ca.pem").chmod(0o644)
+
+                stdin_ed = "\n".join(
+                    [
+                        "mozilla.org",       # sni
+                        "mozilla.org:443",   # cover
+                        "203.0.113.55",      # public_host
+                        str(edge_port),      # local port
+                        f"127.0.0.1:{eg_port}",  # initial raw tcp upstream for initial check-egress before mounting CA
+                        token_hex,           # MTV2/MTV3 token
+                    ]
+                ) + "\n"
+                with (
+                    mock.patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "setup.py",
+                            "--dir",
+                            str(edge_dir),
+                            "--project",
+                            f"mtevil-ed-wss-{os.getpid()}",
+                            "--image",
+                            img,
+                            "--no-build",
+                            "--shared-443",
+                            "--role",
+                            "edge",
+                        ],
+                    ),
+                    mock.patch.object(setup, "check_cover_from_container", return_value=(True, "ok")),
+                    mock.patch.object(setup, "check_public_port_reachable", return_value=("ok", "")),
+                    mock.patch.object(sys, "stdin", io.StringIO(stdin_ed)),
+                    mock.patch.object(sys, "stdout", io.StringIO()),
+                    mock.patch.object(sys, "stderr", io.StringIO()),
+                ):
+                    self.assertEqual(setup.main(), 0)
+
+                # Mount CA cert and switch edge strictly to `wss://egress.example.test:...`!
+                ed_cfg = setup.json.loads((edge_dir / "config.json").read_text(encoding="utf-8"))
+                ed_cfg["egress_upstreams"] = [wss_uri]
+                ed_cfg["egress_tls_ca_file"] = "/etc/mtevil/egress-ca.pem"
+                (edge_dir / "config.json").write_text(setup.json.dumps(ed_cfg, indent=2) + "\n", encoding="utf-8")
+                ed_comp = setup.render_compose(
+                    Path("."),
+                    edge_dir,
+                    "edge",
+                    "config.json",
+                    network_host=True,
+                    health_host="127.0.0.1",
+                    health_port=edge_port,
+                    include_build=False,
+                    extra_volumes=["./egress-ca.pem:/etc/mtevil/egress-ca.pem:ro"],
+                )
+                (edge_dir / "compose.yaml").write_text(ed_comp, encoding="utf-8")
+                setup.run(edge_base + ["up", "-d", "--force-recreate", setup.compose_service(edge_base)])
+                setup.wait_healthy(edge_base)
+
+                # Verify check-egress over real WSS + OpenSSL CA validation AND probe-telegram over PROXY v2 + WSS!
+                with mock.patch.object(sys, "stdout", io.StringIO()) as chk_out:
+                    self.assertEqual(setup.run_egress_command(edge_dir, "check"), 0)
+                self.assertIn("wss://egress.example.test:", chk_out.getvalue())
+                self.assertNotIn("e2e-live-secret-99", chk_out.getvalue())
+
+                ok_tg, detail_tg = setup.verify_telegram_e2e(edge_base, attempts=2, delay_s=0.5, dc=2)
+                self.assertTrue(ok_tg, msg=detail_tg)
+            finally:
+                stop_tls.set()
+                try:
+                    tls_sock.close()
+                except OSError:
+                    pass
+                dc.close()
+                setup.run(edge_base + ["down", "-v", "--remove-orphans"], check=False)
+                setup.run(eg_base + ["down", "-v", "--remove-orphans"], check=False)
+
 
 if __name__ == "__main__":
     prog = unittest.main(verbosity=2, exit=False)

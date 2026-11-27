@@ -34,6 +34,7 @@ mod egress_server;
 mod me;
 mod relay;
 mod serve;
+mod ws_egress;
 
 use alerts::*;
 use connect::*;
@@ -42,6 +43,7 @@ use egress_health::*;
 use egress_server::*;
 use relay::*;
 use serve::*;
+use ws_egress::*;
 
 const BUILD_VERSION: &str = match option_env!("MTEVIL_BUILD_VERSION") {
     Some(v) => v,
@@ -53,7 +55,7 @@ const BUILD_VERSION: &str = match option_env!("MTEVIL_BUILD_VERSION") {
 struct Args {
     #[command(subcommand)]
     command: Option<Action>,
-    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms","egress_probe_interval_secs","egress_probe_degraded_interval_secs","egress_hedge_ms","egress_accept_legacy","egress_use_mtv3","egress_allow_from","egress_max_failed_per_ip","dc_media_override","dc_probe_interval_secs","cover_dns_ttl_secs","diagnostics","metrics_listen"])]
+    #[arg(long, conflicts_with_all=["listen","secret_file","users_file","replay_file","sni","cover","dc","egress_upstreams","egress_strategy","egress_token_file","egress_ws_path","egress_ws_pool_size","egress_tls_ca_file","role","enable_dd","proxy_protocol","max_connections","client_hello_timeout_secs","handshake_timeout_secs","idle_timeout_secs","drain_timeout_secs","fake_tls_cert_bytes","fake_tls_cert_jitter","flight_shaping","client_mss","client_mss_bulk","egress_cooldown_base_ms","egress_cooldown_max_ms","egress_probe_interval_secs","egress_probe_degraded_interval_secs","egress_hedge_ms","egress_accept_legacy","egress_use_mtv3","egress_allow_from","egress_max_failed_per_ip","dc_media_override","dc_probe_interval_secs","cover_dns_ttl_secs","diagnostics","metrics_listen"])]
     config: Option<PathBuf>,
     #[arg(long)]
     check_config: bool,
@@ -74,11 +76,20 @@ struct Args {
     #[arg(long)]
     dc: Vec<String>,
     #[arg(long)]
-    egress_upstreams: Vec<SocketAddr>,
+    egress_upstreams: Vec<EgressEndpoint>,
     #[arg(long)]
     egress_strategy: Option<EgressStrategy>,
     #[arg(long)]
     egress_token_file: Option<PathBuf>,
+    /// Secret HTTP path on `egress` for accepting RFC 6455 WebSocket upgrades.
+    #[arg(long)]
+    egress_ws_path: Option<String>,
+    /// Warm pool size of pre-established `ws://`/`wss://` streams per WS upstream on `edge`.
+    #[arg(long)]
+    egress_ws_pool_size: Option<usize>,
+    /// Optional PEM root CA file on `edge` for `wss://` egress certificate verification.
+    #[arg(long)]
+    egress_tls_ca_file: Option<PathBuf>,
     #[arg(long)]
     enable_dd: bool,
     #[arg(long)]
@@ -247,6 +258,11 @@ impl Args {
             egress_upstreams: self.egress_upstreams,
             egress_strategy: self.egress_strategy.unwrap_or(EgressStrategy::RoundRobin),
             egress_token_file: self.egress_token_file,
+            egress_ws_path: self.egress_ws_path,
+            egress_ws_pool_size: self
+                .egress_ws_pool_size
+                .unwrap_or_else(config::default_egress_ws_pool_size),
+            egress_tls_ca_file: self.egress_tls_ca_file,
             max_connections: self.max_connections.unwrap_or(128),
             client_hello_timeout_secs: self.client_hello_timeout_secs.unwrap_or(5),
             handshake_timeout_secs: self.handshake_timeout_secs.unwrap_or(10),
@@ -317,7 +333,8 @@ struct State {
     cover_permits: Semaphore,
     dcs: HashMap<i16, SocketAddr>,
     dc_media_overrides: HashMap<i16, Vec<SocketAddr>>,
-    egress_upstreams: Vec<SocketAddr>,
+    egress_upstreams: Vec<EgressEndpoint>,
+    ws_pool: Option<Arc<WsWarmPool>>,
     egress_strategy: EgressStrategy,
     egress_token: [u8; 16],
     egress_rr: std::sync::atomic::AtomicUsize,
@@ -755,23 +772,29 @@ async fn main() -> Result<()> {
                     "egress_upstreams is empty in config"
                 );
                 let token = config.egress_token()?;
+                let tls_conn = if config.egress_upstreams.iter().any(EgressEndpoint::is_ws) {
+                    Some(build_tls_connector(config.egress_tls_ca_file.as_deref())?)
+                } else {
+                    None
+                };
                 let per_try = Duration::from_secs(config.handshake_timeout_secs.clamp(1, 5));
                 let mut results = Vec::with_capacity(config.egress_upstreams.len());
                 let mut all_ok = true;
-                for addr in &config.egress_upstreams {
+                for endpoint in &config.egress_upstreams {
                     let probe = probe_egress_endpoint_proto(
-                        *addr,
+                        endpoint,
                         dc,
                         &token,
                         per_try,
                         config.egress_use_mtv3,
+                        tls_conn.as_ref(),
                     )
                     .await;
                     if !probe.dc_reachable {
                         all_ok = false;
                     }
                     results.push(json!({
-                        "address": addr.to_string(),
+                        "address": endpoint.redacted_label(),
                         "dc_tested": dc,
                         "tcp_reachable": probe.tcp_reachable,
                         "token_status": probe.token_status,
@@ -904,6 +927,7 @@ async fn main() -> Result<()> {
                 "rlimit_nofile":rlimit_nofile,
                 "authenticated":config.egress_token_file.is_some(),
                 "accept_legacy_mtv2":config.egress_accept_legacy,
+                "ws_enabled":config.egress_ws_path.is_some(),
                 "allow_from_cidrs":allow_from.len(),
                 "test_only":true
             }),
@@ -955,6 +979,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| config::default_egress_nonce_cache_capacity(effective_max)),
             dc_media_overrides: dc_media_overrides.clone(),
             me: egress_me_rt.clone(),
+            ws_path: config.egress_ws_path.clone(),
         };
         let dcs_arc = Arc::new(dcs);
         let dc_monitor = (config.dc_probe_interval_secs > 0).then(|| {
@@ -1064,6 +1089,15 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let ws_pool = if config.egress_upstreams.iter().any(EgressEndpoint::is_ws) {
+        Some(Arc::new(WsWarmPool::new(
+            &config.egress_upstreams,
+            config.egress_ws_pool_size,
+            config.egress_tls_ca_file.as_deref(),
+        )?))
+    } else {
+        None
+    };
     let state = Arc::new(State {
         secrets: std::sync::RwLock::new(Arc::new(secrets)),
         sni: config.sni,
@@ -1075,6 +1109,7 @@ async fn main() -> Result<()> {
         dcs,
         dc_media_overrides,
         egress_upstreams: config.egress_upstreams,
+        ws_pool: ws_pool.clone(),
         egress_strategy: config.egress_strategy,
         egress_token,
         egress_rr: std::sync::atomic::AtomicUsize::new(0),
@@ -1216,6 +1251,11 @@ async fn main() -> Result<()> {
             }
         })
     });
+    let (ws_pool_stop_tx, ws_pool_stop_rx) = tokio::sync::watch::channel(false);
+    let ws_pool_tasks = ws_pool
+        .as_ref()
+        .map(|p| p.spawn_replenishers(state.clone(), ws_pool_stop_rx))
+        .unwrap_or_default();
     let egress_monitor = (!state.egress_upstreams.is_empty()).then(|| {
         let interval = state.egress_probe_interval;
         tokio::spawn(monitor_edge_egress(state.clone(), interval))
@@ -1270,6 +1310,10 @@ async fn main() -> Result<()> {
     }
     let _ = metrics_stop_tx.send(());
     if let Some(task) = metrics_task {
+        let _ = task.await;
+    }
+    let _ = ws_pool_stop_tx.send(true);
+    for task in ws_pool_tasks {
         let _ = task.await;
     }
     if let Some(task) = egress_monitor {

@@ -42,7 +42,15 @@ print_help() {
   mtevilctl adtag show        Показать статус рекламного тега ME (маскированно, без вывода полного значения)
   mtevilctl adtag set         Установить 32-hex ad_tag от @MTProxybot (рекомендуемый скрытый ввод без истории shell; права 0600, без рестарта)
   mtevilctl adtag clear       Удалить рекламный тег (без перезапуска контейнера)
-  mtevilctl setup             Запустить интерактивный мастер перенастройки (--self-steal, --webproxy; псевдоним: reconfigure)
+  mtevilctl egress list       Показать узлы egress, стратегию и задержку хеджирования (на узле edge)
+  mtevilctl egress add <адр>  Проверить и добавить резервный/основной egress (IP:PORT или wss://host/path)
+  mtevilctl egress del <адр>  Удалить узел egress из списка (на узле edge)
+  mtevilctl egress hedge <мс> Задать задержку хеджирования egress_hedge_ms в мс (например, 250; 0 — выкл)
+  mtevilctl egress strategy <ordered|round-robin>
+                              Переключить стратегию выбора egress
+  mtevilctl egress check      Выполнить проверку check-egress всех настроенных узлов выхода
+  mtevilctl tuning            Показать или настроить параметры TCP MSS (--handshake-mss <88..1460|off>, --bulk-mss <88..1460|off>)
+  mtevilctl setup             Запустить интерактивный мастер перенастройки (--self-steal, --webproxy, --shared-443; псевдоним: reconfigure)
   mtevilctl update            Обновить контейнер до свежего стабильного релиза без повторного запуска мастера (с сохранением настроек и секретов)
   mtevilctl update --prerelease
                               Обновить контейнер с учётом предварительных релизов (alpha/beta/rc)
@@ -81,7 +89,7 @@ case "$CMD" in
     print_help
     exit 1
     ;;
-  status|update|rollback|traffic|traf|link|sni|user|adtag|setup|reconfigure)
+  status|update|rollback|traffic|traf|link|sni|user|adtag|egress|tuning|setup|reconfigure)
     shift
     for arg in "$@"; do
       if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then

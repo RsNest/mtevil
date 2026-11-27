@@ -230,7 +230,7 @@ pub(crate) async fn relay_client(
     let framed = tls.is_some();
     let inner_header_us = us();
     let dc = wire::dc_transport_for(transport.kind)?;
-    let (upstream, route) = connect_upstream(state, transport.dc, &dc.header).await?;
+    let (mut upstream, route) = connect_upstream(state, transport.dc, &dc.header).await?;
     let dc_connected_us = us();
     telemetry::event(
         "authenticated",
@@ -256,8 +256,7 @@ pub(crate) async fn relay_client(
         }),
     );
     let client_fd = stream_raw_fd(client);
-    let upstream_fd = stream_raw_fd(&upstream);
-    let (ur, mut uw) = upstream.into_split();
+    let upstream_fd = stream_raw_fd(upstream.tcp_ref());
     let relay = RelayStats {
         counters: Some(state.counters.clone()),
         client_fd,
@@ -268,6 +267,7 @@ pub(crate) async fn relay_client(
     let relay_start_us = us();
     let result = {
         let (cr, cw) = client.split();
+        let (ur, mut uw) = tokio::io::split(&mut upstream);
         relay_until_end_with_drain(
             &relay,
             state.idle,
@@ -319,7 +319,7 @@ pub(crate) async fn relay_client(
             )
         }
         Ok(RelayOutcome::Drained) => {
-            let _ = timeout(Duration::from_millis(150), uw.shutdown()).await;
+            let _ = timeout(Duration::from_millis(150), upstream.shutdown()).await;
             graceful_fin_close(client, state.drain / 2).await;
             Some("server_drain")
         }
@@ -328,7 +328,7 @@ pub(crate) async fn relay_client(
                 .idle_timed_out
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
-                let _ = timeout(Duration::from_millis(150), uw.shutdown()).await;
+                let _ = timeout(Duration::from_millis(150), upstream.shutdown()).await;
                 graceful_fin_close(client, DC_EOF_SHUTDOWN_TIMEOUT).await;
             }
             None
