@@ -3856,13 +3856,15 @@ class SetupValidationTests(unittest.TestCase):
             self.assertTrue((d_sh / "xray.shared443.example.json").is_file())
             self.assertTrue((d_sh / "nginx.stream443.example.conf").is_file())
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux Docker host")
     def test_linux_real_wss_egress_and_shared443_e2e(self):
-        if sys.platform != "linux":
-            self.skipTest("requires Linux Docker host")
-        img = self._local_image_or_skip()
+        img = self._local_image()
+        if img is None:
+            self.skipTest("no local mtevil image available")
         import os
         import shutil
         import ssl
+        import subprocess
         import threading
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -3937,10 +3939,20 @@ class SetupValidationTests(unittest.TestCase):
             )
             ca_crt.chmod(0o644)
 
-            dc = _LocalMockTelegramDc()
-            eg_port = setup.find_free_port("127.0.0.1", 29510) or 29510
-            tls_port = setup.find_free_port("127.0.0.1", 29511) or 29511
-            edge_port = setup.find_free_port("127.0.0.1", 24510) or 24510
+            dc = _MockTelegramDcServer()
+            used_ports: set[int] = set()
+
+            def next_port() -> int:
+                for _ in range(20):
+                    cand = self._free_port()
+                    if cand not in used_ports:
+                        used_ports.add(cand)
+                        return cand
+                self.fail("could not allocate distinct free port")
+
+            eg_port = next_port()
+            tls_port = next_port()
+            edge_port = next_port()
             token_hex = "ab" * 16
             ws_secret_path = "/ws/e2e-live-secret-99"
 
@@ -4014,6 +4026,7 @@ class SetupValidationTests(unittest.TestCase):
                         "n",          # Показать сгенерированный токен MTV2?
                     ]
                 ) + "\n"
+                err_eg = io.StringIO()
                 with (
                     mock.patch.object(
                         sys,
@@ -4036,9 +4049,9 @@ class SetupValidationTests(unittest.TestCase):
                     ),
                     mock.patch.object(sys, "stdin", io.StringIO(stdin_eg)),
                     mock.patch.object(sys, "stdout", io.StringIO()),
-                    mock.patch.object(sys, "stderr", io.StringIO()),
+                    mock.patch.object(sys, "stderr", err_eg),
                 ):
-                    self.assertEqual(setup.main(), 0)
+                    self.assertEqual(setup.main(), 0, msg=err_eg.getvalue())
 
                 self.assertTrue((eg_dir / "Caddyfile.egress.example").is_file())
                 setup.write_volume_secret_stdin(eg_base, "/var/lib/mtevil/egress-token", token_hex)
@@ -4064,6 +4077,7 @@ class SetupValidationTests(unittest.TestCase):
                         token_hex,           # MTV2/MTV3 token
                     ]
                 ) + "\n"
+                err_ed = io.StringIO()
                 with (
                     mock.patch.object(
                         sys,
@@ -4086,9 +4100,9 @@ class SetupValidationTests(unittest.TestCase):
                     mock.patch.object(setup, "check_public_port_reachable", return_value=("ok", "")),
                     mock.patch.object(sys, "stdin", io.StringIO(stdin_ed)),
                     mock.patch.object(sys, "stdout", io.StringIO()),
-                    mock.patch.object(sys, "stderr", io.StringIO()),
+                    mock.patch.object(sys, "stderr", err_ed),
                 ):
-                    self.assertEqual(setup.main(), 0)
+                    self.assertEqual(setup.main(), 0, msg=err_ed.getvalue())
 
                 # Mount CA cert and switch edge strictly to `wss://egress.example.test:...`!
                 ed_cfg = setup.json.loads((edge_dir / "config.json").read_text(encoding="utf-8"))
