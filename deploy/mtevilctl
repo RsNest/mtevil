@@ -49,8 +49,8 @@ print_help() {
   mtevilctl egress strategy <ordered|round-robin>
                               Переключить стратегию выбора egress
   mtevilctl egress check      Выполнить проверку check-egress всех настроенных узлов выхода
-  mtevilctl tuning            Показать или настроить параметры TCP MSS (--handshake-mss <88..1460|off>, --bulk-mss <88..1460|off>)
-  mtevilctl setup             Запустить интерактивный мастер перенастройки (--self-steal, --webproxy, --shared-443; псевдоним: reconfigure)
+  mtevilctl tuning            [experimental] Показать или настроить параметры TCP MSS (--handshake-mss <88..1460|off>, --bulk-mss <88..1460|off>)
+  mtevilctl setup             Запустить интерактивный мастер перенастройки (--self-steal, --webproxy [--managed-caddy|--cdn experimental], --shared-443; псевдоним: reconfigure)
   mtevilctl update            Обновить контейнер до свежего стабильного релиза без повторного запуска мастера (с сохранением настроек и секретов)
   mtevilctl update --prerelease
                               Обновить контейнер с учётом предварительных релизов (alpha/beta/rc)

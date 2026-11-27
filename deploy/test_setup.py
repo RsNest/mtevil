@@ -2659,6 +2659,9 @@ class SetupValidationTests(unittest.TestCase):
         lines = setup.format_handshake_diag_lines(
             "direct",
             {
+                "uptime_ms": 3_600_000,
+                "completed_sessions": 85,
+                "failed_sessions": 15,
                 "client_hello_incomplete_timeout": 12,
                 "client_hello_incomplete_close": 2,
                 "inner_header_incomplete": 3,
@@ -2673,7 +2676,27 @@ class SetupValidationTests(unittest.TestCase):
             lines,
             [
                 "  Сбои handshake:    таймаут ClientHello=12, закрытие сокета=2, после ServerHello=3",
+                "  Доля обрывов:      client_hello_incomplete=14/100 (14.0%), inner_header_incomplete=3/100 (3.0%) [за 1 ч 0 мин 0 с, сессий=100]",
+                "  Подсказка:         зафиксированы обрывы handshake/TLS — смотрите ADR-005 (разделы про порт :443, размер ClientHello и WebProxy).",
                 "  Последний обрыв:   ClientHello: получено 1448 из 1549 байт (таймаут)",
+            ],
+        )
+        clean_lines = setup.format_handshake_diag_lines(
+            "edge",
+            {
+                "uptime_ms": 120_000,
+                "completed_sessions": 10,
+                "failed_sessions": 0,
+                "client_hello_incomplete_timeout": 0,
+                "client_hello_incomplete_close": 0,
+                "inner_header_incomplete": 0,
+            },
+        )
+        self.assertEqual(
+            clean_lines,
+            [
+                "  Сбои handshake:    таймаут ClientHello=0, закрытие сокета=0, после ServerHello=0",
+                "  Доля обрывов:      client_hello_incomplete=0/10 (0.0%), inner_header_incomplete=0/10 (0.0%) [за 2 мин 0 с, сессий=10]",
             ],
         )
         self.assertEqual(setup.format_handshake_diag_lines("egress", {"client_hello_incomplete_timeout": 1}), [])
@@ -3697,8 +3720,11 @@ class SetupValidationTests(unittest.TestCase):
         # 3. Reverse proxy & shared-443 & managed-caddy snippets
         eg_c, eg_n = setup.render_egress_ws_reverse_proxy_snippets("egress.example.com", "/ws/9f3c", "127.0.0.1:29443")
         self.assertIn("@mtevil_egress path /ws/9f3c", eg_c)
+        self.assertIn("log_skip @mtevil_egress", eg_c)
         self.assertIn("location = /ws/9f3c", eg_n)
         self.assertIn("access_log off;", eg_n)
+        loc_block = eg_n.split("location = /ws/9f3c", 1)[1].split("}", 1)[0]
+        self.assertIn("access_log off;", loc_block)
 
         xr_s, ng_s = setup.render_shared_443_snippets("media.example.com", "127.0.0.1:24443")
         self.assertIn('"xver": 2', xr_s)
@@ -4141,6 +4167,50 @@ class SetupValidationTests(unittest.TestCase):
                 dc.close()
                 setup.run(edge_base + ["down", "-v", "--remove-orphans"], check=False)
                 setup.run(eg_base + ["down", "-v", "--remove-orphans"], check=False)
+
+    def test_v041_hardening_experimental_labels_and_h2_log_warning(self):
+        import contextlib
+
+        mtevilctl_text = (Path(__file__).resolve().parent / "mtevilctl").read_text(encoding="utf-8")
+        self.assertIn("[experimental]", mtevilctl_text)
+        self.assertIn("--managed-caddy|--cdn experimental", mtevilctl_text)
+
+        # CLI --help includes [experimental] markers for --managed-caddy and --cdn.
+        help_buf = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["setup.py", "--help"]),
+            contextlib.redirect_stdout(help_buf),
+            self.assertRaises(SystemExit),
+        ):
+            setup.main()
+        help_txt = help_buf.getvalue()
+        self.assertIn("--managed-caddy", help_txt)
+        self.assertIn("--cdn", help_txt)
+        self.assertIn("[experimental]", help_txt)
+
+        # tuning output marks [experimental]
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "compose.yaml").write_text("services:\n  mtevil:\n    image: x\n", encoding="utf-8")
+            (d / ".env").write_text("MTEVIL_ROLE=direct\n", encoding="utf-8")
+            (d / "config.json").write_text(
+                '{"role":"direct","listen":"0.0.0.0:443","sni":"example.com","cover":"example.com:443"}\n',
+                encoding="utf-8",
+            )
+            tun_out = io.StringIO()
+            with (
+                mock.patch.object(setup, "check_prerequisites"),
+                contextlib.redirect_stdout(tun_out),
+            ):
+                rc = setup.run_tuning_command(d)
+            self.assertEqual(rc, 0)
+            self.assertIn("[experimental]", tun_out.getvalue())
+
+        # H2: nginx location has explicit access_log off; Caddy has log_skip @mtevil_egress.
+        eg_c, eg_n = setup.render_egress_ws_reverse_proxy_snippets("egress.example.com", "/ws/secret-token", "127.0.0.1:29443")
+        self.assertIn("log_skip @mtevil_egress", eg_c)
+        loc_block = eg_n.split("location = /ws/secret-token", 1)[1].split("}", 1)[0]
+        self.assertIn("access_log off;", loc_block)
 
 
 if __name__ == "__main__":

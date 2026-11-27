@@ -335,7 +335,7 @@ mtevilctl setup --webproxy
   - Домен и IP привязаны к вам и могут блокироваться без коллатерального ущерба для сторонних сервисов.
   - Поддержка `tg://webproxy` зависит от версии клиента Telegram на платформе пользователя (в первую очередь Telegram Desktop и свежие сборки Android; для клиентов без поддержки `webproxy` можно либо оставить классический `mtevil` вход на отдельном порту, выбрав `0.0.0.0` при настройке бэкенда, либо использовать отдельный узел с `tg://proxy`).
 - **Откат:** при любой ошибке проверки (`-check`, `healthy`, `/readyz`, `probe-telegram`) мастер автоматически откатывает `compose.yaml`, `.env`, `config.json`, удаляет или восстанавливает `tproxy.json` и файлы в томе `state`. Для возврата к прежнему релизу используйте `mtevilctl rollback`.
-- **Автономный `Caddy` и режим за CDN:** если порт `443` свободен и на хосте нет веб-сервера, флаг `mtevilctl setup --webproxy --managed-caddy` поднимет встроенный контейнер `caddy` с автоматическим выпуском сертификата Let's Encrypt. Для одиночного зарубежного узла за Cloudflare используйте `mtevilctl setup --webproxy --cdn` (режим SSL `Full (Strict)` и включённые `WebSockets`).
+- **Автономный `Caddy` и режим за CDN (`experimental`):** если порт `443` свободен и на хосте нет веб-сервера, экспериментальный флаг `mtevilctl setup --webproxy --managed-caddy` поднимет встроенный контейнер `caddy` с автоматическим выпуском сертификата Let's Encrypt. Для одиночного зарубежного узла за Cloudflare доступен экспериментальный профиль `mtevilctl setup --webproxy --cdn` (режим SSL `Full (Strict)` и включённые `WebSockets`). Оба флага помечены как `experimental`, так как автоматический ACME и реальная работа через POP CDN не проверяются в офлайн-CI.
 
 ---
 
@@ -347,6 +347,11 @@ mtevilctl setup --webproxy
    mtevilctl setup --egress-ws --egress-domain egress.example.com
    ```
    Мастер привяжет `mtevil` к `127.0.0.1:29443`, сгенерирует секретный путь `/ws/<hex>`, сохранит шаблоны `Caddyfile.egress.example` и `nginx.egress.example` и выведет готовую команду для `edge`.
+
+   > **Важно (безопасность логов, H2):** `egress_ws_path` выступает секретным HTTP-токеном доступа на уровне reverse proxy. Обязательно отключите запись `access_log` для секретного маршрута или маскируйте путь в журналах:
+   > - в **nginx**: добавьте `access_log off;` непосредственно внутри `location = /ws/<секрет> { ... }` (либо маскируйте `$request_uri` через `map $request_uri`);
+   > - в **Caddy**: по умолчанию access-логи отключены, но если у вас глобально или в блоке сайта включена директива `log`, добавьте `log_skip @mtevil_egress` перед обработчиком `handle @mtevil_egress`.
+
 2. На входном сервере `edge` укажите `wss://egress.example.com/ws/<hex>` при настройке или добавьте резервный выход на лету:
    ```bash
    mtevilctl egress add "wss://egress.example.com/ws/<hex>"
@@ -360,12 +365,12 @@ mtevilctl setup --webproxy
 ```bash
 mtevilctl setup --shared-443
 ```
-Мастер настроит `mtevil` на `127.0.0.1:24443` с `proxy_protocol: true`, зафиксирует порт `:443` во всех клиентских ссылках (`MTEVIL_PUBLIC_PORT=443`) и создаст готовые примеры маршрутизации по SNI в `nginx.stream443.example.conf` (`ssl_preread on; proxy_protocol on;`) и `xray.shared443.example.json` (`fallbacks` с `"xver": 2`).
+Мастер настроит `mtevil` на `127.0.0.1:24443` с `proxy_protocol: true`, зафиксирует порт `:443` во всех клиентских ссылках (`MTEVIL_PUBLIC_PORT=443`) и создаст готовые примеры маршрутизации по SNI в `nginx.stream443.example.conf` (`ssl_preread on; proxy_protocol on;`) и `xray.shared443.example.json` (`fallbacks` с `"xver": 2`). Для защиты от подмены заголовка PROXY v2 `mtevil` принимает `proxy_protocol: true` только на loopback-адресе или с явно заданных доверенных CIDR в `proxy_protocol_allow_from`.
 
-### 3. Профиль TCP MSS (`mtevilctl tuning`)
-Для тактической нарезки `ClientHello` у старых клиентов `tg://proxy` доступно управление `client_mss` и `client_mss_bulk`:
+### 3. Профиль TCP MSS (`mtevilctl tuning`, `[experimental]`)
+Для тактической нарезки `ClientHello` у старых клиентов `tg://proxy` доступно экспериментальное управление `client_mss` и `client_mss_bulk`:
 ```bash
 mtevilctl tuning --handshake-mss 280 --bulk-mss 1400
 mtevilctl tuning --handshake-mss off --bulk-mss off
 ```
-> По стандарту TCP (RFC 9293) `client_mss_bulk` восстанавливает размер сегмента только на скачивание (`сервер → клиент`); отдача от клиента (`upload`) остаётся ограниченной `client_mss` до конца TCP-сессии.
+> По стандарту TCP (RFC 9293) `client_mss_bulk` восстанавливает размер сегмента только на скачивание (`сервер → клиент`); отдача от клиента (`upload`) остаётся ограниченной `client_mss` до конца TCP-сессии. Режим помечен как **`experimental`** до завершения полевой матрицы измерений H4.

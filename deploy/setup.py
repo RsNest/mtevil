@@ -1027,8 +1027,13 @@ def render_egress_ws_reverse_proxy_snippets(
     path = validate_egress_ws_path(ws_path)
     listen_ep = validate_loopback_endpoint(egress_listen)
     caddy = f"""# Caddyfile на узле egress (принимает WSS от RU edge на :443 без внешнего SSH/VPN)
+# ВНИМАНИЕ (H2): egress_ws_path работает как секретный HTTP-токен доступа.
+# По умолчанию Caddy не пишет access log; если вы включаете директиву `log`,
+# обязательно исключите маршрут `@mtevil_egress` через `log_skip @mtevil_egress`
+# (или маскируйте путь), чтобы секрет не попадал в журналы.
 {host} {{
     @mtevil_egress path {path}
+    log_skip @mtevil_egress
     handle @mtevil_egress {{
         reverse_proxy {listen_ep}
     }}
@@ -1037,11 +1042,19 @@ def render_egress_ws_reverse_proxy_snippets(
     }}
 }}
 """
-    nginx = f"""# nginx на узле egress (принимает WSS от RU edge на :443; access_log отключён!)
+    nginx = f"""# nginx на узле egress (принимает WSS от RU edge на :443)
+# ВНИМАНИЕ (H2): egress_ws_path работает как секретный HTTP-токен доступа.
+# Для секретного location обязательно отключите `access_log off;` (или маскируйте $request_uri).
 map $http_upgrade $connection_upgrade {{
     default upgrade;
     ''      close;
 }}
+
+# Опциональное маскирование пути, если в вашей конфигурации требуется общий access_log на уровне server/http:
+# map $request_uri $mtevil_masked_uri {{
+#     ~^{path}(\\?.*)?$  "/ws/***";
+#     default             $request_uri;
+# }}
 
 server {{
     listen 443 ssl;
@@ -1051,9 +1064,9 @@ server {{
 
     ssl_certificate     /etc/letsencrypt/live/{host}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/{host}/privkey.pem;
-    access_log off;
 
     location = {path} {{
+        access_log off;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -4162,11 +4175,37 @@ def format_handshake_diag_lines(
     ch_to = int(rstats.get("client_hello_incomplete_timeout") or 0)
     ch_cl = int(rstats.get("client_hello_incomplete_close") or 0)
     ih_inc = int(rstats.get("inner_header_incomplete") or 0)
+    ch_inc = ch_to + ch_cl
+    total_sessions = int(rstats.get("completed_sessions") or 0) + int(
+        rstats.get("failed_sessions") or 0
+    )
+    uptime_ms_raw = rstats.get("uptime_ms")
+    period_str = (
+        format_duration_ru(float(uptime_ms_raw) / 1000.0)
+        if isinstance(uptime_ms_raw, (int, float)) and uptime_ms_raw >= 0
+        else None
+    )
     lines = [
         f"  Сбои handshake:    таймаут ClientHello={ch_to}, закрытие сокета={ch_cl}, после ServerHello={ih_inc}"
     ]
+    if total_sessions > 0:
+        ch_pct = (ch_inc * 100.0) / total_sessions
+        ih_pct = (ih_inc * 100.0) / total_sessions
+        period_lbl = f"за {period_str}, сессий={total_sessions}" if period_str else f"сессий={total_sessions}"
+        lines.append(
+            f"  Доля обрывов:      client_hello_incomplete={ch_inc}/{total_sessions} ({ch_pct:.1f}%), "
+            f"inner_header_incomplete={ih_inc}/{total_sessions} ({ih_pct:.1f}%) [{period_lbl}]"
+        )
+    elif period_str is not None:
+        lines.append(
+            f"  Доля обрывов:      client_hello_incomplete={ch_inc} (0.0%), inner_header_incomplete={ih_inc} (0.0%) [за {period_str}, сессий=0]"
+        )
+    if (ch_inc + ih_inc) > 0:
+        lines.append(
+            "  Подсказка:         зафиксированы обрывы handshake/TLS — смотрите ADR-005 (разделы про порт :443, размер ClientHello и WebProxy)."
+        )
     sample = rstats.get("last_client_hello_incomplete")
-    if (ch_to + ch_cl) > 0 and isinstance(sample, dict):
+    if ch_inc > 0 and isinstance(sample, dict):
         rx = int(sample.get("received_bytes") or 0)
         exp = int(sample.get("expected_bytes") or 0)
         reason_lbl = "таймаут" if sample.get("timeout") else "закрытие сокета"
@@ -4771,7 +4810,13 @@ def run_tuning_command(
     if not hs_changed and not bk_changed:
         c_mss = saved_cfg.get("client_mss")
         b_mss = saved_cfg.get("client_mss_bulk")
-        print(heading("Параметры TCP-фрагментации (tuning)"))
+        print(heading("Параметры TCP-фрагментации [experimental] (tuning)"))
+        print(
+            warn_text(
+                "Статус [experimental]: профиль TCP MSS не подтверждён полевой матрицей H4; "
+                "малый client_mss снижает размер сегментов отдачи клиента (upload) на всё время TCP-сессии."
+            )
+        )
         print(f"  client_mss (SYN-ACK):      {c_mss if c_mss is not None else 'выкл (системный MSS)'}")
         print(f"  client_mss_bulk (отдача):  {b_mss if b_mss is not None else 'выкл (системный MSS)'}")
         print("  Пример включения: mtevilctl tuning --handshake-mss 280 --bulk-mss 1400")
@@ -4869,12 +4914,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--managed-caddy",
         action="store_true",
-        help="Include an automated Caddy TLS sidecar container in compose.yaml (for --webproxy when port 443 is free)",
+        help="[experimental] Include an automated Caddy TLS sidecar container in compose.yaml (for --webproxy when port 443 is free)",
     )
     parser.add_argument(
         "--cdn",
         action="store_true",
-        help="Generate Cloudflare/CDN reverse-proxy snippets and headers in --webproxy mode",
+        help="[experimental] Generate Cloudflare/CDN reverse-proxy snippets and headers in --webproxy mode",
     )
     parser.add_argument(
         "--egress-ws",
@@ -5353,13 +5398,26 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdin.isatty()
             and not args.cdn
             and ask_yes_no(
-                "Поднять встроенный контейнер Caddy (автоматический TLS Let's Encrypt на порту 443)?",
+                "[experimental] Поднять встроенный контейнер Caddy (автоматический TLS Let's Encrypt на порту 443)?",
                 default=bool(saved.get("managed_caddy", False)),
             )
         ):
+            print(
+                warn_text(
+                    "Примечание [experimental]: --managed-caddy пока помечен как экспериментальный режим "
+                    "(автоматический ACME не покрыт живыми E2E-тестами в CI)."
+                )
+            )
             managed_caddy_enabled = True
             managed_caddy_cand = {"caddyfile_name": "Caddyfile.candidate"}
             managed_caddy_live = {"caddyfile_name": "Caddyfile"}
+        if args.cdn:
+            print(
+                warn_text(
+                    "Примечание [experimental]: профиль --cdn помечен как экспериментальный "
+                    "(требует ручной проверки Cloudflare SSL Full (Strict), WebSockets и полевой матрицы)."
+                )
+            )
 
     if mode == "self-steal":
         role = args.role if args.role in ("direct", "edge") else (existing_role if existing_role in ("direct", "edge") else "direct")
@@ -5635,6 +5693,13 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     egress_ws_path_val = f"/ws/{secrets.token_hex(12)}"
                 config_data["egress_ws_path"] = egress_ws_path_val
+                print(
+                    warn_text(
+                        "Предупреждение безопасности (H2): секретный путь egress_ws_path является HTTP-аутентификатором. "
+                        "В конфигурации nginx/Caddy обязательно отключите access_log для этого location "
+                        "(`access_log off;` в nginx / `log_skip @mtevil_egress` в Caddy) или маскируйте URL в логах."
+                    )
+                )
                 if args.egress_domain:
                     egress_ws_domain = validate_sni(args.egress_domain).lower()
                 elif sys.stdin.isatty():
@@ -6592,6 +6657,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  Добавить на edge одной командой: mtevilctl egress add \"wss://{eg_dom_disp}{egress_ws_path_val}\"")
             print(f"  Шаблон Caddy:      {deploy_dir / 'Caddyfile.egress.example'}")
             print(f"  Шаблон nginx:      {deploy_dir / 'nginx.egress.example'}")
+            print(
+                warn_text(
+                    "  Важно (H2): не логируйте секретный путь egress_ws_path в access_log nginx/Caddy "
+                    "(используйте `access_log off;` внутри `location = ...` / `log_skip @mtevil_egress` или маскирование пути)."
+                )
+            )
         else:
             print(f"  Адрес выхода: {bind_ip}:{pub_port}")
         print("  Режим в мастере на edge: 2 (Расширенная настройка) -> 2 (edge)")
