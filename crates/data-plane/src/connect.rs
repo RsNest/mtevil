@@ -349,6 +349,7 @@ pub(crate) fn default_media_override_map() -> HashMap<i16, Vec<SocketAddr>> {
         cover: String::new(),
         enable_dd: false,
         proxy_protocol: false,
+        proxy_protocol_allow_from: Vec::new(),
         dc: Vec::new(),
         egress_upstreams: Vec::new(),
         egress_strategy: EgressStrategy::RoundRobin,

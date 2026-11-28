@@ -67,3 +67,17 @@ path = "fuzz_targets/fuzz_mtv4_preface_and_frame.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_ws_http_upgrade"
+path = "fuzz_targets/fuzz_ws_http_upgrade.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ws_frame"
+path = "fuzz_targets/fuzz_ws_frame.rs"
+test = false
+doc = false
+bench = false

@@ -87,6 +87,16 @@ impl IpCidr {
     }
 }
 
+pub fn is_canonical_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_loopback(),
+            None => v6.is_loopback(),
+        },
+    }
+}
+
 pub fn is_loopback_or_private_ip(ip: IpAddr) -> bool {
     let canonical = match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -148,6 +158,8 @@ pub struct Config {
     pub enable_dd: bool,
     #[serde(default)]
     pub proxy_protocol: bool,
+    #[serde(default)]
+    pub proxy_protocol_allow_from: Vec<String>,
     #[serde(default)]
     pub dc: Vec<String>,
     #[serde(default)]
@@ -545,6 +557,17 @@ impl Config {
             ensure!(addr.port() > 0, "metrics_listen port must not be zero");
         }
         self.parsed_egress_allow_from()?;
+        let pp_allow_from = self.parsed_proxy_protocol_allow_from()?;
+        if self.proxy_protocol {
+            ensure!(
+                self.role != Role::Egress,
+                "proxy_protocol is not supported on role='egress'"
+            );
+            ensure!(
+                is_canonical_loopback(self.listen.ip()) || !pp_allow_from.is_empty(),
+                "proxy_protocol=true requires a loopback listen address (e.g. 127.0.0.1:PORT) or explicit trusted CIDRs in proxy_protocol_allow_from"
+            );
+        }
         self.dc_media_overrides()?;
         mtevil_proto::ServerFlightProfile {
             cert_bytes: self.fake_tls_cert_bytes,
@@ -730,6 +753,14 @@ impl Config {
     pub fn parsed_egress_allow_from(&self) -> Result<Vec<IpCidr>> {
         let mut cidrs = Vec::with_capacity(self.egress_allow_from.len());
         for raw in &self.egress_allow_from {
+            cidrs.push(IpCidr::parse(raw)?);
+        }
+        Ok(cidrs)
+    }
+
+    pub fn parsed_proxy_protocol_allow_from(&self) -> Result<Vec<IpCidr>> {
+        let mut cidrs = Vec::with_capacity(self.proxy_protocol_allow_from.len());
+        for raw in &self.proxy_protocol_allow_from {
             cidrs.push(IpCidr::parse(raw)?);
         }
         Ok(cidrs)
@@ -959,6 +990,38 @@ mod tests {
         let egress: Config = serde_json::from_str(
             r#"{"role":"egress","listen":"10.203.0.9:29443","dc":["2=149.154.167.51:443"]}"#,
         )?;
+        egress.validate()?;
+
+        // H1: proxy_protocol validation requires loopback listen or explicit allow_from CIDRs
+        let mut pp_loopback = config()?;
+        pp_loopback.proxy_protocol = true;
+        pp_loopback.listen = "127.0.0.1:24443".parse()?;
+        pp_loopback.validate()?;
+
+        let mut pp_v4_mapped_loopback = config()?;
+        pp_v4_mapped_loopback.proxy_protocol = true;
+        pp_v4_mapped_loopback.listen = "[::ffff:127.0.0.1]:24443".parse()?;
+        pp_v4_mapped_loopback.validate()?;
+
+        let mut pp_public_no_allow = config()?;
+        pp_public_no_allow.proxy_protocol = true;
+        pp_public_no_allow.listen = "0.0.0.0:24443".parse()?;
+        assert!(pp_public_no_allow.validate().is_err());
+
+        let mut pp_public_with_cidr = config()?;
+        pp_public_with_cidr.proxy_protocol = true;
+        pp_public_with_cidr.listen = "0.0.0.0:24443".parse()?;
+        pp_public_with_cidr.proxy_protocol_allow_from = vec!["127.0.0.1/32".into()];
+        pp_public_with_cidr.validate()?;
+
+        let mut pp_bad_cidr = config()?;
+        pp_bad_cidr.proxy_protocol_allow_from = vec!["10.0.0.0/99".into()];
+        assert!(pp_bad_cidr.validate().is_err());
+
+        let pp_egress: Config = serde_json::from_str(
+            r#"{"role":"egress","listen":"127.0.0.1:29443","proxy_protocol":true,"dc":["2=149.154.167.51:443"]}"#,
+        )?;
+        assert!(pp_egress.validate().is_err());
         egress.validate()?;
         Ok(())
     }

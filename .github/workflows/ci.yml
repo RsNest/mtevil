@@ -29,6 +29,9 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Check repository hygiene (no real IPs/domains/ASNs)
+        run: python3 scripts/check_repo_hygiene.py
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -78,7 +81,7 @@ jobs:
           if ! command -v cargo-fuzz >/dev/null 2>&1; then
             cargo install cargo-fuzz --locked
           fi
-          for target in fuzz_client_hello fuzz_proxy_v2 fuzz_obfuscated2_init fuzz_egress_preface fuzz_me_rpc_frame fuzz_me_proxy_conf fuzz_client_transport_frame fuzz_mtv4_preface_and_frame; do
+          for target in fuzz_client_hello fuzz_proxy_v2 fuzz_obfuscated2_init fuzz_egress_preface fuzz_me_rpc_frame fuzz_me_proxy_conf fuzz_client_transport_frame fuzz_mtv4_preface_and_frame fuzz_ws_http_upgrade fuzz_ws_frame; do
             echo "=== Fuzzing ${target} (60s) ==="
             cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "${target}" -- -max_total_time=60
           done
@@ -89,6 +92,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

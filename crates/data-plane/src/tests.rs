@@ -66,6 +66,7 @@ pub(crate) fn state(cover: SocketAddr, dc: SocketAddr) -> Arc<State> {
         )),
         enable_dd: false,
         proxy_protocol: false,
+        proxy_protocol_allow_from: Vec::new(),
         cover_permits: Semaphore::new(8),
         dcs: HashMap::from([(2, dc)]),
         dc_media_overrides: default_media_override_map(),
@@ -899,6 +900,108 @@ async fn proxy_v2_empty_eof_is_clean_for_healthchecks() -> Result<()> {
 }
 
 #[tokio::test]
+async fn proxy_v2_untrusted_peer_rejected_before_reading_header_or_cover() -> Result<()> {
+    let mut cover = cover_mock().await?;
+    let dc = TcpListener::bind("127.0.0.1:0").await?;
+    let mut config = state(cover.addr, dc.local_addr()?);
+    Arc::get_mut(&mut config)
+        .context("unique state")?
+        .proxy_protocol = true;
+
+    // Case A: Non-loopback untrusted peer simulated directly via connection_with_peer_and_drain.
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (cl_fut, srv_fut) = (TcpStream::connect(addr), listener.accept());
+    let (cl_res, srv_res) = tokio::join!(cl_fut, srv_fut);
+    let mut client = cl_res?;
+    let (srv_stream, _) = srv_res?;
+    let cfg_clone = config.clone();
+    let task = tokio::spawn(async move {
+        serve::connection_with_peer_and_drain(
+            srv_stream,
+            Some("203.0.113.50:41234".parse()?),
+            cfg_clone,
+            serve::inactive_drain_rx(),
+        )
+        .await
+    });
+    let mut pp = vec![
+        0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a, 0x21, 0x11, 0x00,
+        0x0c,
+    ];
+    pp.extend_from_slice(&[203, 0, 113, 10, 198, 51, 100, 2, 0x9c, 0x40, 0x01, 0xbb]);
+    let _ = client.write_all(&pp).await;
+    let _ = client.write_all(&hello()?).await;
+    assert!(timeout(Duration::from_secs(1), task).await??.is_err());
+    assert!(cover.received.try_recv().is_err());
+
+    // Case B: Explicit CIDR allowlist rejects non-loopback peers outside 10.203.0.0/24 (e.g. 10.204.0.99),
+    // while keeping container loopback self-probes (127.0.0.1) working.
+    let mut config_cidr = state(cover.addr, dc.local_addr()?);
+    {
+        let st_mut = Arc::get_mut(&mut config_cidr).context("unique state")?;
+        st_mut.proxy_protocol = true;
+        st_mut.proxy_protocol_allow_from = vec![config::IpCidr::parse("10.203.0.0/24")?];
+    }
+    let (cl2_res, srv2_res) = tokio::join!(TcpStream::connect(addr), listener.accept());
+    let mut client2 = cl2_res?;
+    let (srv2_stream, _) = srv2_res?;
+    let cfg_cidr_clone = config_cidr.clone();
+    let task2 = tokio::spawn(async move {
+        serve::connection_with_peer_and_drain(
+            srv2_stream,
+            Some("10.204.0.99:41234".parse()?),
+            cfg_cidr_clone,
+            serve::inactive_drain_rx(),
+        )
+        .await
+    });
+    let _ = client2.write_all(&pp).await;
+    assert!(timeout(Duration::from_secs(1), task2).await??.is_err());
+    assert!(cover.received.try_recv().is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxy_v2_explicit_allow_from_cidr_accepts_trusted_proxy_peer() -> Result<()> {
+    let cover = cover_mock().await?;
+    let dc = TcpListener::bind("127.0.0.1:0").await?;
+    let mut config = state(cover.addr, dc.local_addr()?);
+    {
+        let st_mut = Arc::get_mut(&mut config).context("unique state")?;
+        st_mut.proxy_protocol = true;
+        st_mut.proxy_protocol_allow_from = vec![config::IpCidr::parse("127.0.0.0/8")?];
+    }
+    let dc_task = tokio::spawn(async move {
+        let (mut peer, _) = dc.accept().await?;
+        let mut hdr = [0u8; 64];
+        peer.read_exact(&mut hdr).await?;
+        peer.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    });
+    let (mut client, task) = proxy(config).await?;
+    let mut pp = vec![
+        0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a, 0x21, 0x11, 0x00,
+        0x0c,
+    ];
+    pp.extend_from_slice(&[203, 0, 113, 10, 198, 51, 100, 2, 0x9c, 0x40, 0x01, 0xbb]);
+    client.write_all(&pp).await?;
+    let raw = hello()?;
+    client.write_all(&raw).await?;
+    flight(&mut client, &raw).await?;
+    client
+        .write_all(&wire::record(0x17, &fixture("init")?)?)
+        .await?;
+    assert_eq!(
+        timeout(Duration::from_secs(1), client.read(&mut [0u8])).await??,
+        0
+    );
+    timeout(Duration::from_secs(5), task).await???;
+    timeout(Duration::from_secs(1), dc_task).await???;
+    Ok(())
+}
+
+#[tokio::test]
 async fn bind_listener_accepts_optional_mss() -> Result<()> {
     let listener = bind_listener("127.0.0.1:0".parse()?, Some(92))?;
     assert!(listener.local_addr()?.port() > 0);
@@ -1251,6 +1354,7 @@ async fn users_hot_reload_add_and_delete_during_active_download() -> Result<()> 
         cover: cover.addr.to_string(),
         enable_dd: true,
         proxy_protocol: false,
+        proxy_protocol_allow_from: Vec::new(),
         dc: vec![format!("2={dc_addr}")],
         egress_upstreams: Vec::new(),
         egress_strategy: EgressStrategy::RoundRobin,
@@ -1697,6 +1801,7 @@ async fn probe_telegram_e2e_verifies_handshake_and_res_pq_reply() -> Result<()> 
         cover: cover.addr.to_string(),
         enable_dd: false,
         proxy_protocol: false,
+        proxy_protocol_allow_from: Vec::new(),
         dc: vec![format!("2={dc_addr}")],
         egress_upstreams: Vec::new(),
         egress_strategy: EgressStrategy::RoundRobin,
@@ -2112,6 +2217,7 @@ async fn allowed_sni_file_accepts_previous_and_current_sni_without_breaking_link
         cover: cover.addr.to_string(),
         enable_dd: false,
         proxy_protocol: false,
+        proxy_protocol_allow_from: Vec::new(),
         dc: vec![format!("2={dc_addr}")],
         egress_upstreams: Vec::new(),
         egress_strategy: EgressStrategy::RoundRobin,

@@ -327,11 +327,11 @@ pub(crate) async fn serve(
             accepted = listener.accept_conn() => accepted,
             _ = &mut shutdown => break,
         };
-        let socket = match accept_state
+        let (socket, peer_addr) = match accept_state
             .handle_result(accepted, &state.counters, &mut shutdown)
             .await?
         {
-            AcceptDecision::Accepted((socket, _)) => socket,
+            AcceptDecision::Accepted((socket, peer_addr)) => (socket, peer_addr),
             AcceptDecision::Retry => continue,
             AcceptDecision::Shutdown => break,
         };
@@ -340,7 +340,8 @@ pub(crate) async fn serve(
         tasks.spawn(async move {
             let _permit = permit;
             // Deliberately do not log client addresses, secrets or payload bytes.
-            let _ = connection_with_drain(socket, state, conn_drain).await;
+            let _ =
+                connection_with_peer_and_drain(socket, Some(peer_addr), state, conn_drain).await;
         });
     }
     // Stop admission immediately and notify active sessions to close with FIN.
@@ -445,16 +446,18 @@ pub(crate) fn hello_record_count(raw: &[u8]) -> usize {
 
 #[cfg(test)]
 pub(crate) async fn connection(client: TcpStream, state: Arc<State>) -> Result<()> {
-    connection_with_drain(client, state, inactive_drain_rx()).await
+    let peer_addr = client.peer_addr().ok();
+    connection_with_peer_and_drain(client, peer_addr, state, inactive_drain_rx()).await
 }
 
-pub(crate) async fn connection_with_drain(
+pub(crate) async fn connection_with_peer_and_drain(
     mut client: TcpStream,
+    peer_addr: Option<SocketAddr>,
     state: Arc<State>,
     drain_rx: DrainRx,
 ) -> Result<()> {
     let mut session = telemetry::Session::new(&state.counters);
-    let result = connection_inner(&mut client, &state, session.id, drain_rx).await;
+    let result = connection_inner(&mut client, peer_addr, &state, session.id, drain_rx).await;
     session.finish(&result);
     result
 }
@@ -530,6 +533,7 @@ pub(crate) async fn read_proxy_v2<R: AsyncRead + Unpin>(
 
 pub(crate) async fn connection_inner(
     client: &mut TcpStream,
+    peer_addr: Option<SocketAddr>,
     state: &State,
     session_id: u64,
     mut drain_rx: DrainRx,
@@ -539,6 +543,13 @@ pub(crate) async fn connection_inner(
     let us = || t0.elapsed().as_micros() as u64;
     let mut proxy_v2_client_addr: Option<SocketAddr> = None;
     if state.proxy_protocol {
+        let peer_ip = peer_addr
+            .or_else(|| client.peer_addr().ok())
+            .map(|sa| sa.ip());
+        if !peer_ip.is_some_and(|ip| state.is_trusted_proxy_peer(ip)) {
+            telemetry::event("proxy_protocol_untrusted_peer", session_id, json!({}));
+            bail!("proxy_protocol peer is not trusted");
+        }
         let proxy_v2 = tokio::select! {
             biased;
             () = wait_for_drain(&mut drain_rx) => {

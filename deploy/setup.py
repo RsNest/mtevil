@@ -59,6 +59,39 @@ def version_supports_me_config(version: str | None) -> bool:
     return (parsed[0], parsed[1]) >= (0, 3)
 
 
+def version_supports_proxy_protocol_allow_from(version: str | None) -> bool:
+    if not version:
+        return True
+    parsed = parse_semver_tag(version)
+    if parsed is None:
+        return True
+    return parsed[:3] >= (0, 4, 1)
+
+
+def strip_proxy_protocol_allow_from_for_legacy_version(
+    cfg_file: Path, target_version: str | None
+) -> tuple[bool, Path | None]:
+    """Strip `proxy_protocol_allow_from` from `config.json` when rolling back or downgrading to `< v0.4.1`,
+    saving a 0600 backup `config.json.pre-pp-downgrade` before modifying `config.json`."""
+    if version_supports_proxy_protocol_allow_from(target_version) or not cfg_file.is_file():
+        return False, None
+    raw = cfg_file.read_text(encoding="utf-8")
+    data = json.loads(raw)
+    if not isinstance(data, dict) or "proxy_protocol_allow_from" not in data:
+        return False, None
+    backup_path = cfg_file.with_name(f"{cfg_file.name}.pre-pp-downgrade")
+    backup_path.write_text(raw, encoding="utf-8")
+    try:
+        os.chmod(backup_path, 0o600)
+    except OSError:
+        pass
+    data.pop("proxy_protocol_allow_from", None)
+    tmp = cfg_file.with_name(f".{cfg_file.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, cfg_file)
+    return True, backup_path
+
+
 def strip_me_block_for_legacy_version(
     cfg_file: Path, target_version: str | None
 ) -> tuple[bool, Path | None]:
@@ -1027,8 +1060,13 @@ def render_egress_ws_reverse_proxy_snippets(
     path = validate_egress_ws_path(ws_path)
     listen_ep = validate_loopback_endpoint(egress_listen)
     caddy = f"""# Caddyfile на узле egress (принимает WSS от RU edge на :443 без внешнего SSH/VPN)
+# ВНИМАНИЕ (H2): egress_ws_path работает как секретный HTTP-токен доступа.
+# По умолчанию Caddy не пишет access log; если вы включаете директиву `log`,
+# обязательно исключите маршрут `@mtevil_egress` через `log_skip @mtevil_egress`
+# (или маскируйте путь), чтобы секрет не попадал в журналы.
 {host} {{
     @mtevil_egress path {path}
+    log_skip @mtevil_egress
     handle @mtevil_egress {{
         reverse_proxy {listen_ep}
     }}
@@ -1037,11 +1075,19 @@ def render_egress_ws_reverse_proxy_snippets(
     }}
 }}
 """
-    nginx = f"""# nginx на узле egress (принимает WSS от RU edge на :443; access_log отключён!)
+    nginx = f"""# nginx на узле egress (принимает WSS от RU edge на :443)
+# ВНИМАНИЕ (H2): egress_ws_path работает как секретный HTTP-токен доступа.
+# Для секретного location обязательно отключите `access_log off;` (или маскируйте $request_uri).
 map $http_upgrade $connection_upgrade {{
     default upgrade;
     ''      close;
 }}
+
+# Опциональное маскирование пути, если в вашей конфигурации требуется общий access_log на уровне server/http:
+# map $request_uri $mtevil_masked_uri {{
+#     ~^{path}(\\?.*)?$  "/ws/***";
+#     default             $request_uri;
+# }}
 
 server {{
     listen 443 ssl;
@@ -1051,9 +1097,9 @@ server {{
 
     ssl_certificate     /etc/letsencrypt/live/{host}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/{host}/privkey.pem;
-    access_log off;
 
     location = {path} {{
+        access_log off;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -2659,6 +2705,401 @@ def copy_legacy_replay_bin_to_replay_volume(base: list[str]) -> bool:
     return proc.returncode == 0 and "COPIED" in (proc.stdout or "")
 
 
+def _parse_listen_host_ip(listen_val: object) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    if not isinstance(listen_val, str) or not listen_val.strip():
+        raise MigrationError("отсутствует или пусто строковое поле listen")
+    raw = listen_val.strip()
+    if ":" not in raw:
+        raise MigrationError(f"некорректный формат listen='{raw}' (ожидается IP:PORT)")
+    host_part, port_part = raw.rsplit(":", 1)
+    try:
+        port = int(port_part)
+    except ValueError as exc:
+        raise MigrationError(f"некорректный порт в listen='{raw}'") from exc
+    if not (1 <= port <= 65535):
+        raise MigrationError(f"порт вне диапазона 1..65535 в listen='{raw}'")
+    host_clean = host_part.strip("[]")
+    try:
+        return ipaddress.ip_address(host_clean)
+    except ValueError as exc:
+        raise MigrationError(f"некорректный IP в listen='{raw}': {exc}") from exc
+
+
+def _is_canonical_loopback_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if ip_obj.is_loopback:
+        return True
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+        return ip_obj.ipv4_mapped.is_loopback
+    return False
+
+
+_PRIVATE_CGNAT_V4_NETS = (
+    ipaddress.IPv4Network("10.0.0.0/8"),
+    ipaddress.IPv4Network("172.16.0.0/12"),
+    ipaddress.IPv4Network("192.168.0.0/16"),
+    ipaddress.IPv4Network("100.64.0.0/10"),
+)
+_ULA_V6_NET = ipaddress.IPv6Network("fc00::/7")
+
+
+def _is_private_cgnat_or_ula_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip_obj, ipaddress.IPv6Address):
+        if ip_obj.ipv4_mapped is not None:
+            return any(ip_obj.ipv4_mapped in net for net in _PRIVATE_CGNAT_V4_NETS)
+        return ip_obj in _ULA_V6_NET
+    return any(ip_obj in net for net in _PRIVATE_CGNAT_V4_NETS)
+
+
+def _is_private_cgnat_or_ula_net(net_obj: ipaddress.IPv4Network | ipaddress.IPv6Network) -> bool:
+    if isinstance(net_obj, ipaddress.IPv6Network):
+        return net_obj.subnet_of(_ULA_V6_NET)
+    return any(net_obj.subnet_of(base) for base in _PRIVATE_CGNAT_V4_NETS)
+
+
+def _validate_cidr_list_csv(value: str) -> list[str]:
+    cidrs: list[str] = []
+    for part in value.split(","):
+        tok = part.strip()
+        if not tok:
+            continue
+        net = ipaddress.ip_network(tok, strict=False)
+        norm = str(net)
+        if norm not in cidrs:
+            cidrs.append(norm)
+    if not cidrs:
+        raise ValueError("укажите хотя бы один корректный CIDR (например, 172.17.0.1/32 или 10.203.0.0/24)")
+    return cidrs
+
+
+def _parse_cli_proxy_protocol_allow_from(raw_values: list[str] | None) -> list[str] | None:
+    if not raw_values:
+        return None
+    combined = ",".join(raw_values)
+    return _validate_cidr_list_csv(combined)
+
+
+def _detect_docker_bridge_gateway_cidrs(deploy_dir: Path, project: str) -> list[str]:
+    candidates: list[str] = []
+    for net_name in (f"{project}_default", "bridge"):
+        proc = run(["docker", "network", "inspect", net_name], check=False)
+        if proc.returncode != 0 or not proc.stdout:
+            continue
+        try:
+            info = json.loads(proc.stdout)
+        except ValueError:
+            continue
+        items = info if isinstance(info, list) else [info]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            ipam = item.get("IPAM") if isinstance(item.get("IPAM"), dict) else {}
+            configs = ipam.get("Config") if isinstance(ipam.get("Config"), list) else []
+            for entry in configs:
+                if not isinstance(entry, dict):
+                    continue
+                gw = str(entry.get("Gateway") or "").strip()
+                if gw:
+                    try:
+                        ip_gw = ipaddress.ip_address(gw)
+                        if isinstance(ip_gw, ipaddress.IPv6Address) and ip_gw.ipv4_mapped is not None:
+                            ip_gw = ip_gw.ipv4_mapped
+                        cidr = f"{ip_gw}/32" if ip_gw.version == 4 else f"{ip_gw}/128"
+                        if cidr not in candidates:
+                            candidates.append(cidr)
+                        continue
+                    except ValueError:
+                        pass
+                sub = str(entry.get("Subnet") or "").strip()
+                if sub:
+                    try:
+                        sub_net = ipaddress.ip_network(sub, strict=False)
+                        if _is_private_cgnat_or_ula_net(sub_net):
+                            cidr = str(sub_net)
+                            if cidr not in candidates:
+                                candidates.append(cidr)
+                    except ValueError:
+                        pass
+        if candidates:
+            break
+    if not candidates:
+        proc_ip = run(["ip", "-o", "addr", "show"], check=False)
+        if proc_ip.returncode == 0 and proc_ip.stdout:
+            for line in proc_ip.stdout.splitlines():
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                iface, addr_cidr = parts[1], parts[3]
+                if not iface.startswith(("docker", "br-")):
+                    continue
+                try:
+                    ip_only = ipaddress.ip_address(addr_cidr.split("/", 1)[0])
+                    if _is_canonical_loopback_ip(ip_only) or ip_only.is_link_local or ip_only.is_unspecified:
+                        continue
+                    cidr = f"{ip_only}/32" if ip_only.version == 4 else f"{ip_only}/128"
+                    if cidr not in candidates:
+                        candidates.append(cidr)
+                except ValueError:
+                    continue
+    return candidates
+
+
+def _detect_host_proxy_source_cidrs(listen_ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> list[str]:
+    eff_ip: ipaddress.IPv4Address | ipaddress.IPv6Address = listen_ip
+    if isinstance(eff_ip, ipaddress.IPv6Address) and eff_ip.ipv4_mapped is not None:
+        eff_ip = eff_ip.ipv4_mapped
+
+    if not eff_ip.is_unspecified and not _is_canonical_loopback_ip(eff_ip):
+        if _is_private_cgnat_or_ula_ip(eff_ip):
+            if eff_ip.version == 4:
+                return [str(ipaddress.ip_network(f"{eff_ip}/24", strict=False))]
+            return [str(ipaddress.ip_network(f"{eff_ip}/64", strict=False))]
+        # Never expand a public / non-private IP to /24 or /64: restrict strictly to single host (/32 or /128).
+        return [f"{eff_ip}/32" if eff_ip.version == 4 else f"{eff_ip}/128"]
+
+    candidates: list[str] = []
+    proc = run(["ip", "-o", "addr", "show"], check=False)
+    if proc.returncode == 0 and proc.stdout:
+        for line in proc.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            iface = parts[1]
+            addr_cidr = parts[3]
+            if not any(iface.startswith(pfx) for pfx in ("wg", "awg", "amnezia", "docker", "br-")):
+                continue
+            try:
+                ip_only = ipaddress.ip_address(addr_cidr.split("/", 1)[0])
+                iface_net = ipaddress.ip_network(addr_cidr, strict=False)
+            except ValueError:
+                continue
+            if _is_canonical_loopback_ip(ip_only) or ip_only.is_link_local or ip_only.is_unspecified:
+                continue
+            if iface.startswith(("docker", "br-")):
+                cidr = f"{ip_only}/32" if ip_only.version == 4 else f"{ip_only}/128"
+            elif _is_private_cgnat_or_ula_ip(ip_only):
+                if ip_only.version == 4:
+                    if _is_private_cgnat_or_ula_net(iface_net) and iface_net.prefixlen >= 24:
+                        cidr = str(iface_net)
+                    else:
+                        cidr = str(ipaddress.ip_network(f"{ip_only}/24", strict=False))
+                else:
+                    if _is_private_cgnat_or_ula_net(iface_net) and iface_net.prefixlen >= 64:
+                        cidr = str(iface_net)
+                    else:
+                        cidr = str(ipaddress.ip_network(f"{ip_only}/64", strict=False))
+            else:
+                cidr = f"{ip_only}/32" if ip_only.version == 4 else f"{ip_only}/128"
+            if cidr not in candidates:
+                candidates.append(cidr)
+    return candidates
+
+
+def suggest_proxy_protocol_allow_from(
+    deploy_dir: Path,
+    project: str,
+    cfg: dict[str, object],
+    *,
+    network_mode: str | None = None,
+    compose_text: str | None = None,
+) -> tuple[list[str], str]:
+    mode = network_mode
+    if mode is None:
+        txt = compose_text
+        if txt is None:
+            comp_file = deploy_dir / "compose.yaml"
+            if comp_file.is_file():
+                txt = comp_file.read_text(encoding="utf-8", errors="ignore")
+            else:
+                txt = ""
+        mode = "host" if re.search(r"(?m)^\s*network_mode\s*:\s*[\"']?host[\"']?\s*$", txt) else "bridge"
+
+    listen_ip = _parse_listen_host_ip(cfg.get("listen"))
+    if mode == "bridge":
+        return (
+            _detect_docker_bridge_gateway_cidrs(deploy_dir, project),
+            "шлюз Docker bridge-сети (режим bridge + HAProxy/обратный прокси)",
+        )
+    return (
+        _detect_host_proxy_source_cidrs(listen_ip),
+        "подсеть туннеля (WireGuard/AWG) или локальный прокси в режиме host-network",
+    )
+
+
+def inspect_proxy_protocol_config(
+    deploy_dir: Path,
+    cfg_file: Path,
+    *,
+    override_cfg: dict[str, object] | None = None,
+    network_mode: str | None = None,
+    project: str | None = None,
+) -> tuple[str, list[str], str, dict[str, object]]:
+    if override_cfg is not None:
+        cfg = override_cfg
+    else:
+        try:
+            raw_text = cfg_file.read_text(encoding="utf-8")
+            cfg = json.loads(raw_text)
+        except (OSError, ValueError) as exc:
+            raise MigrationError(f"повреждённая конфигурация {cfg_file.name}: {exc}") from exc
+    if not isinstance(cfg, dict):
+        raise MigrationError(f"повреждённая конфигурация {cfg_file.name}: ожидается JSON-объект")
+
+    if cfg.get("proxy_protocol") is not True:
+        return ("ok", [], "", cfg)
+
+    if str(cfg.get("role") or "direct") == "egress":
+        raise MigrationError("proxy_protocol=true не поддерживается при role='egress'")
+
+    listen_ip = _parse_listen_host_ip(cfg.get("listen"))
+    raw_allow = cfg.get("proxy_protocol_allow_from")
+    parsed_allow: list[str] = []
+    if raw_allow is not None:
+        if not isinstance(raw_allow, list) or not all(isinstance(x, str) for x in raw_allow):
+            raise MigrationError(
+                "повреждённое поле proxy_protocol_allow_from в config.json: ожидается список CIDR-строк"
+            )
+        for item in raw_allow:
+            try:
+                parsed_allow.append(str(ipaddress.ip_network(item.strip(), strict=False)))
+            except ValueError as exc:
+                raise MigrationError(
+                    f"повреждённый CIDR '{item}' в proxy_protocol_allow_from: {exc}"
+                ) from exc
+
+    if not _is_canonical_loopback_ip(listen_ip) and not parsed_allow:
+        proj = project or f"mtevil-{cfg.get('role') or 'direct'}"
+        suggested, reason = suggest_proxy_protocol_allow_from(
+            deploy_dir, proj, cfg, network_mode=network_mode
+        )
+        return ("needs_allow_from", suggested, reason, cfg)
+    return ("ok", [], "", cfg)
+
+
+def ensure_proxy_protocol_migration(
+    deploy_dir: Path,
+    cfg_file: Path,
+    *,
+    project: str,
+    target_label: str = "v0.4.1+",
+    interactive: bool | None = None,
+    apply_to_file: bool = True,
+    override_cfg: dict[str, object] | None = None,
+    network_mode: str | None = None,
+    explicit_allow_from: list[str] | None = None,
+) -> tuple[bool, dict[str, object]]:
+    """Verify proxy_protocol config compatibility before pulling images or touching containers."""
+    status, suggested, reason, cfg = inspect_proxy_protocol_config(
+        deploy_dir,
+        cfg_file,
+        override_cfg=override_cfg,
+        network_mode=network_mode,
+        project=project,
+    )
+    if explicit_allow_from is not None and cfg.get("proxy_protocol") is True:
+        new_cfg = copy.deepcopy(cfg)
+        new_cfg["proxy_protocol_allow_from"] = list(explicit_allow_from)
+        if apply_to_file and cfg_file.is_file():
+            bak = cfg_file.with_name(f"{cfg_file.name}.pre-v041-pp.bak")
+            if not bak.exists():
+                shutil.copyfile(cfg_file, bak)
+                try:
+                    os.chmod(bak, 0o600)
+                except OSError:
+                    pass
+            cfg_file.write_text(json.dumps(new_cfg, indent=2) + "\n", encoding="utf-8")
+        print(ok_text(f"Записано proxy_protocol_allow_from={json.dumps(explicit_allow_from)} (--proxy-protocol-allow-from)."))
+        return True, new_cfg
+
+    if status == "ok":
+        return True, cfg
+
+    listen_disp = str(cfg.get("listen") or "")
+    print(
+        warn_text(
+            f"Несовместимость {target_label} (P2/Q3): в config.json включён proxy_protocol=true, "
+            f"но listen='{listen_disp}' не на loopback и не задано поле proxy_protocol_allow_from."
+        ),
+        file=sys.stderr,
+    )
+    if suggested:
+        suggested_csv = ", ".join(suggested)
+        print(
+            f"  Обнаруженный источник ({reason}): {suggested_csv}\n"
+            f"  Вариант 1: переведите listen на loopback (127.0.0.1:PORT) в режиме --shared-443.\n"
+            f"  Вариант 2: передайте флаг --proxy-protocol-allow-from \"{suggested_csv}\" "
+            f"или укажите в config.json: {json.dumps(suggested)}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "  Подходящие частные/туннельные интерфейсы не обнаружены (автоподстановка не выполняется).\n"
+            "  Вариант 1: переведите listen на loopback (127.0.0.1:PORT) в режиме --shared-443.\n"
+            "  Вариант 2: укажите доверенный источник явно флагом --proxy-protocol-allow-from <CIDR> "
+            "или в поле proxy_protocol_allow_from файла config.json.",
+            file=sys.stderr,
+        )
+
+    is_tty = sys.stdin.isatty() if interactive is None else interactive
+    if not is_tty:
+        print(
+            err_text(
+                "Операция остановлена до замены контейнера: передайте --proxy-protocol-allow-from <CIDR>, "
+                "заполните proxy_protocol_allow_from в config.json или переведите listen на 127.0.0.1."
+            ),
+            file=sys.stderr,
+        )
+        return False, cfg
+
+    if suggested:
+        suggested_csv = ", ".join(suggested)
+        if not ask_yes_no(
+            f"Записать предложенное proxy_protocol_allow_from = [{suggested_csv}] и продолжить?",
+            default=True,
+        ):
+            print(
+                err_text("Операция отменена до замены контейнера. Конфигурация и работающий сервис не изменены."),
+                file=sys.stderr,
+            )
+            return False, cfg
+        default_prompt_val: str | None = suggested_csv
+    else:
+        if not ask_yes_no(
+            "Указать доверенные CIDR для proxy_protocol_allow_from вручную сейчас?",
+            default=False,
+        ):
+            print(
+                err_text(
+                    "Операция остановлена до замены контейнера: укажите --proxy-protocol-allow-from <CIDR> "
+                    "или переведите listen на 127.0.0.1."
+                ),
+                file=sys.stderr,
+            )
+            return False, cfg
+        default_prompt_val = None
+
+    while True:
+        raw_entry = ask("Доверенные CIDR для proxy_protocol_allow_from (через запятую)", default_prompt_val)
+        try:
+            chosen = _validate_cidr_list_csv(raw_entry)
+            break
+        except ValueError as exc:
+            print(warn_text(f"Некорректный CIDR: {exc}"))
+
+    new_cfg = copy.deepcopy(cfg)
+    new_cfg["proxy_protocol_allow_from"] = chosen
+    if apply_to_file and cfg_file.is_file():
+        bak = cfg_file.with_name(f"{cfg_file.name}.pre-v041-pp.bak")
+        if not bak.exists():
+            shutil.copyfile(cfg_file, bak)
+            try:
+                os.chmod(bak, 0o600)
+            except OSError:
+                pass
+        cfg_file.write_text(json.dumps(new_cfg, indent=2) + "\n", encoding="utf-8")
+    print(ok_text(f"Добавлено proxy_protocol_allow_from={json.dumps(chosen)} в config.json."))
+    return True, new_cfg
+
+
 def strip_legacy_default_mss(cfg_file: Path) -> bool:
     """Remove legacy default client_mss=100 / client_mss_bulk=1380 that clamped client SYN-ACK MSS."""
     if not cfg_file.is_file():
@@ -2907,6 +3348,13 @@ def perform_rollback(
             print(
                 f"Блок 'me' не поддерживается в {target_version}: сохранён бэкап {backup_path.name} и удалён блок 'me' из config.json."
             )
+        stripped_pp, pp_backup = strip_proxy_protocol_allow_from_for_legacy_version(
+            deploy_dir / "config.json", target_version
+        )
+        if stripped_pp and pp_backup is not None:
+            print(
+                f"Поле 'proxy_protocol_allow_from' не поддерживается в {target_version}: сохранён бэкап {pp_backup.name} и удалено поле из config.json."
+            )
     except Exception as exc:
         print(
             err_text(
@@ -2969,6 +3417,7 @@ def run_update_command(
     *,
     reexec: bool = False,
     allow_prerelease: bool = False,
+    proxy_protocol_allow_from: list[str] | None = None,
 ) -> int:
     check_prerequisites()
     compose_file = deploy_dir / "compose.yaml"
@@ -3031,6 +3480,11 @@ def run_update_command(
             print(
                 f"Блок 'me' не поддерживается в {target_version}: сохранён бэкап {me_backup.name} и удалён блок 'me' из config.json."
             )
+        stripped_pp, pp_backup = strip_proxy_protocol_allow_from_for_legacy_version(cfg_file, target_version)
+        if stripped_pp and pp_backup is not None:
+            print(
+                f"Поле 'proxy_protocol_allow_from' не поддерживается в {target_version}: сохранён бэкап {pp_backup.name} и удалено поле из config.json."
+            )
     except Exception as exc:
         print(
             err_text(
@@ -3090,6 +3544,9 @@ def run_update_command(
         ]
         if explicit_image:
             reexec_argv.extend(["--image", explicit_image])
+        if proxy_protocol_allow_from:
+            for pp_cidr in proxy_protocol_allow_from:
+                reexec_argv.extend(["--proxy-protocol-allow-from", pp_cidr])
         try:
             os.execv(sys.executable, reexec_argv)
         except OSError as exc:
@@ -3104,13 +3561,45 @@ def run_update_command(
     from_label = cur_version or cur_image_ref or "unknown"
     print(heading(f"Обновление mtevil: {from_label} -> {target_version}"))
 
+    orig_cfg_bytes_before_pp = cfg_file.read_bytes() if cfg_file.is_file() else None
+    ver_key = parse_semver_tag(target_version)
+    if ver_key is None or ver_key[:3] >= (0, 4, 1) or explicit_image:
+        try:
+            pp_ok, _ = ensure_proxy_protocol_migration(
+                deploy_dir,
+                cfg_file,
+                project=project,
+                target_label=target_version,
+                explicit_allow_from=proxy_protocol_allow_from,
+            )
+        except MigrationError as exc:
+            print(
+                err_text(f"Обновление отменено до скачивания образа и замены контейнера: {exc}."),
+                file=sys.stderr,
+            )
+            return 1
+        if not pp_ok:
+            return 1
+    else:
+        try:
+            json.loads(cfg_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(
+                err_text(f"Обновление отменено до скачивания образа: повреждена конфигурация config.json ({exc})."),
+                file=sys.stderr,
+            )
+            return 1
+
     print(f"Загрузка Docker-образа {target_image}...")
     pull_proc = run(["docker", "pull", target_image], check=False)
     if pull_proc.returncode != 0:
-        detail = (pull_proc.stderr or pull_proc.stdout or "").strip()
-        summary, action = diagnose_docker_error(detail, target_image)
-        print(f"{err_text(summary)}\nДальше: {action}", file=sys.stderr)
-        return 1
+        if explicit_image and run(["docker", "image", "inspect", target_image], check=False).returncode == 0:
+            print(warn_text(f"Используется предзагруженный локальный образ {target_image} из кэша Docker."))
+        else:
+            detail = (pull_proc.stderr or pull_proc.stdout or "").strip()
+            summary, action = diagnose_docker_error(detail, target_image)
+            print(f"{err_text(summary)}\nДальше: {action}", file=sys.stderr)
+            return 1
 
     new_image_id, _, new_image_ver = inspect_image_metadata(target_image)
     if cur_image_id and new_image_id and cur_image_id == new_image_id and (cur_version or new_image_ver) == target_version:
@@ -3160,6 +3649,8 @@ def run_update_command(
             cur_image_id,
             cur_digest,
         )
+        if orig_cfg_bytes_before_pp is not None:
+            (deploy_dir / "config.json.rollback").write_bytes(orig_cfg_bytes_before_pp)
     except Exception as exc:
         print(err_text(str(exc)), file=sys.stderr)
         return 1
@@ -4162,11 +4653,37 @@ def format_handshake_diag_lines(
     ch_to = int(rstats.get("client_hello_incomplete_timeout") or 0)
     ch_cl = int(rstats.get("client_hello_incomplete_close") or 0)
     ih_inc = int(rstats.get("inner_header_incomplete") or 0)
+    ch_inc = ch_to + ch_cl
+    total_sessions = int(rstats.get("completed_sessions") or 0) + int(
+        rstats.get("failed_sessions") or 0
+    )
+    uptime_ms_raw = rstats.get("uptime_ms")
+    period_str = (
+        format_duration_ru(float(uptime_ms_raw) / 1000.0)
+        if isinstance(uptime_ms_raw, (int, float)) and uptime_ms_raw >= 0
+        else None
+    )
     lines = [
         f"  Сбои handshake:    таймаут ClientHello={ch_to}, закрытие сокета={ch_cl}, после ServerHello={ih_inc}"
     ]
+    if total_sessions > 0:
+        ch_pct = (ch_inc * 100.0) / total_sessions
+        ih_pct = (ih_inc * 100.0) / total_sessions
+        period_lbl = f"за {period_str}, сессий={total_sessions}" if period_str else f"сессий={total_sessions}"
+        lines.append(
+            f"  Доля обрывов:      client_hello_incomplete={ch_inc}/{total_sessions} ({ch_pct:.1f}%), "
+            f"inner_header_incomplete={ih_inc}/{total_sessions} ({ih_pct:.1f}%) [{period_lbl}]"
+        )
+    elif period_str is not None:
+        lines.append(
+            f"  Доля обрывов:      client_hello_incomplete={ch_inc} (0.0%), inner_header_incomplete={ih_inc} (0.0%) [за {period_str}, сессий=0]"
+        )
+    if (ch_inc + ih_inc) > 0:
+        lines.append(
+            "  Подсказка:         зафиксированы обрывы handshake/TLS — смотрите ADR-005 (разделы про порт :443, размер ClientHello и WebProxy)."
+        )
     sample = rstats.get("last_client_hello_incomplete")
-    if (ch_to + ch_cl) > 0 and isinstance(sample, dict):
+    if ch_inc > 0 and isinstance(sample, dict):
         rx = int(sample.get("received_bytes") or 0)
         exp = int(sample.get("expected_bytes") or 0)
         reason_lbl = "таймаут" if sample.get("timeout") else "закрытие сокета"
@@ -4771,7 +5288,13 @@ def run_tuning_command(
     if not hs_changed and not bk_changed:
         c_mss = saved_cfg.get("client_mss")
         b_mss = saved_cfg.get("client_mss_bulk")
-        print(heading("Параметры TCP-фрагментации (tuning)"))
+        print(heading("Параметры TCP-фрагментации [experimental] (tuning)"))
+        print(
+            warn_text(
+                "Статус [experimental]: профиль TCP MSS не подтверждён полевой матрицей H4; "
+                "малый client_mss снижает размер сегментов отдачи клиента (upload) на всё время TCP-сессии."
+            )
+        )
         print(f"  client_mss (SYN-ACK):      {c_mss if c_mss is not None else 'выкл (системный MSS)'}")
         print(f"  client_mss_bulk (отдача):  {b_mss if b_mss is not None else 'выкл (системный MSS)'}")
         print("  Пример включения: mtevilctl tuning --handshake-mss 280 --bulk-mss 1400")
@@ -4869,12 +5392,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--managed-caddy",
         action="store_true",
-        help="Include an automated Caddy TLS sidecar container in compose.yaml (for --webproxy when port 443 is free)",
+        help="[experimental] Include an automated Caddy TLS sidecar container in compose.yaml (for --webproxy when port 443 is free)",
     )
     parser.add_argument(
         "--cdn",
         action="store_true",
-        help="Generate Cloudflare/CDN reverse-proxy snippets and headers in --webproxy mode",
+        help="[experimental] Generate Cloudflare/CDN reverse-proxy snippets and headers in --webproxy mode",
     )
     parser.add_argument(
         "--egress-ws",
@@ -4921,7 +5444,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--me-public-ipv4", type=str, default=None, help="Explicit public IPv4 for ME KDF (required behind NAT/bridge)")
     parser.add_argument("--me-send-client-ip", choices=("true", "false"), default=None, help="Whether to forward client IPv4 in ME RPC_PROXY_REQ")
     parser.add_argument("--me-fallback-to-direct", choices=("true", "false"), default=None, help="Whether to fall back to Direct when ME is degraded")
+    parser.add_argument(
+        "--proxy-protocol-allow-from",
+        action="append",
+        default=None,
+        help="Trusted source CIDR(s) allowed to send PROXY protocol v2 headers (comma-separated or repeatable)",
+    )
     args = parser.parse_args(argv)
+
+    try:
+        cli_pp_allow_from = _parse_cli_proxy_protocol_allow_from(args.proxy_protocol_allow_from)
+    except ValueError as exc:
+        print(err_text(f"Некорректное значение --proxy-protocol-allow-from: {exc}"), file=sys.stderr)
+        return 1
 
     repo_root = Path(__file__).resolve().parent.parent
     if args.command in ("status", "update", "rollback", "traffic", "traf", "link", "sni", "user", "adtag", "egress", "tuning"):
@@ -4934,6 +5469,7 @@ def main(argv: list[str] | None = None) -> int:
                 target_version_override=args.version,
                 reexec=args.reexec,
                 allow_prerelease=args.prerelease,
+                proxy_protocol_allow_from=cli_pp_allow_from,
             )
         if args.command == "rollback":
             return perform_rollback(deploy_dir)
@@ -5042,6 +5578,18 @@ def main(argv: list[str] | None = None) -> int:
     existing_network_host = bool(saved.get("network_host", False))
 
     if existing_cfg.exists():
+        try:
+            existing_parsed = json.loads(existing_cfg.read_text(encoding="utf-8"))
+            if not isinstance(existing_parsed, dict):
+                raise ValueError("config.json должен содержать JSON-объект")
+        except (OSError, ValueError) as exc:
+            print(
+                err_text(
+                    f"Повреждённая конфигурация {existing_cfg}: {exc}. Исправьте или удалите файл вручную перед запуском мастера."
+                ),
+                file=sys.stderr,
+            )
+            return 1
         print(f"\nНайдена существующая конфигурация в {deploy_dir}")
         if existing_role:
             cur_port = str(saved.get("MTEVIL_PORT") or "")
@@ -5353,13 +5901,26 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdin.isatty()
             and not args.cdn
             and ask_yes_no(
-                "Поднять встроенный контейнер Caddy (автоматический TLS Let's Encrypt на порту 443)?",
+                "[experimental] Поднять встроенный контейнер Caddy (автоматический TLS Let's Encrypt на порту 443)?",
                 default=bool(saved.get("managed_caddy", False)),
             )
         ):
+            print(
+                warn_text(
+                    "Примечание [experimental]: --managed-caddy пока помечен как экспериментальный режим "
+                    "(автоматический ACME не покрыт живыми E2E-тестами в CI)."
+                )
+            )
             managed_caddy_enabled = True
             managed_caddy_cand = {"caddyfile_name": "Caddyfile.candidate"}
             managed_caddy_live = {"caddyfile_name": "Caddyfile"}
+        if args.cdn:
+            print(
+                warn_text(
+                    "Примечание [experimental]: профиль --cdn помечен как экспериментальный "
+                    "(требует ручной проверки Cloudflare SSL Full (Strict), WebSockets и полевой матрицы)."
+                )
+            )
 
     if mode == "self-steal":
         role = args.role if args.role in ("direct", "edge") else (existing_role if existing_role in ("direct", "edge") else "direct")
@@ -5635,6 +6196,13 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     egress_ws_path_val = f"/ws/{secrets.token_hex(12)}"
                 config_data["egress_ws_path"] = egress_ws_path_val
+                print(
+                    warn_text(
+                        "Предупреждение безопасности (H2): секретный путь egress_ws_path является HTTP-аутентификатором. "
+                        "В конфигурации nginx/Caddy обязательно отключите access_log для этого location "
+                        "(`access_log off;` в nginx / `log_skip @mtevil_egress` в Caddy) или маскируйте URL в логах."
+                    )
+                )
                 if args.egress_domain:
                     egress_ws_domain = validate_sni(args.egress_domain).lower()
                 elif sys.stdin.isatty():
@@ -5763,6 +6331,23 @@ def main(argv: list[str] | None = None) -> int:
             health_host = "127.0.0.1" if bind_ip == "0.0.0.0" else bind_ip
     else:
         health_host = "127.0.0.1"
+
+    try:
+        pp_ok, config_data = ensure_proxy_protocol_migration(
+            deploy_dir,
+            deploy_dir / "config.json",
+            project=project,
+            target_label="текущая версия",
+            apply_to_file=False,
+            override_cfg=config_data,
+            network_mode="host" if use_network_host else "bridge",
+            explicit_allow_from=cli_pp_allow_from,
+        )
+    except MigrationError as exc:
+        print(err_text(f"Некорректная конфигурация proxy_protocol: {exc}."), file=sys.stderr)
+        return 1
+    if not pp_ok:
+        return 1
 
     cand_compose = deploy_dir / "compose.candidate.yaml"
     cand_env = deploy_dir / ".env.candidate"
@@ -6592,6 +7177,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  Добавить на edge одной командой: mtevilctl egress add \"wss://{eg_dom_disp}{egress_ws_path_val}\"")
             print(f"  Шаблон Caddy:      {deploy_dir / 'Caddyfile.egress.example'}")
             print(f"  Шаблон nginx:      {deploy_dir / 'nginx.egress.example'}")
+            print(
+                warn_text(
+                    "  Важно (H2): не логируйте секретный путь egress_ws_path в access_log nginx/Caddy "
+                    "(используйте `access_log off;` внутри `location = ...` / `log_skip @mtevil_egress` или маскирование пути)."
+                )
+            )
         else:
             print(f"  Адрес выхода: {bind_ip}:{pub_port}")
         print("  Режим в мастере на edge: 2 (Расширенная настройка) -> 2 (edge)")
