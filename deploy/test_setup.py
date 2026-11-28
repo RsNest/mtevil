@@ -104,12 +104,12 @@ class _Aes256Ctr:
 class _MockTelegramDcServer:
     """Distinguishable local MTProto DC mock that separates background probes from real client req_pq_multi."""
 
-    def __init__(self) -> None:
+    def __init__(self, bind_host: str = "127.0.0.1") -> None:
         import threading
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(("127.0.0.1", 0))
+        self._sock.bind((bind_host, 0))
         self._sock.listen(64)
         self._sock.settimeout(0.2)
         self.port = self._sock.getsockname()[1]
@@ -4512,6 +4512,523 @@ class SetupValidationTests(unittest.TestCase):
                 self.assertEqual(rc_bad, 1, msg=bad_raw)
                 self.assertEqual(pull_called, [])
                 self.assertEqual((d / "config.json").read_text(encoding="utf-8"), bad_raw)
+
+        # 5. Downgrade / rollback to < v0.4.1 strips proxy_protocol_allow_from with 0600 backup
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            cfg_p = d / "config.json"
+            cfg_p.write_text(
+                setup.json.dumps({
+                    "role": "direct",
+                    "listen": "0.0.0.0:24443",
+                    "proxy_protocol": True,
+                    "proxy_protocol_allow_from": ["172.18.0.1/32"],
+                }),
+                encoding="utf-8",
+            )
+            self.assertEqual(setup.strip_proxy_protocol_allow_from_for_legacy_version(cfg_p, "v0.4.1"), (False, None))
+            stripped_ok, bak_p = setup.strip_proxy_protocol_allow_from_for_legacy_version(cfg_p, "v0.4.0")
+            self.assertTrue(stripped_ok)
+            self.assertIsNotNone(bak_p)
+            self.assertTrue(bak_p.is_file())
+            self.assertNotIn("proxy_protocol_allow_from", setup.json.loads(cfg_p.read_text(encoding="utf-8")))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux Docker host")
+    def test_linux_real_v040_to_head_update_matrix_and_rollback(self):
+        import hashlib
+        import http.server
+        import ipaddress
+        import threading
+
+        head_img = self._local_image()
+        if head_img is None:
+            self.skipTest("no local mtevil image available")
+
+        v040_img = "ghcr.io/rsnest/mtevil:v0.4.0"
+        setup.run(["docker", "pull", v040_img])
+        v040_id, _, _ = setup.inspect_image_metadata(v040_img)
+        head_id, _, _ = setup.inspect_image_metadata(head_img)
+        self.assertIsNotNone(v040_id)
+        self.assertIsNotNone(head_id)
+        self.assertNotEqual(v040_id, head_id)
+
+        repo_root = Path(__file__).resolve().parent.parent
+        v040_setup_bytes = subprocess.check_output(["git", "show", "v0.4.0:deploy/setup.py"], cwd=str(repo_root))
+        v040_ctl_bytes = subprocess.check_output(["git", "show", "v0.4.0:deploy/mtevilctl"], cwd=str(repo_root))
+
+        head_setup_bytes = (repo_root / "deploy" / "setup.py").read_bytes()
+        head_ctl_bytes = (repo_root / "deploy" / "mtevilctl").read_bytes()
+        head_inst_bytes = (repo_root / "deploy" / "install.sh").read_bytes()
+        sha_lines = (
+            f"{hashlib.sha256(head_inst_bytes).hexdigest()}  install.sh\n"
+            f"{hashlib.sha256(head_setup_bytes).hexdigest()}  setup.py\n"
+            f"{hashlib.sha256(head_ctl_bytes).hexdigest()}  mtevilctl\n"
+        ).encode("utf-8")
+        assets_map = {
+            "/download/v0.4.1/install.sh": head_inst_bytes,
+            "/download/v0.4.1/setup.py": head_setup_bytes,
+            "/download/v0.4.1/mtevilctl": head_ctl_bytes,
+            "/download/v0.4.1/SHA256SUMS": sha_lines,
+        }
+        releases_payload = setup.json.dumps([
+            {
+                "tag_name": "v0.4.1",
+                "draft": False,
+                "prerelease": False,
+                "assets": [
+                    {"name": "install.sh", "state": "uploaded"},
+                    {"name": "setup.py", "state": "uploaded"},
+                    {"name": "mtevilctl", "state": "uploaded"},
+                    {"name": "SHA256SUMS", "state": "uploaded"},
+                ],
+            }
+        ]).encode("utf-8")
+
+        class _RelHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                path_only = self.path.split("?", 1)[0]
+                if path_only == "/releases":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(releases_payload)
+                    return
+                if path_only in assets_map:
+                    body = assets_map[path_only]
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, *_args):
+                return
+
+        rel_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _RelHandler)
+        rel_port = rel_srv.server_address[1]
+        rel_thr = threading.Thread(target=rel_srv.serve_forever, daemon=True)
+        rel_thr.start()
+
+        dc_host = _MockTelegramDcServer(bind_host="0.0.0.0")
+        secret_hex = "11" * 16
+        token_hex = "22" * 16
+        active_bases: list[list[str]] = []
+
+        def run_ctl(d: Path, *ctl_args: str) -> subprocess.CompletedProcess[str]:
+            env = dict(os.environ)
+            env["MTEVIL_DIR"] = str(d)
+            env["MTEVIL_RELEASES_API_URL"] = f"http://127.0.0.1:{rel_port}/releases?per_page=30"
+            env["MTEVIL_RELEASE_BASE_URL"] = f"http://127.0.0.1:{rel_port}/download"
+            env["MTEVIL_UPDATE_IMAGE"] = head_img
+            return subprocess.run(
+                ["bash", str(d / "mtevilctl"), *ctl_args],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        def boot_v040_node(
+            d: Path,
+            proj: str,
+            role: str,
+            cfg_dict: dict[str, object],
+            *,
+            network_host: bool,
+            bind_ip: str,
+            host_port: int,
+            extra_env: str = "",
+        ) -> list[str]:
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "setup.py").write_bytes(v040_setup_bytes)
+            (d / "setup.py").chmod(0o755)
+            (d / "mtevilctl").write_bytes(v040_ctl_bytes)
+            (d / "mtevilctl").chmod(0o755)
+            hc_host = bind_ip if (network_host and bind_ip not in ("0.0.0.0", "::", "")) else "127.0.0.1"
+            comp = setup.render_compose(
+                repo_root,
+                d,
+                role,
+                "config.json",
+                network_host=network_host,
+                health_host=hc_host,
+                health_port=host_port if network_host else None,
+                include_build=False,
+            )
+            comp = comp.replace("interval: 30s", "interval: 2s").replace("start_period: 5s", "start_period: 1s")
+            (d / "compose.yaml").write_text(comp, encoding="utf-8")
+            env_body = (
+                f"MTEVIL_PROJECT={proj}\n"
+                f"MTEVIL_IMAGE={v040_img}\n"
+                f"MTEVIL_BIND={bind_ip}\n"
+                f"MTEVIL_PORT={host_port}\n"
+                + extra_env
+            )
+            (d / ".env").write_text(env_body, encoding="utf-8")
+            (d / "config.json").write_text(setup.json.dumps(cfg_dict, indent=2) + "\n", encoding="utf-8")
+            base = setup.compose_cmd(d, proj)
+            active_bases.append(base)
+            if role in ("direct", "edge"):
+                setup.write_volume_secret_stdin(base, "/var/lib/mtevil/proxy-secret", secret_hex)
+            if role in ("edge", "egress"):
+                setup.write_volume_secret_stdin(base, "/var/lib/mtevil/egress-token", token_hex)
+            setup.run(base + ["up", "-d", setup.compose_service(base)])
+            setup.wait_healthy(base)
+            return base
+
+        proxy_stop = threading.Event()
+        proxy_socks: list[socket.socket] = []
+
+        def start_proxy_v2_forwarder(target_port: int) -> int:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(32)
+            srv.settimeout(0.2)
+            proxy_socks.append(srv)
+            rp_port = srv.getsockname()[1]
+            pp_hdr = (
+                b"\r\n\r\n\x00\r\nQUIT\n\x21\x11\x00\x0c"
+                + bytes([198, 51, 100, 44, 203, 0, 113, 10, 0xCA, 0xFE, 0x01, 0xBB])
+            )
+
+            def _pump(src: socket.socket, dst: socket.socket) -> None:
+                try:
+                    while not proxy_stop.is_set():
+                        data = src.recv(16384)
+                        if not data:
+                            break
+                        dst.sendall(data)
+                except OSError:
+                    pass
+                finally:
+                    try:
+                        dst.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+
+            def _accept_loop() -> None:
+                while not proxy_stop.is_set():
+                    try:
+                        cl, _ = srv.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    try:
+                        up = socket.create_connection(("127.0.0.1", target_port), timeout=3.0)
+                        up.sendall(pp_hdr)
+                    except OSError:
+                        cl.close()
+                        continue
+                    t1 = threading.Thread(target=_pump, args=(cl, up), daemon=True)
+                    t2 = threading.Thread(target=_pump, args=(up, cl), daemon=True)
+                    t1.start()
+                    t2.start()
+
+            threading.Thread(target=_accept_loop, daemon=True).start()
+            return rp_port
+
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                dc_loop = [f"{i}=127.0.0.1:{dc_host.port}" for i in range(1, 6)]
+
+                # --- 1. DIRECT (v0.4.0 -> HEAD -> rollback) ---
+                p_dir = self._free_port()
+                d_dir = root / "direct"
+                proj_dir = f"mtevil-u-dir-{p_dir}"
+                base_dir = boot_v040_node(
+                    d_dir,
+                    proj_dir,
+                    "direct",
+                    {
+                        "role": "direct",
+                        "listen": f"127.0.0.1:{p_dir}",
+                        "secret_file": "/var/lib/mtevil/proxy-secret",
+                        "replay_file": "/var/lib/mtevil-replay/replay.bin",
+                        "sni": "mozilla.org",
+                        "cover": "127.0.0.1:9",
+                        "dc": dc_loop,
+                    },
+                    network_host=True,
+                    bind_ip="127.0.0.1",
+                    host_port=p_dir,
+                )
+                self.assertEqual(setup.inspect_current_deployment(d_dir, proj_dir, v040_img)[0], v040_id)
+                self.assertTrue(setup.verify_telegram_e2e(base_dir, attempts=2, delay_s=0.5)[0])
+                r_up = run_ctl(d_dir, "update")
+                self.assertEqual(r_up.returncode, 0, msg=r_up.stdout + r_up.stderr)
+                self.assertEqual(setup.inspect_current_deployment(d_dir, proj_dir, head_img)[0], head_id)
+                r_rb = run_ctl(d_dir, "rollback")
+                self.assertEqual(r_rb.returncode, 0, msg=r_rb.stdout + r_rb.stderr)
+                self.assertEqual(setup.inspect_current_deployment(d_dir, proj_dir, v040_img)[0], v040_id)
+                print("UPDATE_MATRIX_RESULT | direct | v0.4.0=PASS | update=PASS | rollback=PASS", flush=True)
+
+                # --- 2. SPLIT edge -> egress (v0.4.0 -> HEAD -> rollback) ---
+                p_eg = self._free_port()
+                p_ed = self._free_port()
+                d_eg = root / "split_egress"
+                d_ed = root / "split_edge"
+                proj_eg = f"mtevil-u-eg-{p_eg}"
+                proj_ed = f"mtevil-u-ed-{p_ed}"
+                base_eg = boot_v040_node(
+                    d_eg,
+                    proj_eg,
+                    "egress",
+                    {
+                        "role": "egress",
+                        "listen": f"127.0.0.1:{p_eg}",
+                        "egress_token_file": "/var/lib/mtevil/egress-token",
+                        "dc": dc_loop,
+                    },
+                    network_host=True,
+                    bind_ip="127.0.0.1",
+                    host_port=p_eg,
+                )
+                base_ed = boot_v040_node(
+                    d_ed,
+                    proj_ed,
+                    "edge",
+                    {
+                        "role": "edge",
+                        "listen": f"127.0.0.1:{p_ed}",
+                        "secret_file": "/var/lib/mtevil/proxy-secret",
+                        "replay_file": "/var/lib/mtevil-replay/replay.bin",
+                        "sni": "mozilla.org",
+                        "cover": "127.0.0.1:9",
+                        "egress_upstreams": [f"127.0.0.1:{p_eg}"],
+                        "egress_token_file": "/var/lib/mtevil/egress-token",
+                    },
+                    network_host=True,
+                    bind_ip="127.0.0.1",
+                    host_port=p_ed,
+                )
+                self.assertTrue(setup.verify_telegram_e2e(base_ed, attempts=2, delay_s=0.5)[0])
+                r_eg_up = run_ctl(d_eg, "update")
+                self.assertEqual(r_eg_up.returncode, 0, msg=r_eg_up.stdout + r_eg_up.stderr)
+                self.assertEqual(setup.inspect_current_deployment(d_eg, proj_eg, head_img)[0], head_id)
+                self.assertTrue(setup.verify_telegram_e2e(base_ed, attempts=2, delay_s=0.5)[0])
+                r_ed_up = run_ctl(d_ed, "update")
+                self.assertEqual(r_ed_up.returncode, 0, msg=r_ed_up.stdout + r_ed_up.stderr)
+                self.assertEqual(setup.inspect_current_deployment(d_ed, proj_ed, head_img)[0], head_id)
+                r_ed_rb = run_ctl(d_ed, "rollback")
+                self.assertEqual(r_ed_rb.returncode, 0, msg=r_ed_rb.stdout + r_ed_rb.stderr)
+                r_eg_rb = run_ctl(d_eg, "rollback")
+                self.assertEqual(r_eg_rb.returncode, 0, msg=r_eg_rb.stdout + r_eg_rb.stderr)
+                self.assertEqual(setup.inspect_current_deployment(d_ed, proj_ed, v040_img)[0], v040_id)
+                self.assertEqual(setup.inspect_current_deployment(d_eg, proj_eg, v040_img)[0], v040_id)
+                self.assertTrue(setup.verify_telegram_e2e(base_ed, attempts=2, delay_s=0.5)[0])
+                print("UPDATE_MATRIX_RESULT | split (edge->egress) | v0.4.0=PASS | update=PASS | rollback=PASS", flush=True)
+
+                # --- 3. SHARED-443 LOOPBACK (v0.4.0 -> HEAD -> rollback) ---
+                p_sh = self._free_port()
+                d_sh = root / "shared443"
+                proj_sh = f"mtevil-u-sh-{p_sh}"
+                base_sh = boot_v040_node(
+                    d_sh,
+                    proj_sh,
+                    "direct",
+                    {
+                        "role": "direct",
+                        "listen": f"127.0.0.1:{p_sh}",
+                        "secret_file": "/var/lib/mtevil/proxy-secret",
+                        "replay_file": "/var/lib/mtevil-replay/replay.bin",
+                        "sni": "mozilla.org",
+                        "cover": "127.0.0.1:9",
+                        "proxy_protocol": True,
+                        "dc": dc_loop,
+                    },
+                    network_host=True,
+                    bind_ip="127.0.0.1",
+                    host_port=p_sh,
+                    extra_env="MTEVIL_SHARED_443=1\nMTEVIL_PUBLIC_PORT=443\n",
+                )
+                self.assertTrue(setup.verify_telegram_e2e(base_sh, attempts=2, delay_s=0.5)[0])
+                r_sh_up = run_ctl(d_sh, "update")
+                self.assertEqual(r_sh_up.returncode, 0, msg=r_sh_up.stdout + r_sh_up.stderr)
+                self.assertEqual(setup.inspect_current_deployment(d_sh, proj_sh, head_img)[0], head_id)
+                r_sh_rb = run_ctl(d_sh, "rollback")
+                self.assertEqual(r_sh_rb.returncode, 0, msg=r_sh_rb.stdout + r_sh_rb.stderr)
+                self.assertEqual(setup.inspect_current_deployment(d_sh, proj_sh, v040_img)[0], v040_id)
+                print("UPDATE_MATRIX_RESULT | shared-443 loopback | v0.4.0=PASS | update=PASS | rollback=PASS", flush=True)
+
+                # --- 4. BRIDGE + REVERSE PROXY WITH proxy_protocol ---
+                p_br = self._free_port()
+                d_br = root / "bridge_pp"
+                proj_br = f"mtevil-u-br-{p_br}"
+                base_br = boot_v040_node(
+                    d_br,
+                    proj_br,
+                    "direct",
+                    {
+                        "role": "direct",
+                        "listen": "0.0.0.0:24443",
+                        "secret_file": "/var/lib/mtevil/proxy-secret",
+                        "replay_file": "/var/lib/mtevil-replay/replay.bin",
+                        "sni": "mozilla.org",
+                        "cover": "127.0.0.1:9",
+                        "proxy_protocol": True,
+                        "dc": dc_loop,
+                    },
+                    network_host=False,
+                    bind_ip="127.0.0.1",
+                    host_port=p_br,
+                )
+                cid_br0 = setup.run(base_br + ["ps", "-q", "mtevil"]).stdout.strip()
+                insp_br = setup.json.loads(setup.run(["docker", "inspect", cid_br0]).stdout)[0]
+                br_gw_ip = ""
+                for net_obj in (insp_br.get("NetworkSettings", {}).get("Networks") or {}).values():
+                    if net_obj.get("Gateway"):
+                        br_gw_ip = str(net_obj["Gateway"]).strip()
+                        break
+                self.assertTrue(bool(br_gw_ip))
+                br_gw_cidr = f"{br_gw_ip}/32"
+                cfg_br = setup.json.loads((d_br / "config.json").read_text(encoding="utf-8"))
+                cfg_br["dc"] = [f"{i}={br_gw_ip}:{dc_host.port}" for i in range(1, 6)]
+                (d_br / "config.json").write_text(setup.json.dumps(cfg_br, indent=2) + "\n", encoding="utf-8")
+                setup.run(base_br + ["up", "-d", "--force-recreate", setup.compose_service(base_br)])
+                setup.wait_healthy(base_br)
+
+                rp_port = start_proxy_v2_forwarder(p_br)
+                probe_dir = root / "ext_probe"
+                probe_dir.mkdir(parents=True, exist_ok=True)
+                (probe_dir / "secret").write_text(secret_hex + "\n", encoding="utf-8")
+                (probe_dir / "probe.json").write_text(
+                    setup.json.dumps({
+                        "role": "direct",
+                        "listen": "127.0.0.1:24443",
+                        "secret_file": "/probe/secret",
+                        "sni": "mozilla.org",
+                        "cover": "127.0.0.1:9",
+                        "proxy_protocol": False,
+                        "dc": ["2=127.0.0.1:9"],
+                    }),
+                    encoding="utf-8",
+                )
+
+                def check_via_reverse_proxy() -> None:
+                    pr = setup.run(
+                        [
+                            "docker",
+                            "run",
+                            "--rm",
+                            "--network",
+                            "host",
+                            "-v",
+                            f"{probe_dir}:/probe:ro",
+                            head_img,
+                            "probe-telegram",
+                            "--config",
+                            "/probe/probe.json",
+                            "--address",
+                            f"127.0.0.1:{rp_port}",
+                            "--dc",
+                            "2",
+                            "--timeout-secs",
+                            "5",
+                        ],
+                        check=False,
+                    )
+                    self.assertEqual(pr.returncode, 0, msg=pr.stdout + pr.stderr)
+
+                check_via_reverse_proxy()
+                cid_before_br = setup.run(base_br + ["ps", "-q", "mtevil"]).stdout.strip()
+                # 4a. Update without flag stops BEFORE container replacement and explains
+                r_br_fail = run_ctl(d_br, "update")
+                self.assertNotEqual(r_br_fail.returncode, 0)
+                self.assertIn("--proxy-protocol-allow-from", r_br_fail.stderr)
+                self.assertIn(br_gw_cidr, r_br_fail.stderr)
+                self.assertEqual(setup.run(base_br + ["ps", "-q", "mtevil"]).stdout.strip(), cid_before_br)
+                self.assertEqual(setup.inspect_current_deployment(d_br, proj_br, v040_img)[0], v040_id)
+                check_via_reverse_proxy()
+
+                # 4b. Update with --proxy-protocol-allow-from succeeds and external reverse proxy works!
+                r_br_ok = run_ctl(d_br, "update", "--proxy-protocol-allow-from", br_gw_cidr)
+                self.assertEqual(r_br_ok.returncode, 0, msg=r_br_ok.stdout + r_br_ok.stderr)
+                self.assertTrue((d_br / "config.json.pre-v041-pp.bak").is_file())
+                self.assertEqual(setup.inspect_current_deployment(d_br, proj_br, head_img)[0], head_id)
+                check_via_reverse_proxy()
+
+                # 4c. Rollback restores v0.4.0 cleanly (strips proxy_protocol_allow_from) and reverse proxy works!
+                r_br_rb = run_ctl(d_br, "rollback")
+                self.assertEqual(r_br_rb.returncode, 0, msg=r_br_rb.stdout + r_br_rb.stderr)
+                self.assertEqual(setup.inspect_current_deployment(d_br, proj_br, v040_img)[0], v040_id)
+                self.assertNotIn(
+                    "proxy_protocol_allow_from",
+                    setup.json.loads((d_br / "config.json").read_text(encoding="utf-8")),
+                )
+                check_via_reverse_proxy()
+                print("UPDATE_MATRIX_RESULT | bridge + reverse proxy (proxy_protocol) | v0.4.0=PASS | pre_stop_explain=PASS | update_with_flag=PASS | rollback=PASS", flush=True)
+
+                # --- 5. HOST-NETWORK WITH TUNNEL / PRIVATE SUBNET ---
+                host_priv_ip: str | None = None
+                ip_out = setup.run(["ip", "-o", "-4", "addr", "show"], check=False).stdout or ""
+                for line in ip_out.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        cand_ip = ipaddress.IPv4Address(parts[3].split("/", 1)[0])
+                        if setup._is_private_cgnat_or_ula_ip(cand_ip):
+                            host_priv_ip = str(cand_ip)
+                            break
+                self.assertIsNotNone(host_priv_ip, "expected at least one RFC1918/CGNAT IPv4 on Linux Docker host")
+                priv_subnet = str(ipaddress.ip_network(f"{host_priv_ip}/24", strict=False))
+                s_priv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s_priv.bind((host_priv_ip, 0))
+                p_tun = s_priv.getsockname()[1]
+                s_priv.close()
+
+                d_tun = root / "host_tunnel"
+                proj_tun = f"mtevil-u-tun-{p_tun}"
+                base_tun = boot_v040_node(
+                    d_tun,
+                    proj_tun,
+                    "direct",
+                    {
+                        "role": "direct",
+                        "listen": f"{host_priv_ip}:{p_tun}",
+                        "secret_file": "/var/lib/mtevil/proxy-secret",
+                        "replay_file": "/var/lib/mtevil-replay/replay.bin",
+                        "sni": "mozilla.org",
+                        "cover": "127.0.0.1:9",
+                        "proxy_protocol": True,
+                        "dc": dc_loop,
+                    },
+                    network_host=True,
+                    bind_ip=host_priv_ip,
+                    host_port=p_tun,
+                )
+                self.assertTrue(setup.verify_telegram_e2e(base_tun, attempts=2, delay_s=0.5)[0])
+                cid_before_tun = setup.run(base_tun + ["ps", "-q", "mtevil"]).stdout.strip()
+                r_tun_fail = run_ctl(d_tun, "update")
+                self.assertNotEqual(r_tun_fail.returncode, 0)
+                self.assertIn(priv_subnet, r_tun_fail.stderr)
+                self.assertEqual(setup.run(base_tun + ["ps", "-q", "mtevil"]).stdout.strip(), cid_before_tun)
+
+                r_tun_ok = run_ctl(d_tun, "update", "--proxy-protocol-allow-from", priv_subnet)
+                self.assertEqual(r_tun_ok.returncode, 0, msg=r_tun_ok.stdout + r_tun_ok.stderr)
+                self.assertEqual(setup.inspect_current_deployment(d_tun, proj_tun, head_img)[0], head_id)
+
+                r_tun_rb = run_ctl(d_tun, "rollback")
+                self.assertEqual(r_tun_rb.returncode, 0, msg=r_tun_rb.stdout + r_tun_rb.stderr)
+                self.assertEqual(setup.inspect_current_deployment(d_tun, proj_tun, v040_img)[0], v040_id)
+                self.assertTrue(setup.verify_telegram_e2e(base_tun, attempts=2, delay_s=0.5)[0])
+                print("UPDATE_MATRIX_RESULT | host-network tunnel subnet | v0.4.0=PASS | pre_stop_explain=PASS | update_with_flag=PASS | rollback=PASS", flush=True)
+        finally:
+            proxy_stop.set()
+            for ps in proxy_socks:
+                try:
+                    ps.close()
+                except OSError:
+                    pass
+            rel_srv.shutdown()
+            rel_srv.server_close()
+            dc_host.close()
+            for b in reversed(active_bases):
+                setup.run(b + ["down", "-v", "--remove-orphans"], check=False)
 
 
 if __name__ == "__main__":

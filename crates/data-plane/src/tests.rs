@@ -935,14 +935,27 @@ async fn proxy_v2_untrusted_peer_rejected_before_reading_header_or_cover() -> Re
     assert!(timeout(Duration::from_secs(1), task).await??.is_err());
     assert!(cover.received.try_recv().is_err());
 
-    // Case B: Explicit CIDR allowlist excludes loopback 127.0.0.1 when only 10.203.0.0/24 is trusted.
+    // Case B: Explicit CIDR allowlist rejects non-loopback peers outside 10.203.0.0/24 (e.g. 10.204.0.99),
+    // while keeping container loopback self-probes (127.0.0.1) working.
     let mut config_cidr = state(cover.addr, dc.local_addr()?);
     {
         let st_mut = Arc::get_mut(&mut config_cidr).context("unique state")?;
         st_mut.proxy_protocol = true;
         st_mut.proxy_protocol_allow_from = vec![config::IpCidr::parse("10.203.0.0/24")?];
     }
-    let (mut client2, task2) = proxy(config_cidr).await?;
+    let (cl2_res, srv2_res) = tokio::join!(TcpStream::connect(addr), listener.accept());
+    let mut client2 = cl2_res?;
+    let (srv2_stream, _) = srv2_res?;
+    let cfg_cidr_clone = config_cidr.clone();
+    let task2 = tokio::spawn(async move {
+        serve::connection_with_peer_and_drain(
+            srv2_stream,
+            Some("10.204.0.99:41234".parse()?),
+            cfg_cidr_clone,
+            serve::inactive_drain_rx(),
+        )
+        .await
+    });
     let _ = client2.write_all(&pp).await;
     assert!(timeout(Duration::from_secs(1), task2).await??.is_err());
     assert!(cover.received.try_recv().is_err());

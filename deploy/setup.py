@@ -59,6 +59,39 @@ def version_supports_me_config(version: str | None) -> bool:
     return (parsed[0], parsed[1]) >= (0, 3)
 
 
+def version_supports_proxy_protocol_allow_from(version: str | None) -> bool:
+    if not version:
+        return True
+    parsed = parse_semver_tag(version)
+    if parsed is None:
+        return True
+    return parsed[:3] >= (0, 4, 1)
+
+
+def strip_proxy_protocol_allow_from_for_legacy_version(
+    cfg_file: Path, target_version: str | None
+) -> tuple[bool, Path | None]:
+    """Strip `proxy_protocol_allow_from` from `config.json` when rolling back or downgrading to `< v0.4.1`,
+    saving a 0600 backup `config.json.pre-pp-downgrade` before modifying `config.json`."""
+    if version_supports_proxy_protocol_allow_from(target_version) or not cfg_file.is_file():
+        return False, None
+    raw = cfg_file.read_text(encoding="utf-8")
+    data = json.loads(raw)
+    if not isinstance(data, dict) or "proxy_protocol_allow_from" not in data:
+        return False, None
+    backup_path = cfg_file.with_name(f"{cfg_file.name}.pre-pp-downgrade")
+    backup_path.write_text(raw, encoding="utf-8")
+    try:
+        os.chmod(backup_path, 0o600)
+    except OSError:
+        pass
+    data.pop("proxy_protocol_allow_from", None)
+    tmp = cfg_file.with_name(f".{cfg_file.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, cfg_file)
+    return True, backup_path
+
+
 def strip_me_block_for_legacy_version(
     cfg_file: Path, target_version: str | None
 ) -> tuple[bool, Path | None]:
@@ -3315,6 +3348,13 @@ def perform_rollback(
             print(
                 f"Блок 'me' не поддерживается в {target_version}: сохранён бэкап {backup_path.name} и удалён блок 'me' из config.json."
             )
+        stripped_pp, pp_backup = strip_proxy_protocol_allow_from_for_legacy_version(
+            deploy_dir / "config.json", target_version
+        )
+        if stripped_pp and pp_backup is not None:
+            print(
+                f"Поле 'proxy_protocol_allow_from' не поддерживается в {target_version}: сохранён бэкап {pp_backup.name} и удалено поле из config.json."
+            )
     except Exception as exc:
         print(
             err_text(
@@ -3440,6 +3480,11 @@ def run_update_command(
             print(
                 f"Блок 'me' не поддерживается в {target_version}: сохранён бэкап {me_backup.name} и удалён блок 'me' из config.json."
             )
+        stripped_pp, pp_backup = strip_proxy_protocol_allow_from_for_legacy_version(cfg_file, target_version)
+        if stripped_pp and pp_backup is not None:
+            print(
+                f"Поле 'proxy_protocol_allow_from' не поддерживается в {target_version}: сохранён бэкап {pp_backup.name} и удалено поле из config.json."
+            )
     except Exception as exc:
         print(
             err_text(
@@ -3516,6 +3561,7 @@ def run_update_command(
     from_label = cur_version or cur_image_ref or "unknown"
     print(heading(f"Обновление mtevil: {from_label} -> {target_version}"))
 
+    orig_cfg_bytes_before_pp = cfg_file.read_bytes() if cfg_file.is_file() else None
     ver_key = parse_semver_tag(target_version)
     if ver_key is None or ver_key[:3] >= (0, 4, 1) or explicit_image:
         try:
@@ -3547,10 +3593,13 @@ def run_update_command(
     print(f"Загрузка Docker-образа {target_image}...")
     pull_proc = run(["docker", "pull", target_image], check=False)
     if pull_proc.returncode != 0:
-        detail = (pull_proc.stderr or pull_proc.stdout or "").strip()
-        summary, action = diagnose_docker_error(detail, target_image)
-        print(f"{err_text(summary)}\nДальше: {action}", file=sys.stderr)
-        return 1
+        if explicit_image and run(["docker", "image", "inspect", target_image], check=False).returncode == 0:
+            print(warn_text(f"Используется предзагруженный локальный образ {target_image} из кэша Docker."))
+        else:
+            detail = (pull_proc.stderr or pull_proc.stdout or "").strip()
+            summary, action = diagnose_docker_error(detail, target_image)
+            print(f"{err_text(summary)}\nДальше: {action}", file=sys.stderr)
+            return 1
 
     new_image_id, _, new_image_ver = inspect_image_metadata(target_image)
     if cur_image_id and new_image_id and cur_image_id == new_image_id and (cur_version or new_image_ver) == target_version:
@@ -3600,6 +3649,8 @@ def run_update_command(
             cur_image_id,
             cur_digest,
         )
+        if orig_cfg_bytes_before_pp is not None:
+            (deploy_dir / "config.json.rollback").write_bytes(orig_cfg_bytes_before_pp)
     except Exception as exc:
         print(err_text(str(exc)), file=sys.stderr)
         return 1

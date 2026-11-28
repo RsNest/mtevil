@@ -373,13 +373,11 @@ struct State {
 
 impl State {
     fn is_trusted_proxy_peer(&self, ip: IpAddr) -> bool {
-        if self.proxy_protocol_allow_from.is_empty() {
-            config::is_canonical_loopback(ip)
-        } else {
-            self.proxy_protocol_allow_from
+        config::is_canonical_loopback(ip)
+            || self
+                .proxy_protocol_allow_from
                 .iter()
                 .any(|c| c.contains(ip))
-        }
     }
 
     fn flight_profile(&self) -> wire::ServerFlightProfile {
