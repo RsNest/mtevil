@@ -4538,6 +4538,7 @@ class SetupValidationTests(unittest.TestCase):
         import hashlib
         import http.server
         import ipaddress
+        import os
         import threading
 
         head_img = self._local_image()
