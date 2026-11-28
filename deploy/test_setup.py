@@ -4571,20 +4571,6 @@ class SetupValidationTests(unittest.TestCase):
             "/download/v0.4.1/mtevilctl": head_ctl_bytes,
             "/download/v0.4.1/SHA256SUMS": sha_lines,
         }
-        releases_payload = setup.json.dumps([
-            {
-                "tag_name": "v0.4.1",
-                "draft": False,
-                "prerelease": False,
-                "assets": [
-                    {"name": "install.sh", "state": "uploaded"},
-                    {"name": "setup.py", "state": "uploaded"},
-                    {"name": "mtevilctl", "state": "uploaded"},
-                    {"name": "SHA256SUMS", "state": "uploaded"},
-                ],
-            }
-        ]).encode("utf-8")
-
         class _RelHandler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 path_only = self.path.split("?", 1)[0]
@@ -4609,6 +4595,20 @@ class SetupValidationTests(unittest.TestCase):
 
         rel_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _RelHandler)
         rel_port = rel_srv.server_address[1]
+        dl_base = f"http://127.0.0.1:{rel_port}/download/v0.4.1"
+        releases_payload = setup.json.dumps([
+            {
+                "tag_name": "v0.4.1",
+                "draft": False,
+                "prerelease": False,
+                "assets": [
+                    {"name": "install.sh", "state": "uploaded", "browser_download_url": f"{dl_base}/install.sh"},
+                    {"name": "setup.py", "state": "uploaded", "browser_download_url": f"{dl_base}/setup.py"},
+                    {"name": "mtevilctl", "state": "uploaded", "browser_download_url": f"{dl_base}/mtevilctl"},
+                    {"name": "SHA256SUMS", "state": "uploaded", "browser_download_url": f"{dl_base}/SHA256SUMS"},
+                ],
+            }
+        ]).encode("utf-8")
         rel_thr = threading.Thread(target=rel_srv.serve_forever, daemon=True)
         rel_thr.start()
 
