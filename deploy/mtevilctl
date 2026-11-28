@@ -51,7 +51,7 @@ print_help() {
   mtevilctl egress check      Выполнить проверку check-egress всех настроенных узлов выхода
   mtevilctl tuning            [experimental] Показать или настроить параметры TCP MSS (--handshake-mss <88..1460|off>, --bulk-mss <88..1460|off>)
   mtevilctl setup             Запустить интерактивный мастер перенастройки (--self-steal, --webproxy [--managed-caddy|--cdn experimental], --shared-443; псевдоним: reconfigure)
-  mtevilctl update            Обновить контейнер до свежего стабильного релиза без повторного запуска мастера (с сохранением настроек и секретов)
+  mtevilctl update            Обновить контейнер до свежего стабильного релиза (--proxy-protocol-allow-from <CIDR>)
   mtevilctl update --prerelease
                               Обновить контейнер с учётом предварительных релизов (alpha/beta/rc)
   mtevilctl rollback          Вернуть предыдущую рабочую версию и конфигурацию локально (без интернета)

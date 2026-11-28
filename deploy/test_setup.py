@@ -4231,10 +4231,14 @@ class SetupValidationTests(unittest.TestCase):
             bad_ip = ".".join(["93", "184", "216", "34"])
             bad_pfx = ".".join(["93", "184"]) + "/16"
             bad_asn = "AS" + "12345"
-            (root / "clean.md").write_text("Host edge.example.org IP 203.0.113.10 IPv6 2001:db8::1\n", encoding="utf-8")
+            bad_isp1 = "МГ" + "ТС"
+            bad_isp2 = "Ростеле" + "коме"
+            bad_hoster = "Hetz" + "ner"
+            (root / "clean.md").write_text("Host edge.example.org IP 203.0.113.10 IPv6 2001:db8::1 на российском провайдере\n", encoding="utf-8")
             (root / "bad_dom.md").write_text(f"SNI {bad_dom}\n", encoding="utf-8")
             (root / "bad_ip.md").write_text(f"Server 198.51.100.1 ok vs {bad_ip} bad and prefix {bad_pfx}\n", encoding="utf-8")
             (root / "bad_asn.md").write_text(f"Carrier {bad_asn}\n", encoding="utf-8")
+            (root / "bad_isp.md").write_text(f"Link on {bad_isp1}, {bad_isp2} and {bad_hoster}\n", encoding="utf-8")
             with mock.patch.object(hygiene.subprocess, "check_output", side_effect=OSError("no git")):
                 errs = hygiene.scan_repo(root)
             joined = "\n".join(errs)
@@ -4242,6 +4246,14 @@ class SetupValidationTests(unittest.TestCase):
             self.assertIn("bad_dom.md", joined)
             self.assertIn("bad_ip.md", joined)
             self.assertIn("bad_asn.md", joined)
+            self.assertEqual(joined.count("bad_isp.md"), 3)
+
+        # Q2: legacy one-off ops scripts are absent from deploy/ and unused by Dockerfile / release.yml
+        repo_root = hygiene.REPO_ROOT
+        for removed_name in ("hour_monitor.py", "port443_guard.py", "window_capture.py"):
+            self.assertFalse((repo_root / "deploy" / removed_name).exists(), msg=removed_name)
+            self.assertNotIn(removed_name, (repo_root / "Dockerfile").read_text(encoding="utf-8"))
+            self.assertNotIn(removed_name, (repo_root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8"))
 
     def test_p2_proxy_protocol_migration_bridge_host_loopback_and_corrupted(self):
         import contextlib
@@ -4348,7 +4360,98 @@ class SetupValidationTests(unittest.TestCase):
             with mock.patch.object(setup, "run", side_effect=fake_ip_addr):
                 st_w, sug_w, _, _ = setup.inspect_proxy_protocol_config(d, d / "config.json")
             self.assertEqual(st_w, "needs_allow_from")
-            self.assertIn("10.204.5.0/24", sug_w)
+            self.assertEqual(sug_w, ["10.204.5.0/24"])
+            self.assertNotIn("127.0.0.1/32", sug_w)
+
+            # Q3a: CGNAT (RFC 6598) and IPv6 ULA get /24 and /64, while public/non-private IPs NEVER expand beyond /32 or /128!
+            for listen_val, expected_sug in (
+                ("100.64.5.9:24443", ["100.64.5.0/24"]),
+                ("[fd12:3456::2]:24443", ["fd12:3456::/64"]),
+                ("203.0.113.50:24443", ["203.0.113.50/32"]),
+                ("[2001:db8::42]:24443", ["2001:db8::42/128"]),
+            ):
+                (d / "config.json").write_text(
+                    setup.json.dumps({"role": "direct", "listen": listen_val, "proxy_protocol": True}),
+                    encoding="utf-8",
+                )
+                st_q3, sug_q3, _, _ = setup.inspect_proxy_protocol_config(d, d / "config.json")
+                self.assertEqual(st_q3, "needs_allow_from")
+                self.assertEqual(sug_q3, expected_sug, msg=listen_val)
+
+            # Q3b: Wildcard 0.0.0.0 with NO suitable tunnel/bridge interfaces returns [] (NEVER 127.0.0.1/32)
+            #      and requires explicit --proxy-protocol-allow-from!
+            (d / "config.json").write_text(
+                setup.json.dumps({"role": "direct", "listen": "0.0.0.0:24443", "proxy_protocol": True}),
+                encoding="utf-8",
+            )
+            def fake_only_public_eth(argv, **_kwargs):
+                if argv[:2] == ["ip", "-o"]:
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        stdout=(
+                            "1: lo    inet 127.0.0.1/8 scope host lo\n"
+                            "2: eth0  inet 203.0.113.10/24 scope global eth0\n"
+                        ),
+                        stderr="",
+                    )
+                if "pull" in argv:
+                    return subprocess.CompletedProcess(argv, 1, stdout="", stderr="stop-after-pull")
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+
+            with mock.patch.object(setup, "run", side_effect=fake_only_public_eth):
+                st_empty, sug_empty, _, _ = setup.inspect_proxy_protocol_config(d, d / "config.json")
+            self.assertEqual(st_empty, "needs_allow_from")
+            self.assertEqual(sug_empty, [])
+
+            # Non-interactive update without --proxy-protocol-allow-from fails and mentions --proxy-protocol-allow-from
+            (d / ".env").write_text("MTEVIL_PROJECT=mtevil-direct\nMTEVIL_IMAGE=mtevil:v0.4.0\n", encoding="utf-8")
+            err_empty = io.StringIO()
+            with (
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "inspect_current_deployment", return_value=("id0", None, "v0.4.0")),
+                mock.patch.object(setup, "run", side_effect=fake_only_public_eth),
+                mock.patch.object(sys.stdin, "isatty", return_value=False),
+                mock.patch.dict(setup.os.environ, {"MTEVIL_SKIP_ASSET_DOWNLOAD": "1"}),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(err_empty),
+            ):
+                rc_empty = setup.main(["update", "--dir", str(d), "--version", "v0.4.1", "--reexec"])
+            self.assertEqual(rc_empty, 1)
+            self.assertIn("--proxy-protocol-allow-from", err_empty.getvalue())
+            self.assertNotIn("127.0.0.1/32", err_empty.getvalue())
+
+            # Passing explicit --proxy-protocol-allow-from succeeds in migration even non-interactively!
+            with (
+                mock.patch.object(setup, "check_prerequisites"),
+                mock.patch.object(setup, "inspect_current_deployment", return_value=("id0", None, "v0.4.0")),
+                mock.patch.object(setup, "run", side_effect=fake_only_public_eth),
+                mock.patch.object(sys.stdin, "isatty", return_value=False),
+                mock.patch.dict(setup.os.environ, {"MTEVIL_SKIP_ASSET_DOWNLOAD": "1"}),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                rc_explicit = setup.main([
+                    "update",
+                    "--dir",
+                    str(d),
+                    "--version",
+                    "v0.4.1",
+                    "--reexec",
+                    "--proxy-protocol-allow-from",
+                    "10.203.0.0/24, 172.17.0.1/32",
+                ])
+            # Reached mocked `docker pull` after writing explicit allow_from
+            self.assertEqual(rc_explicit, 1)
+            cfg_after_cli = setup.json.loads((d / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(cfg_after_cli["proxy_protocol_allow_from"], ["10.203.0.0/24", "172.17.0.1/32"])
+
+            # Invalid --proxy-protocol-allow-from rejected immediately by CLI parser
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    setup.main(["update", "--dir", str(d), "--proxy-protocol-allow-from", "not-a-cidr"]),
+                    1,
+                )
 
             # Wizard reconfigure preserves proxy_protocol=True with non-loopback bind_ip and stops if unconfirmed
             (d / ".env").write_text("MTEVIL_PROJECT=mtevil-direct\nMTEVIL_BIND=10.203.0.2\nMTEVIL_PORT=24443\n", encoding="utf-8")

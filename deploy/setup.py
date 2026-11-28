@@ -2700,6 +2700,29 @@ def _is_canonical_loopback_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Addr
     return False
 
 
+_PRIVATE_CGNAT_V4_NETS = (
+    ipaddress.IPv4Network("10.0.0.0/8"),
+    ipaddress.IPv4Network("172.16.0.0/12"),
+    ipaddress.IPv4Network("192.168.0.0/16"),
+    ipaddress.IPv4Network("100.64.0.0/10"),
+)
+_ULA_V6_NET = ipaddress.IPv6Network("fc00::/7")
+
+
+def _is_private_cgnat_or_ula_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip_obj, ipaddress.IPv6Address):
+        if ip_obj.ipv4_mapped is not None:
+            return any(ip_obj.ipv4_mapped in net for net in _PRIVATE_CGNAT_V4_NETS)
+        return ip_obj in _ULA_V6_NET
+    return any(ip_obj in net for net in _PRIVATE_CGNAT_V4_NETS)
+
+
+def _is_private_cgnat_or_ula_net(net_obj: ipaddress.IPv4Network | ipaddress.IPv6Network) -> bool:
+    if isinstance(net_obj, ipaddress.IPv6Network):
+        return net_obj.subnet_of(_ULA_V6_NET)
+    return any(net_obj.subnet_of(base) for base in _PRIVATE_CGNAT_V4_NETS)
+
+
 def _validate_cidr_list_csv(value: str) -> list[str]:
     cidrs: list[str] = []
     for part in value.split(","):
@@ -2713,6 +2736,13 @@ def _validate_cidr_list_csv(value: str) -> list[str]:
     if not cidrs:
         raise ValueError("укажите хотя бы один корректный CIDR (например, 172.17.0.1/32 или 10.203.0.0/24)")
     return cidrs
+
+
+def _parse_cli_proxy_protocol_allow_from(raw_values: list[str] | None) -> list[str] | None:
+    if not raw_values:
+        return None
+    combined = ",".join(raw_values)
+    return _validate_cidr_list_csv(combined)
 
 
 def _detect_docker_bridge_gateway_cidrs(deploy_dir: Path, project: str) -> list[str]:
@@ -2738,35 +2768,63 @@ def _detect_docker_bridge_gateway_cidrs(deploy_dir: Path, project: str) -> list[
                 if gw:
                     try:
                         ip_gw = ipaddress.ip_address(gw)
+                        if isinstance(ip_gw, ipaddress.IPv6Address) and ip_gw.ipv4_mapped is not None:
+                            ip_gw = ip_gw.ipv4_mapped
                         cidr = f"{ip_gw}/32" if ip_gw.version == 4 else f"{ip_gw}/128"
                         if cidr not in candidates:
                             candidates.append(cidr)
-                            continue
+                        continue
                     except ValueError:
                         pass
                 sub = str(entry.get("Subnet") or "").strip()
                 if sub:
                     try:
-                        cidr = str(ipaddress.ip_network(sub, strict=False))
-                        if cidr not in candidates:
-                            candidates.append(cidr)
+                        sub_net = ipaddress.ip_network(sub, strict=False)
+                        if _is_private_cgnat_or_ula_net(sub_net):
+                            cidr = str(sub_net)
+                            if cidr not in candidates:
+                                candidates.append(cidr)
                     except ValueError:
                         pass
         if candidates:
             break
     if not candidates:
-        candidates.append("172.17.0.1/32")
+        proc_ip = run(["ip", "-o", "addr", "show"], check=False)
+        if proc_ip.returncode == 0 and proc_ip.stdout:
+            for line in proc_ip.stdout.splitlines():
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                iface, addr_cidr = parts[1], parts[3]
+                if not iface.startswith(("docker", "br-")):
+                    continue
+                try:
+                    ip_only = ipaddress.ip_address(addr_cidr.split("/", 1)[0])
+                    if _is_canonical_loopback_ip(ip_only) or ip_only.is_link_local or ip_only.is_unspecified:
+                        continue
+                    cidr = f"{ip_only}/32" if ip_only.version == 4 else f"{ip_only}/128"
+                    if cidr not in candidates:
+                        candidates.append(cidr)
+                except ValueError:
+                    continue
     return candidates
 
 
 def _detect_host_proxy_source_cidrs(listen_ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> list[str]:
-    if not listen_ip.is_unspecified and not _is_canonical_loopback_ip(listen_ip):
-        if listen_ip.version == 4:
-            return [str(ipaddress.ip_network(f"{listen_ip}/24", strict=False))]
-        return [str(ipaddress.ip_network(f"{listen_ip}/64", strict=False))]
+    eff_ip: ipaddress.IPv4Address | ipaddress.IPv6Address = listen_ip
+    if isinstance(eff_ip, ipaddress.IPv6Address) and eff_ip.ipv4_mapped is not None:
+        eff_ip = eff_ip.ipv4_mapped
+
+    if not eff_ip.is_unspecified and not _is_canonical_loopback_ip(eff_ip):
+        if _is_private_cgnat_or_ula_ip(eff_ip):
+            if eff_ip.version == 4:
+                return [str(ipaddress.ip_network(f"{eff_ip}/24", strict=False))]
+            return [str(ipaddress.ip_network(f"{eff_ip}/64", strict=False))]
+        # Never expand a public / non-private IP to /24 or /64: restrict strictly to single host (/32 or /128).
+        return [f"{eff_ip}/32" if eff_ip.version == 4 else f"{eff_ip}/128"]
 
     candidates: list[str] = []
-    proc = run(["ip", "-o", "-4", "addr", "show"], check=False)
+    proc = run(["ip", "-o", "addr", "show"], check=False)
     if proc.returncode == 0 and proc.stdout:
         for line in proc.stdout.splitlines():
             parts = line.split()
@@ -2777,23 +2835,29 @@ def _detect_host_proxy_source_cidrs(listen_ip: ipaddress.IPv4Address | ipaddress
             if not any(iface.startswith(pfx) for pfx in ("wg", "awg", "amnezia", "docker", "br-")):
                 continue
             try:
+                ip_only = ipaddress.ip_address(addr_cidr.split("/", 1)[0])
                 iface_net = ipaddress.ip_network(addr_cidr, strict=False)
             except ValueError:
                 continue
+            if _is_canonical_loopback_ip(ip_only) or ip_only.is_link_local or ip_only.is_unspecified:
+                continue
             if iface.startswith(("docker", "br-")):
-                gw_ip = addr_cidr.split("/", 1)[0]
-                cidr = f"{gw_ip}/32"
-            elif iface_net.prefixlen < 24:
-                ip_only = addr_cidr.split("/", 1)[0]
-                cidr = str(ipaddress.ip_network(f"{ip_only}/24", strict=False))
+                cidr = f"{ip_only}/32" if ip_only.version == 4 else f"{ip_only}/128"
+            elif _is_private_cgnat_or_ula_ip(ip_only):
+                if ip_only.version == 4:
+                    if _is_private_cgnat_or_ula_net(iface_net) and iface_net.prefixlen >= 24:
+                        cidr = str(iface_net)
+                    else:
+                        cidr = str(ipaddress.ip_network(f"{ip_only}/24", strict=False))
+                else:
+                    if _is_private_cgnat_or_ula_net(iface_net) and iface_net.prefixlen >= 64:
+                        cidr = str(iface_net)
+                    else:
+                        cidr = str(ipaddress.ip_network(f"{ip_only}/64", strict=False))
             else:
-                cidr = str(iface_net)
+                cidr = f"{ip_only}/32" if ip_only.version == 4 else f"{ip_only}/128"
             if cidr not in candidates:
                 candidates.append(cidr)
-    if not candidates:
-        candidates.append("127.0.0.1/32")
-    elif "127.0.0.1/32" not in candidates:
-        candidates.append("127.0.0.1/32")
     return candidates
 
 
@@ -2888,6 +2952,7 @@ def ensure_proxy_protocol_migration(
     apply_to_file: bool = True,
     override_cfg: dict[str, object] | None = None,
     network_mode: str | None = None,
+    explicit_allow_from: list[str] | None = None,
 ) -> tuple[bool, dict[str, object]]:
     """Verify proxy_protocol config compatibility before pulling images or touching containers."""
     status, suggested, reason, cfg = inspect_proxy_protocol_config(
@@ -2897,48 +2962,90 @@ def ensure_proxy_protocol_migration(
         network_mode=network_mode,
         project=project,
     )
+    if explicit_allow_from is not None and cfg.get("proxy_protocol") is True:
+        new_cfg = copy.deepcopy(cfg)
+        new_cfg["proxy_protocol_allow_from"] = list(explicit_allow_from)
+        if apply_to_file and cfg_file.is_file():
+            bak = cfg_file.with_name(f"{cfg_file.name}.pre-v041-pp.bak")
+            if not bak.exists():
+                shutil.copyfile(cfg_file, bak)
+                try:
+                    os.chmod(bak, 0o600)
+                except OSError:
+                    pass
+            cfg_file.write_text(json.dumps(new_cfg, indent=2) + "\n", encoding="utf-8")
+        print(ok_text(f"Записано proxy_protocol_allow_from={json.dumps(explicit_allow_from)} (--proxy-protocol-allow-from)."))
+        return True, new_cfg
+
     if status == "ok":
         return True, cfg
 
     listen_disp = str(cfg.get("listen") or "")
-    suggested_csv = ", ".join(suggested)
     print(
         warn_text(
-            f"Несовместимость {target_label} (P2): в config.json включён proxy_protocol=true, "
+            f"Несовместимость {target_label} (P2/Q3): в config.json включён proxy_protocol=true, "
             f"но listen='{listen_disp}' не на loopback и не задано поле proxy_protocol_allow_from."
         ),
         file=sys.stderr,
     )
-    print(
-        f"  Источник ({reason}): {suggested_csv}\n"
-        f"  Вариант 1: переведите listen на loopback (127.0.0.1:PORT) в режиме --shared-443.\n"
-        f"  Вариант 2: укажите доверенные CIDR в proxy_protocol_allow_from: {json.dumps(suggested)}",
-        file=sys.stderr,
-    )
+    if suggested:
+        suggested_csv = ", ".join(suggested)
+        print(
+            f"  Обнаруженный источник ({reason}): {suggested_csv}\n"
+            f"  Вариант 1: переведите listen на loopback (127.0.0.1:PORT) в режиме --shared-443.\n"
+            f"  Вариант 2: передайте флаг --proxy-protocol-allow-from \"{suggested_csv}\" "
+            f"или укажите в config.json: {json.dumps(suggested)}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "  Подходящие частные/туннельные интерфейсы не обнаружены (автоподстановка не выполняется).\n"
+            "  Вариант 1: переведите listen на loopback (127.0.0.1:PORT) в режиме --shared-443.\n"
+            "  Вариант 2: укажите доверенный источник явно флагом --proxy-protocol-allow-from <CIDR> "
+            "или в поле proxy_protocol_allow_from файла config.json.",
+            file=sys.stderr,
+        )
 
     is_tty = sys.stdin.isatty() if interactive is None else interactive
     if not is_tty:
         print(
             err_text(
-                "Операция остановлена до замены контейнера: в неинтерактивном режиме требуется явное "
-                "разрешение proxy_protocol_allow_from или привязка listen к 127.0.0.1."
+                "Операция остановлена до замены контейнера: передайте --proxy-protocol-allow-from <CIDR>, "
+                "заполните proxy_protocol_allow_from в config.json или переведите listen на 127.0.0.1."
             ),
             file=sys.stderr,
         )
         return False, cfg
 
-    if not ask_yes_no(
-        f"Записать предложенное proxy_protocol_allow_from = [{suggested_csv}] и продолжить?",
-        default=True,
-    ):
-        print(
-            err_text("Операция отменена до замены контейнера. Конфигурация и работающий сервис не изменены."),
-            file=sys.stderr,
-        )
-        return False, cfg
+    if suggested:
+        suggested_csv = ", ".join(suggested)
+        if not ask_yes_no(
+            f"Записать предложенное proxy_protocol_allow_from = [{suggested_csv}] и продолжить?",
+            default=True,
+        ):
+            print(
+                err_text("Операция отменена до замены контейнера. Конфигурация и работающий сервис не изменены."),
+                file=sys.stderr,
+            )
+            return False, cfg
+        default_prompt_val: str | None = suggested_csv
+    else:
+        if not ask_yes_no(
+            "Указать доверенные CIDR для proxy_protocol_allow_from вручную сейчас?",
+            default=False,
+        ):
+            print(
+                err_text(
+                    "Операция остановлена до замены контейнера: укажите --proxy-protocol-allow-from <CIDR> "
+                    "или переведите listen на 127.0.0.1."
+                ),
+                file=sys.stderr,
+            )
+            return False, cfg
+        default_prompt_val = None
 
     while True:
-        raw_entry = ask("Доверенные CIDR для proxy_protocol_allow_from (через запятую)", suggested_csv)
+        raw_entry = ask("Доверенные CIDR для proxy_protocol_allow_from (через запятую)", default_prompt_val)
         try:
             chosen = _validate_cidr_list_csv(raw_entry)
             break
@@ -3270,6 +3377,7 @@ def run_update_command(
     *,
     reexec: bool = False,
     allow_prerelease: bool = False,
+    proxy_protocol_allow_from: list[str] | None = None,
 ) -> int:
     check_prerequisites()
     compose_file = deploy_dir / "compose.yaml"
@@ -3391,6 +3499,9 @@ def run_update_command(
         ]
         if explicit_image:
             reexec_argv.extend(["--image", explicit_image])
+        if proxy_protocol_allow_from:
+            for pp_cidr in proxy_protocol_allow_from:
+                reexec_argv.extend(["--proxy-protocol-allow-from", pp_cidr])
         try:
             os.execv(sys.executable, reexec_argv)
         except OSError as exc:
@@ -3413,6 +3524,7 @@ def run_update_command(
                 cfg_file,
                 project=project,
                 target_label=target_version,
+                explicit_allow_from=proxy_protocol_allow_from,
             )
         except MigrationError as exc:
             print(
@@ -5281,7 +5393,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--me-public-ipv4", type=str, default=None, help="Explicit public IPv4 for ME KDF (required behind NAT/bridge)")
     parser.add_argument("--me-send-client-ip", choices=("true", "false"), default=None, help="Whether to forward client IPv4 in ME RPC_PROXY_REQ")
     parser.add_argument("--me-fallback-to-direct", choices=("true", "false"), default=None, help="Whether to fall back to Direct when ME is degraded")
+    parser.add_argument(
+        "--proxy-protocol-allow-from",
+        action="append",
+        default=None,
+        help="Trusted source CIDR(s) allowed to send PROXY protocol v2 headers (comma-separated or repeatable)",
+    )
     args = parser.parse_args(argv)
+
+    try:
+        cli_pp_allow_from = _parse_cli_proxy_protocol_allow_from(args.proxy_protocol_allow_from)
+    except ValueError as exc:
+        print(err_text(f"Некорректное значение --proxy-protocol-allow-from: {exc}"), file=sys.stderr)
+        return 1
 
     repo_root = Path(__file__).resolve().parent.parent
     if args.command in ("status", "update", "rollback", "traffic", "traf", "link", "sni", "user", "adtag", "egress", "tuning"):
@@ -5294,6 +5418,7 @@ def main(argv: list[str] | None = None) -> int:
                 target_version_override=args.version,
                 reexec=args.reexec,
                 allow_prerelease=args.prerelease,
+                proxy_protocol_allow_from=cli_pp_allow_from,
             )
         if args.command == "rollback":
             return perform_rollback(deploy_dir)
@@ -6165,6 +6290,7 @@ def main(argv: list[str] | None = None) -> int:
             apply_to_file=False,
             override_cfg=config_data,
             network_mode="host" if use_network_host else "bridge",
+            explicit_allow_from=cli_pp_allow_from,
         )
     except MigrationError as exc:
         print(err_text(f"Некорректная конфигурация proxy_protocol: {exc}."), file=sys.stderr)
