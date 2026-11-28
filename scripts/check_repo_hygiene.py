@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""CI repository hygiene linter (P1).
+"""CI repository hygiene linter (P1 / Q1).
 
 Fails the build if tracked text files contain:
 - Autonomous System numbers (e.g., AS12345),
+- specific telecom / ISP names or common hosting/AS brand names,
 - non-allowlisted public IPv4/IPv6 addresses or partial IP prefixes (outside
   RFC 1918/6598/5737/3849, loopback, link-local, and official Telegram DC CIDRs),
 - non-allowlisted domain names outside RFC 2606 (`example.*`, `*.test`) and the
-  explicitly approved infrastructure/preset allowlist,
-- SHA-256 digests matching previously leaked personal domains/IP prefixes.
+  explicitly approved infrastructure/preset allowlist.
 """
 from __future__ import annotations
 
@@ -124,6 +124,26 @@ SKIP_FILES = {
 IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
 PARTIAL_CIDR_RE = re.compile(r"(?<![\d.])(\d{1,3})\.(\d{1,3})/(\d{1,2})\b")
 ASN_RE = re.compile(r"\bAS\d{2,7}\b")
+ISP_BRAND_RE = re.compile(
+    r"(?<![A-Za-zА-Яа-яЁё0-9_])(?:"
+    r"мгтс|mgts"
+    r"|ростелеком[а-яё]*|rostelecom\w*|ртк"
+    r"|билайн[а-яё]*|beeline\w*|вымпелком[а-яё]*|vimpelcom\w*"
+    r"|мегафон[а-яё]*|megafon\w*"
+    r"|мтс|mts"
+    r"|йот[аеыуой]|yota"
+    r"|теле2|tele2"
+    r"|эр-?телеком[а-яё]*|er-?telecom\w*|дом\.ру|dom\.ru|domru"
+    r"|транстелеком[а-яё]*|transtelecom\w*|ттк"
+    r"|акадо|akado|таттелеком[а-яё]*|tattelecom\w*|башинформсвяз[а-яё]*"
+    r"|hetzner\w*|хетцнер[а-яё]*|ovhcloud|ovh"
+    r"|digitalocean|linode|vultr|contabo|scaleway|upcloud|leaseweb|choopa|melbicom|hostkey"
+    r"|aeza|аеза|аэза|timeweb\w*|таймвеб[а-яё]*|selectel\w*|селектел[а-яё]*"
+    r"|vdsina\w*|firstvds\w*|ruvds\w*|beget\w*|бегет[а-яё]*|fornex"
+    r"|comcast|verizon|vodafone|telefonica|chinanet"
+    r")(?![A-Za-zА-Яа-яЁё0-9_])",
+    re.IGNORECASE,
+)
 IPV6_RE = re.compile(r"(?<![A-Za-z0-9:])(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{0,4}(?![A-Za-z0-9:])")
 DOMAIN_TLD_RE = re.compile(
     r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9-]{1,63})*"
@@ -227,6 +247,9 @@ def scan_repo(root: pathlib.Path = REPO_ROOT) -> list[str]:
         for lineno, line in lines_to_scan:
             for m in ASN_RE.finditer(line):
                 errors.append(f"{norm}:{lineno}: disallowed AS number token '{m.group(0)}'")
+            for m in ISP_BRAND_RE.finditer(line):
+                h = hashlib.sha256(m.group(0).lower().encode()).hexdigest()[:12]
+                errors.append(f"{norm}:{lineno}: disallowed ISP / AS brand name (sha256:{h})")
             for m in IPV4_RE.finditer(line):
                 val = m.group(0)
                 if not _is_allowed_ipv4(val):
